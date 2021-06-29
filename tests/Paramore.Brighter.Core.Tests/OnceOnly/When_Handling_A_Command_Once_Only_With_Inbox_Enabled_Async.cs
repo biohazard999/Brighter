@@ -11,6 +11,9 @@ using Paramore.Brighter.Inbox.Handlers;
 
 namespace Paramore.Brighter.Core.Tests.OnceOnly
 {
+    
+    [Trait("Fragile", "CI")]
+    [Collection("CommandProcessor")]
     public class OnceOnlyAttributeAsyncTests
     {
         private readonly MyCommand _command;
@@ -42,7 +45,7 @@ namespace Paramore.Brighter.Core.Tests.OnceOnly
         {
             await _commandProcessor.SendAsync(_command);
             
-            Exception ex = await Assert.ThrowsAsync<OnceOnlyException>(() => _commandProcessor.SendAsync(_command));
+            Exception ex = await Assert.ThrowsAsync<OnceOnlyException>(async () => await _commandProcessor.SendAsync(_command));
             
             Assert.Equal($"A command with id {_command.Id} has already been handled", ex.Message);
  

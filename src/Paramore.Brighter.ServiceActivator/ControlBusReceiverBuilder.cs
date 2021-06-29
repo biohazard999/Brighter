@@ -153,25 +153,25 @@ namespace Paramore.Brighter.ServiceActivator.ControlBus
             var producer = _producerFactory.Create();
 
             var outbox = new SinkOutbox();
-
+            
             CommandProcessor commandProcessor = null;
             commandProcessor = CommandProcessorBuilder.With()
                 .Handlers(new HandlerConfiguration(subscriberRegistry, new ControlBusHandlerFactory(_dispatcher, () => commandProcessor)))
                 .Policies(policyRegistry)
-                .TaskQueues(new MessagingConfiguration(outbox, producer, outgoingMessageMapperRegistry))
+                .TaskQueues(new MessagingConfiguration(producer, outgoingMessageMapperRegistry), outbox)
                 .RequestContextFactory(new InMemoryRequestContextFactory())
                 .Build();
 
             // These are the control bus channels, we hardcode them because we want to know they exist, but we use
             // a base naming scheme to allow centralized management.
-            var connectionsConfiguration = new Connection[]
+            var connectionsConfiguration = new Subscription[]
             {
-                new Connection<ConfigurationCommand>(
-                    new ConnectionName($"{hostName}.{CONFIGURATION}"),
+                new Subscription<ConfigurationCommand>(
+                    new SubscriptionName($"{hostName}.{CONFIGURATION}"),
                     new ChannelName($"{hostName}.{CONFIGURATION}"),
                     new RoutingKey($"{hostName}.{CONFIGURATION}")),
-                new Connection<HeartbeatRequest>(
-                    new ConnectionName($"{hostName}.{HEARTBEAT}"),
+                new Subscription<HeartbeatRequest>(
+                    new SubscriptionName($"{hostName}.{HEARTBEAT}"),
                     new ChannelName($"{hostName}.{HEARTBEAT}"),
                     new RoutingKey($"{hostName}.{HEARTBEAT}"))
             };

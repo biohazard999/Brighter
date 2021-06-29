@@ -24,13 +24,13 @@ THE SOFTWARE. */
 #endregion
 
 using System;
-using System.Data;
-using System.Data.Common;
-using System.Data.SqlClient;
+using Microsoft.Data.SqlClient;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Inbox.Exceptions;
+using Paramore.Brighter.MsSql;
 using Paramore.Brighter.Logging;
 
 namespace Paramore.Brighter.Inbox.MsSql
@@ -40,20 +40,32 @@ namespace Paramore.Brighter.Inbox.MsSql
     /// </summary>
     public class MsSqlInbox : IAmAnInbox, IAmAnInboxAsync
     {
-        private static readonly Lazy<ILog> s_logger = new Lazy<ILog>(LogProvider.For<MsSqlInbox>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MsSqlInbox>();
 
         private const int MsSqlDuplicateKeyError_UniqueIndexViolation = 2601;
         private const int MsSqlDuplicateKeyError_UniqueConstraintViolation = 2627;
-        private readonly MsSqlInboxConfiguration _configuration;
+        private readonly MsSqlConfiguration _configuration;
+        private readonly IMsSqlConnectionProvider _connectionProvider;
 
         /// <summary>
         ///     Initializes a new instance of the <see cref="MsSqlInbox" /> class.
         /// </summary>
         /// <param name="configuration">The configuration.</param>
-        public MsSqlInbox(MsSqlInboxConfiguration configuration)
+        /// <param name="connectionProvider">The Connection Provider.</param>
+        public MsSqlInbox(MsSqlConfiguration configuration, IMsSqlConnectionProvider connectionProvider)
         {
             _configuration = configuration;
             ContinueOnCapturedContext = false;
+            _connectionProvider = connectionProvider;
+        }
+
+        /// <summary>
+        ///     Initializes a new instance of the <see cref="MsSqlInbox" /> class.
+        /// </summary>
+        /// <param name="configuration">The configuration.</param>
+        public MsSqlInbox(MsSqlConfiguration configuration) : this(configuration,
+            new MsSqlSqlAuthConnectionProvider(configuration))
+        {
         }
 
         /// <summary>
@@ -68,7 +80,7 @@ namespace Paramore.Brighter.Inbox.MsSql
         {
             var parameters = InitAddDbParameters(command, contextKey);
 
-            using (var connection = GetConnection())
+            using (var connection = _connectionProvider.GetConnection())
             {
                 connection.Open();
                 var sqlcmd = InitAddDbCommand(connection, parameters, timeoutInMilliseconds);
@@ -80,8 +92,8 @@ namespace Paramore.Brighter.Inbox.MsSql
                 {
                     if (sqlException.Number == MsSqlDuplicateKeyError_UniqueIndexViolation || sqlException.Number == MsSqlDuplicateKeyError_UniqueConstraintViolation)
                     {
-                        s_logger.Value.WarnFormat(
-                            "MsSqlOutbox: A duplicate Command with the CommandId {0} was inserted into the Outbox, ignoring and continuing",
+                        s_logger.LogWarning(
+                            "MsSqlOutbox: A duplicate Command with the CommandId {Id} was inserted into the Outbox, ignoring and continuing",
                             command.Id);
                         return;
                     }
@@ -145,7 +157,7 @@ namespace Paramore.Brighter.Inbox.MsSql
         {
             var parameters = InitAddDbParameters(command, contextKey);
 
-            using (var connection = GetConnection())
+            using (var connection = await _connectionProvider.GetConnectionAsync(cancellationToken))
             {
                 await connection.OpenAsync(cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
                 var sqlcmd = InitAddDbCommand(connection, parameters, timeoutInMilliseconds);
@@ -157,8 +169,8 @@ namespace Paramore.Brighter.Inbox.MsSql
                 {
                     if (sqlException.Number == MsSqlDuplicateKeyError_UniqueIndexViolation || sqlException.Number == MsSqlDuplicateKeyError_UniqueConstraintViolation)
                     {
-                        s_logger.Value.WarnFormat(
-                            "MsSqlOutbox: A duplicate Command with the CommandId {0} was inserted into the Outbox, ignoring and continuing",
+                        s_logger.LogWarning(
+                            "MsSqlOutbox: A duplicate Command with the CommandId {Id} was inserted into the Outbox, ignoring and continuing",
                             command.Id);
                         return;
                     }
@@ -238,15 +250,15 @@ namespace Paramore.Brighter.Inbox.MsSql
                 .ConfigureAwait(ContinueOnCapturedContext);
         }
 
-        private DbParameter CreateSqlParameter(string parameterName, object value)
+        private SqlParameter CreateSqlParameter(string parameterName, object value)
         {
             return new SqlParameter(parameterName, value ?? DBNull.Value);
         }
 
-        private T ExecuteCommand<T>(Func<DbCommand, T> execute, string sql, int timeoutInMilliseconds,
-            params DbParameter[] parameters)
+        private T ExecuteCommand<T>(Func<SqlCommand, T> execute, string sql, int timeoutInMilliseconds,
+            params SqlParameter[] parameters)
         {
-            using (var connection = GetConnection())
+            using (var connection = _connectionProvider.GetConnection())
             using (var command = connection.CreateCommand())
             {
                 if (timeoutInMilliseconds != -1) command.CommandTimeout = timeoutInMilliseconds;
@@ -260,13 +272,13 @@ namespace Paramore.Brighter.Inbox.MsSql
         }
 
         private async Task<T> ExecuteCommandAsync<T>(
-            Func<DbCommand, Task<T>> execute,
+            Func<SqlCommand, Task<T>> execute,
             string sql,
             int timeoutInMilliseconds,
             CancellationToken cancellationToken = default(CancellationToken),
-            params DbParameter[] parameters)
+            params SqlParameter[] parameters)
         {
-            using (var connection = GetConnection())
+            using (var connection = await _connectionProvider.GetConnectionAsync(cancellationToken))
             using (var command = connection.CreateCommand())
             {
                 if (timeoutInMilliseconds != -1) command.CommandTimeout = timeoutInMilliseconds;
@@ -279,12 +291,7 @@ namespace Paramore.Brighter.Inbox.MsSql
             }
         }
 
-        private DbConnection GetConnection()
-        {
-            return new SqlConnection(_configuration.ConnectionString);
-        }
-
-        private DbCommand InitAddDbCommand(DbConnection connection, DbParameter[] parameters, int timeoutInMilliseconds)
+        private SqlCommand InitAddDbCommand(SqlConnection connection, SqlParameter[] parameters, int timeoutInMilliseconds)
         {
             var sqlAdd =
                 $"insert into {_configuration.InBoxTableName} (CommandID, CommandType, CommandBody, Timestamp, ContextKey) values (@CommandID, @CommandType, @CommandBody, @Timestamp, @ContextKey)";
@@ -297,9 +304,9 @@ namespace Paramore.Brighter.Inbox.MsSql
             return sqlcmd;
         }
 
-        private DbParameter[] InitAddDbParameters<T>(T command, string contextKey) where T : class, IRequest
+        private SqlParameter[] InitAddDbParameters<T>(T command, string contextKey) where T : class, IRequest
         {
-            var commandJson = JsonConvert.SerializeObject(command);
+            var commandJson = JsonSerializer.Serialize(command, JsonSerialisationOptions.Options);
             var parameters = new[]
             {
                 CreateSqlParameter("CommandID", command.Id),
@@ -311,12 +318,12 @@ namespace Paramore.Brighter.Inbox.MsSql
             return parameters;
         }
 
-        private TResult ReadCommand<TResult>(IDataReader dr, Guid commandId) where TResult : class, IRequest
+        private TResult ReadCommand<TResult>(SqlDataReader dr, Guid commandId) where TResult : class, IRequest
         {
             if (dr.Read())
             {
                 var body = dr.GetString(dr.GetOrdinal("CommandBody"));
-                return JsonConvert.DeserializeObject<TResult>(body);
+                return JsonSerializer.Deserialize<TResult>(body, JsonSerialisationOptions.Options);
             }
 
             throw new RequestNotFoundException<TResult>(commandId);

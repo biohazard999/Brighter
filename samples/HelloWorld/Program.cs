@@ -25,9 +25,11 @@ THE SOFTWARE. */
 
 using System;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter;
 using Paramore.Brighter.Extensions.DependencyInjection;
 using Serilog;
+using Serilog.Extensions.Logging;
 
 namespace HelloWorld
 {
@@ -41,17 +43,25 @@ namespace HelloWorld
                 .WriteTo.Console()
                 .CreateLogger();
 
-            var serviceCollection = new ServiceCollection();
-
-            serviceCollection.AddBrighter().AutoFromAssemblies();
-
-            var serviceProvider = serviceCollection.BuildServiceProvider();
-
-            var commandProcessor = serviceProvider.GetService<IAmACommandProcessor>();
+            var commandProcessor = 
+                CreateServices()
+                .GetService<IAmACommandProcessor>();
             
-            commandProcessor.Send(new GreetingCommand("Ian"));
+            commandProcessor?.Send(new GreetingCommand("Ian"));
 
             Console.ReadLine();
+        }
+
+        private static ServiceProvider CreateServices()
+        {
+            var serviceCollection = new ServiceCollection();
+            serviceCollection.AddSingleton<ILoggerFactory>(new SerilogLoggerFactory());
+            serviceCollection
+                .AddBrighter()
+                .AutoFromAssemblies();
+
+            var serviceProvider = serviceCollection.BuildServiceProvider();
+            return serviceProvider;
         }
     }
 }

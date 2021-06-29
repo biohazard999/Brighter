@@ -25,10 +25,12 @@ THE SOFTWARE. */
 using System;
 using Greetings.Ports.Commands;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter;
 using Paramore.Brighter.Extensions.DependencyInjection;
 using Paramore.Brighter.MessagingGateway.RMQ;
 using Serilog;
+using Serilog.Extensions.Logging;
 
 namespace GreetingsSender
 {
@@ -43,19 +45,27 @@ namespace GreetingsSender
                 .CreateLogger();
 
             var serviceCollection = new ServiceCollection();
-            
+            serviceCollection.AddSingleton<ILoggerFactory>(new SerilogLoggerFactory());
+
             var rmqConnection = new RmqMessagingGatewayConnection
             {
                 AmpqUri = new AmqpUriSpecification(new Uri("amqp://guest:guest@localhost:5672")),
                 Exchange = new Exchange("paramore.brighter.exchange"),
             };
-            var producer = new RmqMessageProducer(rmqConnection);
-
-            serviceCollection.AddBrighter(options =>
+            
+            var producer = new RmqMessageProducer(rmqConnection, new RmqPublication
             {
-                var outBox = new InMemoryOutbox();
-                options.BrighterMessaging = new BrighterMessaging(outBox,outBox, producer, null);
-            }).AutoFromAssemblies();
+                MaxOutStandingMessages = 5,
+                MaxOutStandingCheckIntervalMilliSeconds = 500,
+                WaitForConfirmsTimeOutInMilliseconds = 1000,
+                MakeChannels =OnMissingChannel.Create
+                
+            });
+
+            serviceCollection.AddBrighter()
+                .UseInMemoryOutbox()
+                .UseExternalBus(producer, true)
+                .AutoFromAssemblies();
 
             var serviceProvider = serviceCollection.BuildServiceProvider();
 

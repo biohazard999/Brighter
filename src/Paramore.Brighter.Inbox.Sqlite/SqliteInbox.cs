@@ -26,10 +26,11 @@ THE SOFTWARE. */
 using System;
 using System.Data;
 using System.Data.Common;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
-using Newtonsoft.Json;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Inbox.Exceptions;
 using Paramore.Brighter.Logging;
 
@@ -40,7 +41,7 @@ namespace Paramore.Brighter.Inbox.Sqlite
     /// </summary>
     public class SqliteInbox : IAmAnInbox, IAmAnInboxAsync
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<SqliteInbox>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<SqliteInbox>();
 
         private const int SqliteDuplicateKeyError = 1555;
         private const int SqliteUniqueKeyError = 19;
@@ -74,8 +75,8 @@ namespace Paramore.Brighter.Inbox.Sqlite
                     {
                         if (IsExceptionUnqiueOrDuplicateIssue(sqliteException))
                         {
-                            _logger.Value.WarnFormat(
-                                "MsSqlOutbox: A duplicate Command with the CommandId {0} was inserted into the Outbox, ignoring and continuing",
+                            s_logger.LogWarning(
+                                "MsSqlOutbox: A duplicate Command with the CommandId {Id} was inserted into the Outbox, ignoring and continuing",
                                 command.Id);
                         }
                     }
@@ -169,8 +170,8 @@ namespace Paramore.Brighter.Inbox.Sqlite
                     catch (SqliteException sqliteException)
                     {
                         if (!IsExceptionUnqiueOrDuplicateIssue(sqliteException)) throw;
-                        _logger.Value.WarnFormat(
-                            "MsSqlOutbox: A duplicate Command with the CommandId {0} was inserted into the Outbox, ignoring and continuing",
+                        s_logger.LogWarning(
+                            "MsSqlOutbox: A duplicate Command with the CommandId {Id} was inserted into the Outbox, ignoring and continuing",
                             command.Id);
                     }
                 }
@@ -270,7 +271,7 @@ namespace Paramore.Brighter.Inbox.Sqlite
 
         private DbParameter[] InitAddDbParameters<T>(T command, string contextKey) where T : class, IRequest
         {
-            var commandJson = JsonConvert.SerializeObject(command);
+            var commandJson = JsonSerializer.Serialize(command, JsonSerialisationOptions.Options);
             var parameters = new[]
             {
                 CreateSqlParameter("CommandID", command.Id), //was CommandId
@@ -291,7 +292,7 @@ namespace Paramore.Brighter.Inbox.Sqlite
                     var body = dr.GetString(dr.GetOrdinal("CommandBody"));
 
                     dr.Close();
-                    return JsonConvert.DeserializeObject<TResult>(body);
+                    return JsonSerializer.Deserialize<TResult>(body, JsonSerialisationOptions.Options);
                 }
 
                 throw new RequestNotFoundException<TResult>(id);

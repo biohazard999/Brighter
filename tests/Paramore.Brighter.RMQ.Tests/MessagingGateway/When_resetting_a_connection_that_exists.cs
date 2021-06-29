@@ -29,16 +29,15 @@ using Xunit;
 
 namespace Paramore.Brighter.RMQ.Tests.MessagingGateway
 {
-    [Collection("RMQ")]
     [Trait("Category", "RMQ")]
     public class RMQMessageGatewayConnectionPoolResetConnectionExists
     {
-        private readonly RMQMessageGatewayConnectionPool _connectionPool;
+        private readonly RmqMessageGatewayConnectionPool _connectionPool;
         private readonly IConnection _originalConnection;
 
         public RMQMessageGatewayConnectionPoolResetConnectionExists()
         {
-            _connectionPool = new RMQMessageGatewayConnectionPool("MyConnectionName", 7);
+            _connectionPool = new RmqMessageGatewayConnectionPool("MyConnectionName", 7);
 
             var connectionFactory = new ConnectionFactory { HostName = "localhost" };
 

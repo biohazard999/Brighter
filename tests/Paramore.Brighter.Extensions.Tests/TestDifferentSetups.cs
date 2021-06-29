@@ -30,14 +30,12 @@ namespace Tests
         public void WithProducer()
         {
             var serviceCollection = new ServiceCollection();
+            var producer = new FakeProducer();
             
             serviceCollection
-                .AddBrighter(options =>
-                {
-                    var outBox = new InMemoryOutbox();
-                    var producer = new FakeProducer();
-                    options.BrighterMessaging = new BrighterMessaging(outBox, outBox, producer, producer);
-                })
+                .AddBrighter()
+                .UseInMemoryOutbox()
+                .UseExternalBus(producer, false)
                 .AutoFromAssemblies();
 
             var serviceProvider = serviceCollection.BuildServiceProvider();
@@ -97,8 +95,10 @@ namespace Tests
     }
 
     internal class FakeProducer : IAmAMessageProducer, IAmAMessageProducerAsync
-
     {
+        public int MaxOutStandingMessages { get; set; } = -1;
+        public int MaxOutStandingCheckIntervalMilliSeconds { get; set; } = 0;
+ 
         public void Dispose()
         {
             throw new NotImplementedException();

@@ -11,8 +11,11 @@ name: CI
 on:
   push:
     branches: [ master ]
+    tags:
+      - '*.*.*'
   pull_request:
     branches: [ master ]
+  
 env:
  # Stop wasting time caching packages
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
@@ -27,79 +30,58 @@ env:
 
 jobs:
   build:
+    timeout-minutes: 30
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v2
-      - name: Setup dotnet 5.0.x
+      - name: setup-dotnet tests-sdk
         uses: actions/setup-dotnet@v1
         with:
-          dotnet-version: 5.0.x
-      - name: Install dependencies
-        run: dotnet restore
+          dotnet-version: "3.1.*"
+      - uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: "5.0.*"
+      - run: dotnet --info
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v2
+        with:
+          path: ~/.nuget/packages
+          key: Linux-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            Linux-nuget-
       - name: Build
-        run: dotnet build --configuration Release --no-restore 
-      - uses: actions/upload-artifact@v2
-        with:
-          name: dotnet artifacts
-          path: |
-            ./
-            src/
-            tests/
-  
-  test:
-    runs-on: ubuntu-latest
-    needs: [build]
-
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-
-    steps:
-      - uses: actions/checkout@v2
-      - name: Setup dotnet 3.1
-        uses: actions/setup-dotnet@v1
-        with:
-          dotnet-version: '3.1.x'
-      - name: Setup dotnet 5.0.x
-        uses: actions/setup-dotnet@v1
-        with:
-          dotnet-version: 5.0.x
-      - name: Install dependencies
-        run: dotnet restore
+        run: dotnet build --configuration Release
       - name: Core Tests
-        run: dotnet test tests/Paramore.Brighter.Core.Tests/Paramore.Brighter.Core.Tests.csproj -c Release --no-restore --logger "console;verbosity=normal" --blame -v n
-
-  package:
-    runs-on: ubuntu-latest
-    needs: [test]
-    
-    steps:
-      - uses: actions/download-artifact@v2
-        with:
-          name: dotnet artifacts
-      - uses: actions/upload-artifact@v2
+        run: dotnet test tests/Paramore.Brighter.Core.Tests/Paramore.Brighter.Core.Tests.csproj --filter "Fragile!=CI" -c Release --no-restore --no-build --verbosity d
+      - name: Upload packages as artifacts
+        uses: actions/upload-artifact@v2
         with:
           name: nuget packages
           path: "**/*.nupkg"
-      
-  prerelease:
-    runs-on: ubuntu-latest
-    needs: [package]
-    
-    steps:
-      - uses: actions/download-artifact@v2
-        with:
-          name: nuget packages
-      - name: to GitHub Feed
+      - name: Push to GitHub Feed
         run: dotnet nuget push **/*.nupkg --source https://nuget.pkg.github.com/${REPOSITORY_OWNER}/index.json --api-key ${GITHUB_TOKEN} --skip-duplicate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+
+
+  release:
+    if: startsWith(github.ref, 'refs/tags')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [build]
+    steps:
+      - uses: actions/download-artifact@v2
+        with:
+          name: nuget packages
+      - name: Push generated package to NuGet
+        run: dotnet nuget push **/*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{ secrets.NUGET_KEY }} --skip-duplicate
     
   memory:
     runs-on: ubuntu-latest
-    needs: [test]
+    timeout-minutes: 5
+    needs: [build]
     
     steps:
       - uses: actions/checkout@v2
@@ -114,11 +96,12 @@ jobs:
       - name: Install dependencies
         run: dotnet restore
       - name: In Memory Transport Tests
-        run: dotnet test ./tests/Paramore.Brighter.InMemory.Tests/Paramore.Brighter.InMemory.Tests.csproj --configuration Release --logger "console;verbosity=normal" --blame -v n  
+        run: dotnet test ./tests/Paramore.Brighter.InMemory.Tests/Paramore.Brighter.InMemory.Tests.csproj --filter "Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n  
         
   redis-ci:
     runs-on: ubuntu-latest
-    needs: [test]
+    timeout-minutes: 5
+    needs: [build]
     
     services:
       redis:  
@@ -144,11 +127,12 @@ jobs:
       - name: Install dependencies
         run: dotnet restore
       - name: Redis Transport Tests
-        run: dotnet test ./tests/Paramore.Brighter.Redis.Tests/Paramore.Brighter.Redis.Tests.csproj --configuration Release --logger "console;verbosity=normal" --blame -v n
+        run: dotnet test ./tests/Paramore.Brighter.Redis.Tests/Paramore.Brighter.Redis.Tests.csproj --filter "Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n
   
   rabbitmq-ci:
     runs-on: ubuntu-latest
-    needs: [test]
+    timeout-minutes: 5
+    needs: [build]
 
     services:
       rabbitmq:
@@ -175,12 +159,17 @@ jobs:
       - name: Install dependencies
         run: dotnet restore
       - name: RMQ Transport Tests
-        run: dotnet test ./tests/Paramore.Brighter.RMQ.Tests/Paramore.Brighter.RMQ.Tests.csproj --configuration Release --logger "console;verbosity=normal" --blame -v n
+        run: dotnet test ./tests/Paramore.Brighter.RMQ.Tests/Paramore.Brighter.RMQ.Tests.csproj --filter "Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n
 
   kafka-ci:
     runs-on: ubuntu-latest
-    needs: [test]
-    
+    timeout-minutes: 20
+    needs: [build]
+    env:
+      CONFLUENT_BOOSTRAP_SERVER: ${{ secrets.CONFLUENT_BOOSTRAP_SERVER }}
+      CONFLUENT_SASL_PASSWORD: ${{ secrets.CONFLUENT_SASL_PASSWORD }}
+      CONFLUENT_SASL_USERNAME: ${{ secrets.CONFLUENT_SASL_USERNAME }}
+
     services:
       zookeeper:
         image: confluentinc/cp-zookeeper:latest
@@ -202,7 +191,7 @@ jobs:
           KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
           KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
           KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
-          KAFKA_DELETE_TOPIC_ENABLE: "true"
+          KAFKA_DELETE_TOPIC_ENABLE: "false"
 
     steps:
     - name: Install KafkaCat
@@ -226,18 +215,13 @@ jobs:
         dotnet-version: 5.0.x
     - name: Install dependencies
       run: dotnet restore
-    # - name: Debugging with tmate
-    #   uses: mxschmitt/action-tmate@v3.1
-    - name: Kafka Install Check
-      run:  kafkacat -L -b localhost
     - name: Kafka Transport Tests
-      run: dotnet test ./tests/Paramore.Brighter.Kafka.Tests/Paramore.Brighter.Kafka.Tests.csproj --configuration Release --logger "console;verbosity=normal" --blame -v n
-
- 
+      run: dotnet test ./tests/Paramore.Brighter.Kafka.Tests/Paramore.Brighter.Kafka.Tests.csproj --filter "Category=Kafka&Category!=Confluent&Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n
  
   postgres-ci:
     runs-on: ubuntu-latest
-    needs: [test]
+    timeout-minutes: 5
+    needs: [build]
   
     services:
       postgres:
@@ -264,15 +248,16 @@ jobs:
       - name: Install dependencies
         run: dotnet restore
       - name: Postgres Tests
-        run: dotnet test ./tests/Paramore.Brighter.PostgresSQL.Tests/Paramore.Brighter.PostgresSQL.Tests.csproj --configuration Release --logger "console;verbosity=normal" --blame -v n
+        run: dotnet test ./tests/Paramore.Brighter.PostgresSQL.Tests/Paramore.Brighter.PostgresSQL.Tests.csproj --filter "Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n
         
   eventstore-ci:
     runs-on: ubuntu-latest
-    needs: [test]
+    timeout-minutes: 10
+    needs: [build]
     
     services:
       evenstore: 
-       image: eventstore/eventstore
+       image: eventstore/eventstore:release-5.0.9
        ports: 
          - 1113:1113
          - 2113:2113
@@ -299,20 +284,21 @@ jobs:
       - name: Install dependencies
         run: dotnet restore
       - name: EventStore Tests
-        run: dotnet test ./tests/Paramore.Brighter.EventStore.Tests/Paramore.Brighter.EventStore.Tests.csproj --configuration Release --logger "console;verbosity=normal" --blame -v n
+        run: dotnet test ./tests/Paramore.Brighter.EventStore.Tests/Paramore.Brighter.EventStore.Tests.csproj  --filter "Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n
   
   sqlserver-ci:
     runs-on: ubuntu-latest
-    needs: [test]
+    timeout-minutes: 5
+    needs: [build]
   
     services:
-      postgres:
-        image: microsoft/mssql-server-linux
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server
         ports: 
-          - 1433:1433
+          - 11433:1433
         env:
           ACCEPT_EULA: Y
-          SA_PASSWORD: Password123!
+          SA_PASSWORD: Password1!
     steps:
       - uses: actions/checkout@v2
       - name: Setup dotnet 3.1
@@ -326,11 +312,12 @@ jobs:
       - name: Install dependencies
         run: dotnet restore
       - name: MSSQL Tests
-        run: dotnet test ./tests/Paramore.Brighter.MSSQL.Tests/Paramore.Brighter.MSSQL.Tests.csproj --configuration Release --logger "console;verbosity=normal" --blame -v n
+        run: dotnet test ./tests/Paramore.Brighter.MSSQL.Tests/Paramore.Brighter.MSSQL.Tests.csproj --filter "Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n
         
   mysql-ci:
     runs-on: ubuntu-latest
-    needs: [test]
+    timeout-minutes: 5
+    needs: [build]
   
     services:
       mariadb:
@@ -362,11 +349,12 @@ jobs:
             sleep 1
           done
       - name: MySQL Tests
-        run: dotnet test ./tests/Paramore.Brighter.MySQL.Tests/Paramore.Brighter.MySQL.Tests.csproj --configuration Release --logger "console;verbosity=normal" --blame -v n
+        run: dotnet test ./tests/Paramore.Brighter.MySQL.Tests/Paramore.Brighter.MySQL.Tests.csproj --filter "Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n
 
   dynamo-ci:
     runs-on: ubuntu-latest
-    needs: [test]
+    timeout-minutes: 5
+    needs: [build]
   
     services:
       dynamo:
@@ -387,15 +375,16 @@ jobs:
       - name: Install dependencies
         run: dotnet restore
       - name: DynamoDB Tests
-        run: dotnet test ./tests/Paramore.Brighter.DynamoDB.Tests/Paramore.Brighter.DynamoDB.Tests.csproj --configuration Release --logger "console;verbosity=normal" --blame -v n
+        run: dotnet test ./tests/Paramore.Brighter.DynamoDB.Tests/Paramore.Brighter.DynamoDB.Tests.csproj --filter "Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n
 
   aws-ci:
     runs-on: ubuntu-latest
-    needs: [test]
+    timeout-minutes: 5
+    needs: [build]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: eu-west-1
+      AWS_REGION: us-west-2
       AWS_DEFAULT_OUTPUT: json    
       
     steps:
@@ -420,4 +409,23 @@ jobs:
         run: |
           aws sns list-topics
       - name: SQS Tests
-        run: dotnet test ./tests/Paramore.Brighter.AWSSQS.Tests/Paramore.Brighter.AWSSQS.Tests.csproj --configuration Release --logger "console;verbosity=normal" --blame -v n
+        run: dotnet test ./tests/Paramore.Brighter.AWSSQS.Tests/Paramore.Brighter.AWSSQS.Tests.csproj --filter "Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n
+
+  azure-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup dotnet 3.1
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: '3.1.x'
+      - name: Setup dotnet 5.0.x
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: 5.0.x
+      - name: Install dependencies
+        run: dotnet restore
+      - name: Azure Tests
+        run: dotnet test ./tests/Paramore.Brighter.AzureServiceBus.Tests/Paramore.Brighter.AzureServiceBus.Tests.csproj --filter "Fragile!=CI" --configuration Release --logger "console;verbosity=normal" --blame -v n

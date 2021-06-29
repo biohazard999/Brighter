@@ -34,6 +34,7 @@ using Xunit;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors
 {
+    [Collection("CommandProcessor")]
     public class CommandProcessorPublishMultipleMatchesAsyncTests
     {
         private readonly CommandProcessor _commandProcessor;
@@ -63,7 +64,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors
         [Fact]
         public async Task When_There_Are_Multiple_Subscribers_Async()
         {
-            _exception = await Catch.ExceptionAsync(() => _commandProcessor.PublishAsync(_myEvent));
+            _exception = await Catch.ExceptionAsync(async () => await _commandProcessor.PublishAsync(_myEvent));
 
             //_should_not_throw_an_exception
             _exception.Should().BeNull();

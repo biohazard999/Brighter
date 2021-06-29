@@ -37,7 +37,7 @@ using Paramore.Brighter.Extensions.DependencyInjection;
 
 namespace Paramore.Brighter.Core.Tests.MessageDispatch
 {
-    public class MessageDispatcherMultipleConnectionTests
+    public class MessageDispatcherMultipleConnectionTests : IDisposable
     {
         private readonly Dispatcher _dispatcher;
         private readonly FakeChannel _eventChannel;
@@ -59,9 +59,9 @@ namespace Paramore.Brighter.Core.Tests.MessageDispatch
             messageMapperRegistry.Register<MyCommand, MyCommandMessageMapper>();
 
 
-            var myEventConnection = new Connection<MyEvent>(new ConnectionName("test"), noOfPerformers: 1, timeoutInMilliseconds: 1000, channelFactory: new InMemoryChannelFactory(_eventChannel), channelName: new ChannelName("fakeChannel"), routingKey: new RoutingKey("fakekey"));
-            var myCommandConnection = new Connection<MyCommand>(new ConnectionName("anothertest"), noOfPerformers: 1, timeoutInMilliseconds: 1000, channelFactory: new InMemoryChannelFactory(_commandChannel), channelName: new ChannelName("fakeChannel"), routingKey: new RoutingKey("fakekey"));
-            _dispatcher = new Dispatcher(commandProcessor, messageMapperRegistry, new List<Connection> { myEventConnection, myCommandConnection });
+            var myEventConnection = new Subscription<MyEvent>(new SubscriptionName("test"), noOfPerformers: 1, timeoutInMilliseconds: 1000, channelFactory: new InMemoryChannelFactory(_eventChannel), channelName: new ChannelName("fakeChannel"), routingKey: new RoutingKey("fakekey"));
+            var myCommandConnection = new Subscription<MyCommand>(new SubscriptionName("anothertest"), noOfPerformers: 1, timeoutInMilliseconds: 1000, channelFactory: new InMemoryChannelFactory(_commandChannel), channelName: new ChannelName("fakeChannel"), routingKey: new RoutingKey("fakekey"));
+            _dispatcher = new Dispatcher(commandProcessor, messageMapperRegistry, new List<Subscription> { myEventConnection, myCommandConnection });
 
             var @event = new MyEvent();
             var eventMessage = new MyEventMessageMapper().MapToMessage(@event);
@@ -93,6 +93,12 @@ namespace Paramore.Brighter.Core.Tests.MessageDispatch
             _dispatcher.Consumers.Should().BeEmpty();
             //_should_of_had_2_consumers_when_running
             _numberOfConsumers.Should().Be(2);
+        }
+        
+        public void Dispose()
+        {
+            if (_dispatcher?.State == DispatcherState.DS_RUNNING)
+                _dispatcher.End().Wait();
         }
 
     }

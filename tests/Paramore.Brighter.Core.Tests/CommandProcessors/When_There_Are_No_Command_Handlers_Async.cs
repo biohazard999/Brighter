@@ -33,6 +33,7 @@ using Xunit;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors
 {
+    [Collection("CommandProcessor")]
     public class CommandProcessorNoHandlersMatchAsyncTests
     {
         private readonly CommandProcessor _commandProcessor;
@@ -52,7 +53,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors
         [Fact]
         public async Task When_There_Are_No_Command_Handlers_Async()
         {
-            _exception = await Catch.ExceptionAsync(() => _commandProcessor.SendAsync(_myCommand));
+            _exception = await Catch.ExceptionAsync(async () => await _commandProcessor.SendAsync(_myCommand));
 
             //_should_fail_because_multiple_receivers_found
             _exception.Should().BeOfType<ArgumentException>();

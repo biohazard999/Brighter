@@ -34,6 +34,7 @@ using Xunit;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors
 {
+    [Collection("CommandProcessor")]
     public class PublishingToMultipleSubscribersAsyncTests
     {
         private readonly CommandProcessor _commandProcessor;
@@ -64,7 +65,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors
         [Fact]
         public async Task When_Publishing_To_Multiple_Subscribers_Should_Aggregate_Exceptions_Async()
         {
-            _exception = await Catch.ExceptionAsync(() => _commandProcessor.PublishAsync(_myEvent));
+            _exception = await Catch.ExceptionAsync(async () => await _commandProcessor.PublishAsync(_myEvent));
 
             //_should_throw_an_aggregate_exception
             _exception.Should().BeOfType<AggregateException>();

@@ -26,6 +26,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Extensions;
 using Paramore.Brighter.Logging;
 using RabbitMQ.Client;
@@ -37,7 +38,7 @@ namespace Paramore.Brighter.MessagingGateway.RMQ
     /// </summary>
 internal class RmqMessagePublisher
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<RmqMessagePublisher>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<RmqMessagePublisher>();
         private static readonly string[] _headersToReset =
         {
             HeaderNames.DELAY_MILLISECONDS,
@@ -49,34 +50,36 @@ internal class RmqMessagePublisher
         };
 
         private readonly IModel _channel;
-        private readonly string _exchangeName;
+        private RmqMessagingGatewayConnection _connection;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="RmqMessagePublisher"/> class.
         /// </summary>
         /// <param name="channel">The channel.</param>
-        /// <param name="exchangeName">Name of the exchange.</param>
+        /// <param name="connection">The exchange we want to talk to.</param>
+        /// <param name="makeChannel">Do we create the exchange, if it does not exist? Note that without a bound consumer, messages are discarded</param>
         /// <exception cref="System.ArgumentNullException">
         /// channel
         /// or
         /// exchangeName
         /// </exception>
-        public RmqMessagePublisher(IModel channel, string exchangeName) 
+        public RmqMessagePublisher(IModel channel, RmqMessagingGatewayConnection connection) 
         {
             if (channel is null)
             {
                 throw new ArgumentNullException(nameof(channel));
             }
-            if (exchangeName is null)
+            if (connection is null)
             {
-                throw new ArgumentNullException(nameof(exchangeName));
+                throw new ArgumentNullException(nameof(connection));
             }
 
+            _connection = connection;
+            
             _channel = channel;
-            _exchangeName = exchangeName;
-        }
+       }
 
-        /// <summary>
+       /// <summary>
         /// Publishes the message.
         /// </summary>
         /// <param name="message">The message.</param>
@@ -108,7 +111,7 @@ internal class RmqMessagePublisher
                 headers.Add(HeaderNames.DELAY_MILLISECONDS, delayMilliseconds);
 
             _channel.BasicPublish(
-                _exchangeName,
+                _connection.Exchange.Name,
                 message.Header.Topic,
                 false,
                 CreateBasicProperties(
@@ -122,7 +125,7 @@ internal class RmqMessagePublisher
                 message.Body.Bytes);
         }
 
-        /// <summary>
+       /// <summary>
         /// Requeues the message.
         /// </summary>
         /// <param name="message">The message.</param>
@@ -133,7 +136,7 @@ internal class RmqMessagePublisher
             var messageId = Guid.NewGuid() ;
             const string deliveryTag = "1";
 
-            _logger.Value.InfoFormat("RmqMessagePublisher: Regenerating message {0} with DeliveryTag of {1} to {2} with DeliveryTag of {3}", message.Id, deliveryTag, messageId, 1);
+            s_logger.LogInformation("RmqMessagePublisher: Regenerating message {Id} with DeliveryTag of {1} to {2} with DeliveryTag of {DeliveryTag}", message.Id, deliveryTag, messageId, 1);
 
             var headers = new Dictionary<string, object>
             {
@@ -200,7 +203,7 @@ internal class RmqMessagePublisher
 
             return basicProperties;
         }
-
+        
         /// <summary>
         /// Supports the AMQP 0-8/0-9 standard entry types S, I, D, T
         /// and F, as well as the QPid-0-8 specific b, d, f, l, s, t

@@ -27,10 +27,11 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
-using Newtonsoft.Json;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
 
 namespace Paramore.Brighter.Outbox.Sqlite
@@ -44,7 +45,7 @@ namespace Paramore.Brighter.Outbox.Sqlite
         IAmAnOutboxViewer<Message>,
         IAmAnOutboxViewerAsync<Message>
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<SqliteOutbox>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<SqliteOutbox>();
 
         private const int SqliteDuplicateKeyError = 1555;
         private const int SqliteUniqueKeyError = 19;
@@ -97,8 +98,8 @@ namespace Paramore.Brighter.Outbox.Sqlite
                     {
                         if (IsExceptionUnqiueOrDuplicateIssue(sqlException))
                         {
-                            _logger.Value.WarnFormat(
-                                "MsSqlOutbox: A duplicate Message with the MessageId {0} was inserted into the Outbox, ignoring and continuing",
+                            s_logger.LogWarning(
+                                "MsSqlOutbox: A duplicate Message with the MessageId {Id} was inserted into the Outbox, ignoring and continuing",
                                 message.Id);
                             return;
                         }
@@ -130,7 +131,7 @@ namespace Paramore.Brighter.Outbox.Sqlite
                     {
                         if (IsExceptionUnqiueOrDuplicateIssue(sqlException))
                         {
-                            _logger.Value.WarnFormat("MsSqlOutbox: A duplicate Message with the MessageId {0} was inserted into the Outbox, ignoring and continuing",
+                            s_logger.LogWarning("MsSqlOutbox: A duplicate Message with the MessageId {Id} was inserted into the Outbox, ignoring and continuing",
                                 message.Id);
                             return;
                         }
@@ -399,7 +400,7 @@ namespace Paramore.Brighter.Outbox.Sqlite
 
         private void CreatePagedOutstandingCommand(SqliteCommand command, double milliSecondsSinceAdded, int pageSize, int pageNumber)
         {
-            var pagingSqlFormat = "SELECT * FROM {0} AS TBL WHERE DISPATCHED IS NULL AND TIMESTAMP < DATEADD(millisecond, @OutStandingSince, getdate()) ORDER BY Timestamp DESC limit @PageSize OFFSET @PageNumber";
+            var pagingSqlFormat = "SELECT * FROM {0} AS TBL WHERE DISPATCHED IS NULL AND TIMESTAMP < DATEADD(millisecond, -@OutStandingSince, getdate()) ORDER BY Timestamp ASC limit @PageSize OFFSET @PageNumber";
             var parameters = new[]
             {
                 CreateSqlParameter("PageNumber", pageNumber),
@@ -462,7 +463,7 @@ namespace Paramore.Brighter.Outbox.Sqlite
 
         private SqliteParameter[] InitAddDbParameters(Message message)
         {
-            var bagJson = JsonConvert.SerializeObject(message.Header.Bag);
+            var bagJson = JsonSerializer.Serialize(message.Header.Bag, JsonSerialisationOptions.Options);
             return new[]
             {
                 new SqliteParameter("@MessageId", SqliteType.Text) {Value = message.Id.ToString()},
@@ -520,7 +521,7 @@ namespace Paramore.Brighter.Outbox.Sqlite
                     replyTo: replyTo,
                     contentType: contentType);
 
-                Dictionary<string, string> dictionaryBag = GetContextBag(dr);
+                Dictionary<string, object> dictionaryBag = GetContextBag(dr);
                 if (dictionaryBag != null)
                 {
                     foreach (var key in dictionaryBag.Keys)
@@ -568,11 +569,11 @@ namespace Paramore.Brighter.Outbox.Sqlite
             return replyTo;
         }
 
-        private static Dictionary<string, string> GetContextBag(IDataReader dr)
+        private static Dictionary<string, object> GetContextBag(IDataReader dr)
         {
             var i = dr.GetOrdinal("HeaderBag");
             var headerBag = dr.IsDBNull(i) ? "" : dr.GetString(i);
-            var dictionaryBag = JsonConvert.DeserializeObject<Dictionary<string, string>>(headerBag);
+            var dictionaryBag = JsonSerializer.Deserialize<Dictionary<string, object>>(headerBag, JsonSerialisationOptions.Options);
             return dictionaryBag;
         }
 

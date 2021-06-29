@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -30,30 +30,53 @@ namespace Paramore.Brighter.ServiceActivator
     {
         private readonly IAmACommandProcessor _commandProcessor;
         private readonly IAmAMessageMapperRegistry _messageMapperRegistry;
-        private readonly Connection _connection;
+        private readonly Subscription _subscription;
         private readonly ConsumerName _consumerName;
 
-        public ConsumerFactory(IAmACommandProcessor commandProcessor, IAmAMessageMapperRegistry messageMapperRegistry, Connection connection)
+        public ConsumerFactory(IAmACommandProcessor commandProcessor, IAmAMessageMapperRegistry messageMapperRegistry, Subscription subscription)
         {
             _commandProcessor = commandProcessor;
             _messageMapperRegistry = messageMapperRegistry;
-            _connection = connection;
-            _consumerName = new ConsumerName($"{_connection.Name}-{Guid.NewGuid()}");
+            _subscription = subscription;
+            _consumerName = new ConsumerName($"{_subscription.Name}-{Guid.NewGuid()}");
         }
 
         public Consumer Create()
         {
-            var channel = _connection.ChannelFactory.CreateChannel(_connection);
-            var messagePump = new MessagePump<TRequest>(_commandProcessor, _messageMapperRegistry.Get<TRequest>())
+            if (_subscription.RunAsync)
+                return CreateAsync();
+            else
+                return CreateBlocking();
+        }
+
+        private Consumer CreateBlocking()
+        {
+            var channel = _subscription.ChannelFactory.CreateChannel(_subscription);
+            var messagePump = new MessagePumpBlocking<TRequest>(_commandProcessor, _messageMapperRegistry.Get<TRequest>())
             {
                 Channel = channel,
-                TimeoutInMilliseconds = _connection.TimeoutInMiliseconds,
-                RequeueCount = _connection.RequeueCount,
-                RequeueDelayInMilliseconds = _connection.RequeueDelayInMilliseconds,
-                UnacceptableMessageLimit = _connection.UnacceptableMessageLimit
+                TimeoutInMilliseconds = _subscription.TimeoutInMiliseconds,
+                RequeueCount = _subscription.RequeueCount,
+                RequeueDelayInMilliseconds = _subscription.RequeueDelayInMilliseconds,
+                UnacceptableMessageLimit = _subscription.UnacceptableMessageLimit
             };
 
-            return new Consumer(_consumerName, _connection.Name, channel, messagePump);
+            return new Consumer(_consumerName, _subscription.Name, channel, messagePump);
         }
-   }
+
+        private Consumer CreateAsync()
+        {
+            var channel = _subscription.ChannelFactory.CreateChannel(_subscription);
+            var messagePump = new MessagePumpAsync<TRequest>(_commandProcessor, _messageMapperRegistry.Get<TRequest>())
+            {
+                Channel = channel,
+                TimeoutInMilliseconds = _subscription.TimeoutInMiliseconds,
+                RequeueCount = _subscription.RequeueCount,
+                RequeueDelayInMilliseconds = _subscription.RequeueDelayInMilliseconds,
+                UnacceptableMessageLimit = _subscription.UnacceptableMessageLimit
+            };
+
+            return new Consumer(_consumerName, _subscription.Name, channel, messagePump);
+        }
+    }
 }

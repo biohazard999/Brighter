@@ -1,16 +1,14 @@
 ﻿using System;
+using System.Text.Json;
 using Amazon;
 using Amazon.Runtime;
-using Amazon.Runtime.CredentialManagement;
 using FluentAssertions;
-using Newtonsoft.Json;
 using Paramore.Brighter.AWSSQS.Tests.TestDoubles;
 using Paramore.Brighter.MessagingGateway.AWSSQS;
 using Xunit;
 
 namespace Paramore.Brighter.AWSSQS.Tests.MessagingGateway
 {
-    [Collection("AWS")]
     [Trait("Category", "AWS")]
     public class SqsMessageProducerSendTests : IDisposable
     {
@@ -23,7 +21,6 @@ namespace Paramore.Brighter.AWSSQS.Tests.MessagingGateway
         private readonly string _replyTo;
         private readonly string _contentType;
         private readonly string _topicName;
-        private Connection<MyCommand> _connection; 
 
         public SqsMessageProducerSendTests()
         {
@@ -33,23 +30,28 @@ namespace Paramore.Brighter.AWSSQS.Tests.MessagingGateway
             _contentType = "text\\plain";
             var channelName = $"Producer-Send-Tests-{Guid.NewGuid().ToString()}".Truncate(45);
             _topicName = $"Producer-Send-Tests-{Guid.NewGuid().ToString()}".Truncate(45);
-            _connection = new Connection<MyCommand>(
-                name: new ConnectionName(channelName),
+            var routingKey = new RoutingKey(_topicName);
+            
+            SqsSubscription<MyCommand> subscription = new(
+                name: new SubscriptionName(channelName),
                 channelName: new ChannelName(channelName),
-                routingKey: new RoutingKey(_topicName)
-                );
+                routingKey: routingKey
+            );
             
             _message = new Message(
                 new MessageHeader(_myCommand.Id, _topicName, MessageType.MT_COMMAND, _correlationId, _replyTo, _contentType),
-                new MessageBody(JsonConvert.SerializeObject((object) _myCommand))
+                new MessageBody(JsonSerializer.Serialize((object) _myCommand, JsonSerialisationOptions.Options))
             );
 
 
             (AWSCredentials credentials, RegionEndpoint region) = CredentialsChain.GetAwsCredentials();
             var awsConnection = new AWSMessagingGatewayConnection(credentials, region);
-            _channelFactory = new ChannelFactory(awsConnection, new SqsMessageConsumerFactory(awsConnection));
-            _channel = _channelFactory.CreateChannel(_connection);
-            _messageProducer = new SqsMessageProducer(awsConnection);
+            
+            //We need to do this manually in a test - will create the channel from subscriber parameters
+            _channelFactory = new ChannelFactory(awsConnection);
+            _channel = _channelFactory.CreateChannel(subscription);
+            
+            _messageProducer = new SqsMessageProducer(awsConnection, new SqsPublication{MakeChannels = OnMissingChannel.Create});
         }
 
 
@@ -60,7 +62,7 @@ namespace Paramore.Brighter.AWSSQS.Tests.MessagingGateway
             //arrange
             _messageProducer.Send(_message);
             
-            var message =_channel.Receive(1000);
+            var message =_channel.Receive(5000);
             
             //clear the queue
             _channel.Acknowledge(message);

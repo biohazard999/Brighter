@@ -1,24 +1,31 @@
 ﻿using System;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
+using Paramore.Brighter.MsSql;
 
 namespace Paramore.Brighter.MessagingGateway.MsSql
 {
     public class MsSqlMessageProducerFactory : IAmAMessageProducerFactory
     {
-        private readonly MsSqlMessagingGatewayConfiguration _msSqlMessagingGatewayConfiguration;
-        private static readonly Lazy<ILog> Logger = new Lazy<ILog>(LogProvider.For<MsSqlMessageProducerFactory>);
+        private readonly MsSqlConfiguration _msSqlConfiguration;
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MsSqlMessageProducerFactory>();
+        private Publication _publication; //-- placeholder for future use
 
-        public MsSqlMessageProducerFactory(MsSqlMessagingGatewayConfiguration msSqlMessagingGatewayConfiguration)
+        public MsSqlMessageProducerFactory(
+            MsSqlConfiguration msSqlConfiguration,
+            Publication publication = null)
         {
-            _msSqlMessagingGatewayConfiguration = msSqlMessagingGatewayConfiguration ??
-                                                  throw new ArgumentNullException(
-                                                      nameof(msSqlMessagingGatewayConfiguration));
+            _msSqlConfiguration = 
+                msSqlConfiguration ?? throw new ArgumentNullException(nameof(msSqlConfiguration));
+            if (string.IsNullOrEmpty(msSqlConfiguration.QueueStoreTable))
+                throw new ArgumentNullException(nameof(msSqlConfiguration.QueueStoreTable));
+            _publication = publication ?? new Publication() {MakeChannels = OnMissingChannel.Create};
         }
 
         public IAmAMessageProducer Create()
         {
-            Logger.Value.Debug($"MsSqlMessageProducerFactory: create producer");
-            return new MsSqlMessageProducer(_msSqlMessagingGatewayConfiguration);
+            s_logger.LogDebug("MsSqlMessageProducerFactory: create producer");
+            return new MsSqlMessageProducer(_msSqlConfiguration, _publication);
         }
     }
 }

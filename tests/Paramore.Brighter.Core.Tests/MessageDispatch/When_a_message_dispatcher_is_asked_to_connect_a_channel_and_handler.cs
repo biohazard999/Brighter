@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -22,6 +22,7 @@ THE SOFTWARE. */
 
 #endregion
 
+using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using FluentAssertions;
@@ -33,7 +34,7 @@ using Paramore.Brighter.ServiceActivator.TestHelpers;
 
 namespace Paramore.Brighter.Core.Tests.MessageDispatch
 {
-    public class MessageDispatcherRoutingTests
+    public class MessageDispatcherRoutingTests : IDisposable
     {
         private readonly Dispatcher _dispatcher;
         private readonly FakeChannel _channel;
@@ -47,14 +48,14 @@ namespace Paramore.Brighter.Core.Tests.MessageDispatch
             var messageMapperRegistry = new MessageMapperRegistry(new SimpleMessageMapperFactory((_) => new MyEventMessageMapper()));
             messageMapperRegistry.Register<MyEvent, MyEventMessageMapper>();
 
-            var connection = new Connection<MyEvent>(
-                new ConnectionName("test"), 
+            var connection = new Subscription<MyEvent>(
+                new SubscriptionName("test"), 
                 noOfPerformers: 1, 
                 timeoutInMilliseconds: 1000, 
                 channelFactory: new InMemoryChannelFactory(_channel),
                 channelName: new ChannelName("fakeChannel"), 
                 routingKey: new RoutingKey("fakekey"));
-            _dispatcher = new Dispatcher(_commandProcessor, messageMapperRegistry, new List<Connection> { connection });
+            _dispatcher = new Dispatcher(_commandProcessor, messageMapperRegistry, new List<Subscription> { connection });
 
             var @event = new MyEvent();
             var message = new MyEventMessageMapper().MapToMessage(@event);
@@ -78,6 +79,12 @@ namespace Paramore.Brighter.Core.Tests.MessageDispatch
             _commandProcessor.Observe<MyEvent>().Should().NotBeNull();
             //_should_have_published_async
             _commandProcessor.Commands.Should().Contain(ctype => ctype == CommandType.Publish);
+        }
+        
+        public void Dispose()
+        {
+            if (_dispatcher?.State == DispatcherState.DS_RUNNING)
+                _dispatcher.End().Wait();
         }
     }
 }

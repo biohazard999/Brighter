@@ -27,6 +27,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Extensions;
 using Paramore.Brighter.Logging;
 
@@ -40,7 +41,7 @@ namespace Paramore.Brighter.ServiceActivator
     /// </summary>
     public class Dispatcher : IDispatcher
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<Dispatcher>);
+        private static readonly ILogger s_logger= ApplicationLogging.CreateLogger<Dispatcher>();
 
         private Task _controlTask;
         private readonly IAmAMessageMapperRegistry _messageMapperRegistry;
@@ -57,7 +58,7 @@ namespace Paramore.Brighter.ServiceActivator
         /// Gets the connections.
         /// </summary>
         /// <value>The connections.</value>
-        public IEnumerable<Connection> Connections { get; private set; }
+        public IEnumerable<Subscription> Connections { get; private set; }
 
         /// <summary>
         /// Gets the <see cref="Consumer"/>s
@@ -87,7 +88,7 @@ namespace Paramore.Brighter.ServiceActivator
         public Dispatcher(
             IAmACommandProcessor commandProcessor, 
             IAmAMessageMapperRegistry messageMapperRegistry,
-            IEnumerable<Connection> connections)
+            IEnumerable<Subscription> connections)
         {
             CommandProcessor = commandProcessor;
             Connections = connections;
@@ -109,7 +110,7 @@ namespace Paramore.Brighter.ServiceActivator
         {
             if (State == DispatcherState.DS_RUNNING)
             {
-                _logger.Value.Info("Dispatcher: Stopping dispatcher");
+                s_logger.LogInformation("Dispatcher: Stopping dispatcher");
                 Consumers.Each(consumer => consumer.Shut());
             }
 
@@ -117,24 +118,24 @@ namespace Paramore.Brighter.ServiceActivator
         }
 
         /// <summary>
-        /// Opens the specified connection by name 
+        /// Opens the specified subscription by name 
         /// </summary>
-        /// <param name="connectionName">The name of the connection</param>
+        /// <param name="connectionName">The name of the subscription</param>
         public void Open(string connectionName)
         {
             Open(Connections.SingleOrDefault(c => c.Name == connectionName));
         }
 
         /// <summary>
-        /// Opens the specified connection.
+        /// Opens the specified subscription.
         /// </summary>
-        /// <param name="connection">The connection.</param>
-        public void Open(Connection connection)
+        /// <param name="subscription">The subscription.</param>
+        public void Open(Subscription subscription)
         {
-            _logger.Value.InfoFormat("Dispatcher: Opening connection {0}", connection.Name);
+            s_logger.LogInformation("Dispatcher: Opening subscription {ChannelName}", subscription.Name);
 
-            AddConnectionToConnections(connection);
-            var addedConsumers = CreateConsumers(new[] { connection });
+            AddConnectionToConnections(subscription);
+            var addedConsumers = CreateConsumers(new[] { subscription });
 
             switch (State)
             {
@@ -156,11 +157,11 @@ namespace Paramore.Brighter.ServiceActivator
             }
         }
 
-        private void AddConnectionToConnections(Connection connection)
+        private void AddConnectionToConnections(Subscription subscription)
         {
-            if (Connections.All(c => c.Name != connection.Name))
+            if (Connections.All(c => c.Name != subscription.Name))
             {
-                Connections = new List<Connection>(Connections) { connection };
+                Connections = new List<Subscription>(Connections) { subscription };
             }
         }
 
@@ -174,24 +175,24 @@ namespace Paramore.Brighter.ServiceActivator
         }
 
         /// <summary>
-        /// Shuts the specified connection by name
+        /// Shuts the specified subscription by name
         /// </summary>
-        /// <param name="connectionName">The name of the connection</param>
+        /// <param name="connectionName">The name of the subscription</param>
         public void Shut(string connectionName)
         {
             Shut(Connections.SingleOrDefault(c => c.Name == connectionName));
         }
 
         /// <summary>
-        /// Shuts the specified connection.
+        /// Shuts the specified subscription.
         /// </summary>
-        /// <param name="connection">The connection.</param>
-        public void Shut(Connection connection)
+        /// <param name="subscription">The subscription.</param>
+        public void Shut(Subscription subscription)
         {
             if (State == DispatcherState.DS_RUNNING)
             {
-                _logger.Value.InfoFormat("Dispatcher: Stopping connection {0}", connection.Name);
-                var consumersForConnection = Consumers.Where(consumer => consumer.ConnectionName == connection.Name).ToArray();
+                s_logger.LogInformation("Dispatcher: Stopping subscription {ChannelName}", subscription.Name);
+                var consumersForConnection = Consumers.Where(consumer => consumer.SubscriptionName == subscription.Name).ToArray();
                 var noOfConsumers = consumersForConnection.Length;
                 for (int i = 0; i < noOfConsumers; ++i)
                 {
@@ -206,54 +207,65 @@ namespace Paramore.Brighter.ServiceActivator
             {
                 if (State == DispatcherState.DS_AWAITING || State == DispatcherState.DS_STOPPED)
                 {
-                    _logger.Value.Info("Dispatcher: Dispatcher starting");
+                    s_logger.LogInformation("Dispatcher: Dispatcher starting");
                     State = DispatcherState.DS_RUNNING;
 
                     var consumers = Consumers.ToArray();
                     consumers.Each(consumer => consumer.Open());
                     consumers.Each(consumer => _tasks.TryAdd(consumer.JobId, consumer.Job));
 
-                    _logger.Value.InfoFormat("Dispatcher: Dispatcher starting {0} performers", _tasks.Count);
+                    s_logger.LogInformation("Dispatcher: Dispatcher starting {Consumers} performers", _tasks.Count);
 
-                    while (!_tasks.IsEmpty)
+                    while (_tasks.Any())
                     {
                         try
                         {
                             var runningTasks = _tasks.Values.ToArray();
                             var index = Task.WaitAny(runningTasks);
                             var stoppingConsumer = runningTasks[index];
-                            _logger.Value.DebugFormat("Dispatcher: Performer stopped with state {0}", stoppingConsumer.Status);
+                            s_logger.LogDebug("Dispatcher: Performer stopped with state {Status}", stoppingConsumer.Status);
 
                             var consumer = Consumers.SingleOrDefault(c => c.JobId == stoppingConsumer.Id);
                             if (consumer != null)
                             {
-                                _logger.Value.DebugFormat("Dispatcher: Removing a consumer with connection name {0}", consumer.Name);
-                                consumer.Dispose();
+                                s_logger.LogDebug("Dispatcher: Removing a consumer with subscription name {ChannelName}", consumer.Name);
 
-                                _consumers.TryRemove(consumer.Name, out consumer);
+                                if (_consumers.TryRemove(consumer.Name, out consumer))
+                                {
+                                    consumer.Dispose();
+                                }
                             }
 
-                            Task removedTask;
-                            _tasks.TryRemove(stoppingConsumer.Id, out removedTask);
+                            if (_tasks.TryRemove(stoppingConsumer.Id, out Task removedTask))
+                            {
+                                removedTask.Dispose();
+                            }
+
+                            stoppingConsumer.Dispose();
                         }
                         catch (AggregateException ae)
                         {
                             ae.Handle(ex =>
                             {
-                                _logger.Value.ErrorFormat("Dispatcher: Error on consumer; consumer shut down");
+                                s_logger.LogError(ex, "Dispatcher: Error on consumer; consumer shut down");
                                 return true;
                             });
                         }
                     }
 
                     State = DispatcherState.DS_STOPPED;
-                    _logger.Value.Info("Dispatcher: Dispatcher stopped");
+                    s_logger.LogInformation("Dispatcher: Dispatcher stopped");
                 }
             },
             TaskCreationOptions.LongRunning);
+
+            while (State != DispatcherState.DS_RUNNING)
+            {
+                Task.Delay(100).Wait();
+            }
         }
 
-        private IEnumerable<Consumer> CreateConsumers(IEnumerable<Connection> connections)
+        private IEnumerable<Consumer> CreateConsumers(IEnumerable<Subscription> connections)
         {
             var list = new List<Consumer>();
             connections.Each(connection =>
@@ -261,7 +273,7 @@ namespace Paramore.Brighter.ServiceActivator
                 for (var i = 0; i < connection.NoOfPeformers; i++)
                 {
                     int performer = i;
-                    _logger.Value.InfoFormat("Dispatcher: Creating consumer number {0} for connection: {1}", performer + 1, connection.Name);
+                    s_logger.LogInformation("Dispatcher: Creating consumer number {ConsumerNumber} for subscription: {ChannelName}", performer + 1, connection.Name);
                     var consumerFactoryType = typeof(ConsumerFactory<>).MakeGenericType(connection.DataType);
                     var consumerFactory = (IConsumerFactory)Activator.CreateInstance(consumerFactoryType, CommandProcessor, _messageMapperRegistry, connection);
 

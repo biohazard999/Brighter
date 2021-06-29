@@ -28,10 +28,11 @@ using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using MySqlConnector;
-using Newtonsoft.Json;
 using Paramore.Brighter.Logging;
 
 namespace Paramore.Brighter.Outbox.MySql
@@ -45,7 +46,7 @@ namespace Paramore.Brighter.Outbox.MySql
         IAmAnOutboxViewer<Message>,
         IAmAnOutboxViewerAsync<Message>
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<MySqlOutbox>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MySqlOutbox>();
 
         private const int MySqlDuplicateKeyError = 1062;
         private readonly MySqlOutboxConfiguration _configuration;
@@ -99,7 +100,7 @@ namespace Paramore.Brighter.Outbox.MySql
                     {
                         if (IsExceptionUnqiueOrDuplicateIssue(sqlException))
                         {
-                            _logger.Value.WarnFormat("MsSqlOutbox: A duplicate Message with the MessageId {0} was inserted into the Outbox, ignoring and continuing",
+                            s_logger.LogWarning("MsSqlOutbox: A duplicate Message with the MessageId {Id} was inserted into the Outbox, ignoring and continuing",
                                 message.Id);
                             return;
                         }
@@ -131,7 +132,7 @@ namespace Paramore.Brighter.Outbox.MySql
                     {
                         if (IsExceptionUnqiueOrDuplicateIssue(sqlException))
                         {
-                            _logger.Value.WarnFormat("MsSqlOutbox: A duplicate Message with the MessageId {0} was inserted into the Outbox, ignoring and continuing",
+                            s_logger.LogWarning("MsSqlOutbox: A duplicate Message with the MessageId {Id} was inserted into the Outbox, ignoring and continuing",
                                 message.Id);
                             return;
                         }
@@ -388,7 +389,8 @@ namespace Paramore.Brighter.Outbox.MySql
          
         private void CreatePagedOutstandingCommand(DbCommand command, double milliSecondsSinceAdded, int pageSize, int pageNumber)
         {
-            var pagingSqlFormat = "SELECT * FROM {0} AS TBL WHERE `CreatedID` BETWEEN ((@PageNumber-1)*@PageSize+1) AND (@PageNumber*@PageSize) AND DISPATCHED IS NULL AND TIMESTAMP < DATE_ADD(CURRENT_DATE(), INTERVAL @OutStandingSince SECOND) ORDER BY Timestamp DESC";
+            var pagingSqlFormat =
+                "SELECT * FROM (SELECT ROW_NUMBER() OVER(ORDER BY Timestamp  ASC) As ROWNUMBER, Timestamp FROM {0} WHERE DISPATCHED IS NULL) AS TBL WHERE ROWNUMBER BETWEEN ((@PageNumber-1)*@PageSize+1) AND (@PageNumber*@PageSize) AND Timestamp < DATE_ADD(CURRENT_TIMESTAMP(), INTERVAL -@OutStandingSince SECOND) ORDER BY Timestamp DESC";
             var seconds = TimeSpan.FromMilliseconds(milliSecondsSinceAdded).Seconds > 0 ? TimeSpan.FromMilliseconds(milliSecondsSinceAdded).Seconds : 1;
             var parameters = new[]
             {
@@ -456,7 +458,7 @@ namespace Paramore.Brighter.Outbox.MySql
 
         private MySqlParameter[] InitAddDbParameters(Message message)
         {
-            var bagJson = JsonConvert.SerializeObject(message.Header.Bag);
+            var bagJson = JsonSerializer.Serialize(message.Header.Bag, JsonSerialisationOptions.Options);
             return new[]
             {
                 new MySqlParameter
@@ -557,7 +559,7 @@ namespace Paramore.Brighter.Outbox.MySql
                     replyTo: replyTo,
                     contentType: contentType);
                 
-                Dictionary<string, string> dictionaryBag = GetContextBag(dr);
+                Dictionary<string, object> dictionaryBag = GetContextBag(dr);
                 if (dictionaryBag != null)
                 {
                     foreach (var key in dictionaryBag.Keys)
@@ -605,11 +607,11 @@ namespace Paramore.Brighter.Outbox.MySql
             return replyTo;
         }
 
-        private static Dictionary<string, string> GetContextBag(IDataReader dr)
+        private static Dictionary<string, object> GetContextBag(IDataReader dr)
         {
             var i = dr.GetOrdinal("HeaderBag");
             var headerBag = dr.IsDBNull(i) ? "" : dr.GetString(i);
-            var dictionaryBag = JsonConvert.DeserializeObject<Dictionary<string, string>>(headerBag);
+            var dictionaryBag = JsonSerializer.Deserialize<Dictionary<string, object>>(headerBag, JsonSerialisationOptions.Options);
             return dictionaryBag;
         }
 

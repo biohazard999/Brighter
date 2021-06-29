@@ -1,8 +1,8 @@
 ﻿using System;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using FluentAssertions;
-using Newtonsoft.Json;
 using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
 using Polly;
 using Polly.Registry;
@@ -10,6 +10,7 @@ using Xunit;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors
 {
+    [Collection("CommandProcessor")]
     public class CommandProcessorDepositPostTests
     {
         
@@ -28,7 +29,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors
 
             _message = new Message(
                 new MessageHeader(_myCommand.Id, "MyCommand", MessageType.MT_COMMAND),
-                new MessageBody(JsonConvert.SerializeObject(_myCommand))
+                new MessageBody(JsonSerializer.Serialize(_myCommand, JsonSerialisationOptions.Options))
                 );
 
             var messageMapperRegistry = new MessageMapperRegistry(new SimpleMessageMapperFactory((_) => new MyCommandMessageMapper()));

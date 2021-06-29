@@ -8,7 +8,6 @@ using Xunit;
 namespace Paramore.Brighter.MSSQL.Tests.Outbox
 {
     [Trait("Category", "MSSQL")]
-    [Collection("MSSQL OutBox")]
     public class OutstandingMessagesTests 
     {
         private readonly Message _dispatchedMessage;
@@ -34,7 +33,7 @@ namespace Paramore.Brighter.MSSQL.Tests.Outbox
         {
             var outstandingMessage = _sqlOutbox.OutstandingMessages(500).SingleOrDefault();
 
-            outstandingMessage.Should().NotBe(null);
+            outstandingMessage.Should().NotBeNull();
             outstandingMessage.Id.Should().Be(_dispatchedMessage.Id);
         }
     }

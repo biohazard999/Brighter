@@ -26,16 +26,17 @@ THE SOFTWARE. */
 using System;
 using System.Collections.Generic;
 using Npgsql;
-using Newtonsoft.Json;
 using System.Data;
 using NpgsqlTypes;
 using Paramore.Brighter.Logging;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
 
 namespace Paramore.Brighter.Outbox.PostgreSql
 {
     public class PostgreSqlOutbox : IAmAnOutbox<Message>, IAmAnOutboxViewer<Message>
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<PostgreSqlOutbox>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<PostgreSqlOutbox>();
         private readonly PostgreSqlOutboxConfiguration _configuration;
 
         public bool ContinueOnCapturedContext
@@ -74,8 +75,8 @@ namespace Paramore.Brighter.Outbox.PostgreSql
                     {
                         if (sqlException.SqlState == PostgresErrorCodes.UniqueViolation)
                         {
-                            _logger.Value.WarnFormat(
-                                "PostgresSQLOutbox: A duplicate Message with the MessageId {0} was inserted into the Outbox, ignoring and continuing",
+                            s_logger.LogWarning(
+                                "PostgresSQLOutbox: A duplicate Message with the MessageId {Id} was inserted into the Outbox, ignoring and continuing",
                                 message.Id);
                             return;
                         }
@@ -261,7 +262,7 @@ namespace Paramore.Brighter.Outbox.PostgreSql
             int pageNumber)
         {
             var pagingSqlFormat =
-                "SELECT * FROM (SELECT ROW_NUMBER() OVER(ORDER BY Timestamp DESC) AS NUMBER, * FROM {0}) AS TBL WHERE DISPATCHED IS NULL AND TIMESTAMP < DATEADD(millisecond, @OutStandingSince, getdate()) AND NUMBER BETWEEN ((@PageNumber-1)*@PageSize+1) AND (@PageNumber*@PageSize) ORDER BY Timestamp DESC";
+                "SELECT * FROM (SELECT ROW_NUMBER() OVER(ORDER BY Timestamp ASC) AS NUMBER, * FROM {0} WHERE DISPATCHED IS NULL) AS TBL WHERE TIMESTAMP < DATEADD(millisecond, @OutStandingSince, getdate()) AND NUMBER BETWEEN ((@PageNumber-1)*@PageSize+1) AND (@PageNumber*@PageSize) ORDER BY Timestamp ASC";
             var parameters = new[]
             {
                 CreateNpgsqlParameter("PageNumber", pageNumber), CreateNpgsqlParameter("PageSize", pageSize),
@@ -308,7 +309,7 @@ namespace Paramore.Brighter.Outbox.PostgreSql
 
         private NpgsqlParameter[] InitAddDbParameters(Message message)
         {
-            var bagjson = JsonConvert.SerializeObject(message.Header.Bag);
+            var bagjson = JsonSerializer.Serialize(message.Header.Bag, JsonSerialisationOptions.Options);
             var parameters = new NpgsqlParameter[]
             {
                 CreateNpgsqlParameter("MessageId", message.Id),
@@ -369,7 +370,7 @@ namespace Paramore.Brighter.Outbox.PostgreSql
                 replyTo: replyTo,
                 contentType: contentType);
 
-            Dictionary<string, string> dictionaryBag = GetContextBag(dr);
+            Dictionary<string, object> dictionaryBag = GetContextBag(dr);
             if (dictionaryBag != null)
             {
                 foreach (var key in dictionaryBag.Keys)
@@ -416,11 +417,11 @@ namespace Paramore.Brighter.Outbox.PostgreSql
              return replyTo;
         }
 
-        private static Dictionary<string, string> GetContextBag(IDataReader dr)
+        private static Dictionary<string, object> GetContextBag(IDataReader dr)
         {
             var i = dr.GetOrdinal("HeaderBag");
             var headerBag = dr.IsDBNull(i) ? "" : dr.GetString(i);
-            var dictionaryBag = JsonConvert.DeserializeObject<Dictionary<string, string>>(headerBag);
+            var dictionaryBag = JsonSerializer.Deserialize<Dictionary<string, object>>(headerBag, JsonSerialisationOptions.Options);
             return dictionaryBag;
         }
 

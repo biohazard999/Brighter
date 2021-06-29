@@ -24,9 +24,9 @@ THE SOFTWARE. */
 
 using System;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using FluentAssertions;
-using Newtonsoft.Json;
 using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
 using Polly;
 using Polly.Registry;
@@ -34,7 +34,8 @@ using Xunit;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors
 {
-    public class ControlBusSenderPostMessageAsyneTests : IDisposable
+    [Collection("CommandProcessor")]
+     public class ControlBusSenderPostMessageAsyneTests : IDisposable
     {
         private readonly CommandProcessor _commandProcessor;
         private readonly ControlBusSender _controlBusSender;
@@ -52,7 +53,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors
 
             _message = new Message(
                 new MessageHeader(_myCommand.Id, "MyCommand", MessageType.MT_COMMAND),
-                new MessageBody(JsonConvert.SerializeObject(_myCommand))
+                new MessageBody(JsonSerializer.Serialize(_myCommand, JsonSerialisationOptions.Options))
                 );
 
             var messageMapperRegistry = new MessageMapperRegistry(new SimpleMessageMapperFactory((_) => new MyCommandMessageMapper()));
@@ -90,7 +91,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors
               .SingleOrDefault();
               
               
-            message.Should().NotBe(null);
+            message.Should().NotBeNull();
             
             //_should_convert_the_command_into_a_message
             message.Should().Be(_message);

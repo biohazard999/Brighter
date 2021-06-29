@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -24,6 +24,8 @@ THE SOFTWARE. */
 
 using System;
 using System.Collections.Generic;
+using System.Text.Json.Serialization;
+using Paramore.Brighter.Serialization;
 
 namespace Paramore.Brighter
 {
@@ -58,11 +60,7 @@ namespace Paramore.Brighter
         /// <summary>
         /// A quit message, used to end a dispatcher's message pump
         /// </summary>
-        MT_QUIT = 4,
-        /// <summary>
-        /// We are a message used to provide a callback for an uncompleted task that has finished and should be scheduled
-        /// </summary>
-        MT_CALLBACK = 5,
+        MT_QUIT = 4
     }
 
     /// <summary>
@@ -89,10 +87,12 @@ namespace Paramore.Brighter
         public MessageType MessageType { get; set; }
 
         /// <summary>
-        /// Gets the bag.
+        /// A property bag that can be used for extended header attributes.
+        /// Use camelCase for the key names if you intend to read it yourself, as when converted to and from Json serializers will tend convert the property
+        /// name from UpperCase to camelCase
         /// </summary>
         /// <value>The bag.</value>
-        public Dictionary<string, object> Bag { get; } = new Dictionary<string, object>();
+        public Dictionary<string, object> Bag { get; set; } = new Dictionary<string, object>();
         /// <summary>
         /// Gets the number of times this message has been seen 
         /// </summary>
@@ -124,6 +124,11 @@ namespace Paramore.Brighter
         public string ReplyTo { get; set; }
 
         /// <summary>
+        /// If we are working with consistent hashing to distribute writes across multiple channels according to the hash value of a partition key
+        /// then we need to be able to set that key, so that we can distribute writes effectively.
+        /// </summary>
+        public string PartitionKey { get; set; }
+
         /// Intended for serialization, prefer a parameterized constructor in application code as a better 'pit of success'
         /// </summary>
         public MessageHeader() {}
@@ -137,7 +142,15 @@ namespace Paramore.Brighter
         /// <param name="correlationId">Used in request-reply to allow the sender to match response to their request</param>
         /// <param name="replyTo">Used for a request-reply message to indicate the private channel to reply to</param>
         /// <param name="contentType">The type of the payload of the message, defaults to tex/plain</param>
-        public MessageHeader(Guid messageId, string topic, MessageType messageType, Guid? correlationId = null, string replyTo = "", string contentType = "text/plain")
+        /// <param name="partitionKey">How should we group messages that must be processed together i.e. consistent hashing</param>
+        public MessageHeader(
+            Guid messageId, 
+            string topic, 
+            MessageType messageType, 
+            Guid? correlationId = null, 
+            string replyTo = "", 
+            string contentType = "text/plain",
+            string partitionKey = "")
         {
             Id = messageId;
             Topic = topic;
@@ -146,18 +159,59 @@ namespace Paramore.Brighter
             HandledCount = 0;
             DelayedMilliseconds = 0;
             CorrelationId = correlationId ?? Guid.Empty ;
+            ReplyTo = replyTo;
+            ContentType = contentType;
+            PartitionKey = partitionKey;
             ReplyTo = replyTo ?? string.Empty;
             ContentType = contentType ?? "text/plain";
         }
 
-        public MessageHeader(Guid messageId, string topic, MessageType messageType, DateTime timeStamp, Guid? correlationId = null, string replyTo = null, string contentType = "text/plain")
-            : this(messageId, topic, messageType, correlationId, replyTo, contentType)
+        /// <summary>
+        /// Initializes a new instance of the <see cref="MessageHeader"/> class.
+        /// </summary>
+        /// <param name="messageId">The message identifier.</param>
+        /// <param name="topic">The topic.</param>
+        /// <param name="messageType">Type of the message.</param>
+        /// <param name="correlationId">Used in request-reply to allow the sender to match response to their request</param>
+        /// <param name="replyTo">Used for a request-reply message to indicate the private channel to reply to</param>
+        /// <param name="contentType">The type of the payload of the message, defaults to tex/plain</param>
+        /// <param name="partitionKey">How should we group messages that must be processed together i.e. consistent hashing</param>
+        public MessageHeader(
+            Guid messageId, 
+            string topic, 
+            MessageType messageType, 
+            DateTime timeStamp, 
+            Guid? correlationId = null, 
+            string replyTo = null,
+            string contentType = "text/plain", 
+            string partitionKey = "")
+            : this(messageId, topic, messageType, correlationId, replyTo, contentType, partitionKey)
         {
             TimeStamp = RoundToSeconds(timeStamp);
         }
 
-        public MessageHeader(Guid messageId, string topic, MessageType messageType, DateTime timeStamp, int handledCount, int delayedMilliseconds, Guid? correlationId = null, string replyTo = null, string contentType = "text/plain")
-            : this(messageId, topic, messageType, timeStamp, correlationId, replyTo, contentType)
+          /// <summary>
+          /// Initializes a new instance of the <see cref="MessageHeader"/> class.
+          /// </summary>
+          /// <param name="messageId">The message identifier.</param>
+          /// <param name="topic">The topic.</param>
+          /// <param name="messageType">Type of the message.</param>
+          /// <param name="correlationId">Used in request-reply to allow the sender to match response to their request</param>
+          /// <param name="replyTo">Used for a request-reply message to indicate the private channel to reply to</param>
+          /// <param name="contentType">The type of the payload of the message, defaults to tex/plain</param>
+          /// <param name="partitionKey">How should we group messages that must be processed together i.e. consistent hashing</param>
+          public MessageHeader(
+            Guid messageId, 
+            string topic, 
+            MessageType messageType, 
+            DateTime timeStamp, 
+            int handledCount, 
+            int delayedMilliseconds, 
+            Guid? correlationId = null, 
+            string replyTo = null, 
+            string contentType = "text/plain",
+            string partitionKey = "")
+            : this(messageId, topic, messageType, timeStamp, correlationId, replyTo, contentType, partitionKey)
         {
             HandledCount = handledCount;
             DelayedMilliseconds = delayedMilliseconds;
@@ -179,7 +233,8 @@ namespace Paramore.Brighter
                 DelayedMilliseconds = 0,
                 CorrelationId = CorrelationId,
                 ReplyTo = $"{ReplyTo}",
-                ContentType = $"{ContentType}"
+                ContentType = $"{ContentType}",
+                PartitionKey = $"{PartitionKey}"
             };
 
             foreach (var item in Bag)
@@ -235,9 +290,6 @@ namespace Paramore.Brighter
                 var hashCode = Id.GetHashCode();
                 hashCode = (hashCode * 397) ^ (Topic != null ? Topic.GetHashCode() : 0);
                 hashCode = (hashCode * 397) ^ (int)MessageType;
-                hashCode = (hashCode * 397) ^ TimeStamp.GetHashCode();
-                hashCode = (hashCode * 397) ^ HandledCount.GetHashCode();
-                hashCode = (hashCode * 397) ^ DelayedMilliseconds.GetHashCode();
                 return hashCode;
             }
         }
@@ -271,6 +323,5 @@ namespace Paramore.Brighter
         {
             HandledCount++;
         }
-
-   }
+    }
 }

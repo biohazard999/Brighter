@@ -24,10 +24,9 @@ THE SOFTWARE. */
 #endregion
 
 using System;
-using System.Collections.Concurrent;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
 using Paramore.Brighter.Inbox.Exceptions;
 
 namespace Paramore.Brighter
@@ -140,7 +139,7 @@ namespace Paramore.Brighter
                 }
             }
 
-            _requests[key].RequestBody = JsonConvert.SerializeObject(command);
+            _requests[key].RequestBody = JsonSerializer.Serialize(command, JsonSerialisationOptions.Options);
         }
 
         /// <summary>
@@ -155,7 +154,7 @@ namespace Paramore.Brighter
         /// <exception cref="System.NotImplementedException"></exception>
         public Task AddAsync<T>(T command, string contextKey, int timeoutInMilliseconds = -1, CancellationToken cancellationToken = default(CancellationToken)) where T : class, IRequest
         {
-            var tcs = new TaskCompletionSource<object>();
+            var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (cancellationToken.IsCancellationRequested)
             {
@@ -184,7 +183,7 @@ namespace Paramore.Brighter
             
             if (_requests.TryGetValue(InboxItem.CreateKey(id, contextKey), out InboxItem inboxItem))
             {
-                return JsonConvert.DeserializeObject<T>(inboxItem.RequestBody);
+                return JsonSerializer.Deserialize<T>(inboxItem.RequestBody, JsonSerialisationOptions.Options);
             }
 
             throw new RequestNotFoundException<T>(id);
@@ -207,7 +206,7 @@ namespace Paramore.Brighter
         /// <returns>True if it exists, False otherwise</returns>
         public Task<bool> ExistsAsync<T>(Guid id, string contextKey, int timeoutInMilliseconds = -1, CancellationToken cancellationToken = default(CancellationToken)) where T : class, IRequest
         {
-            var tcs = new TaskCompletionSource<bool>();
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (cancellationToken.IsCancellationRequested)
             {
@@ -234,7 +233,7 @@ namespace Paramore.Brighter
         /// <exception cref="System.NotImplementedException"></exception>
         public Task<T> GetAsync<T>(Guid id, string contextKey, int timeoutInMilliseconds = -1, CancellationToken cancellationToken = default(CancellationToken)) where T : class, IRequest
         {
-            var tcs = new TaskCompletionSource<T>();
+            var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (cancellationToken.IsCancellationRequested)
             {

@@ -26,10 +26,11 @@ THE SOFTWARE. */
 using System;
 using System.Data;
 using System.Data.Common;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using MySqlConnector;
-using Newtonsoft.Json;
 using Paramore.Brighter.Inbox.Exceptions;
 using Paramore.Brighter.Logging;
 
@@ -40,7 +41,7 @@ namespace Paramore.Brighter.Inbox.MySql
     /// </summary>
     public class MySqlInbox : IAmAnInbox, IAmAnInboxAsync
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<MySqlInbox>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MySqlInbox>();
 
         private const int MySqlDuplicateKeyError = 1062;
         private readonly MySqlInboxConfiguration _configuration;
@@ -79,8 +80,8 @@ namespace Paramore.Brighter.Inbox.MySql
                 {
                     if (sqlException.Number == MySqlDuplicateKeyError)
                     {
-                        _logger.Value.WarnFormat(
-                            "MySqlOutbox: A duplicate Command with the CommandId {0} was inserted into the Outbox, ignoring and continuing",
+                        s_logger.LogWarning(
+                            "MySqlOutbox: A duplicate Command with the CommandId {Id} was inserted into the Outbox, ignoring and continuing",
                             command.Id);
                         return;
                     }
@@ -188,8 +189,8 @@ namespace Paramore.Brighter.Inbox.MySql
                 {
                     if (sqlException.Number == MySqlDuplicateKeyError)
                     {
-                        _logger.Value.WarnFormat(
-                            "MySqlOutbox: A duplicate Command with the CommandId {0} was inserted into the Outbox, ignoring and continuing",
+                        s_logger.LogWarning(
+                            "MySqlOutbox: A duplicate Command with the CommandId {Id} was inserted into the Outbox, ignoring and continuing",
                             command.Id);
                         return;
                     }
@@ -303,7 +304,7 @@ namespace Paramore.Brighter.Inbox.MySql
 
         private DbParameter[] InitAddDbParameters<T>(T command, string contextKey) where T : class, IRequest
         {
-            var commandJson = JsonConvert.SerializeObject(command);
+            var commandJson = JsonSerializer.Serialize(command, JsonSerialisationOptions.Options);
             var parameters = new[]
             {
                 CreateSqlParameter("CommandID", command.Id),
@@ -320,7 +321,7 @@ namespace Paramore.Brighter.Inbox.MySql
             if (dr.Read())
             {
                 var body = dr.GetString(dr.GetOrdinal("CommandBody"));
-                return JsonConvert.DeserializeObject<TResult>(body);
+                return JsonSerializer.Deserialize<TResult>(body, JsonSerialisationOptions.Options);
             }
 
             throw new RequestNotFoundException<TResult>(id);

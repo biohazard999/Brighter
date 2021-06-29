@@ -26,10 +26,12 @@ using Amazon;
 using Amazon.Runtime.CredentialManagement;
 using Greetings.Ports.Commands;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter;
 using Paramore.Brighter.Extensions.DependencyInjection;
 using Paramore.Brighter.MessagingGateway.AWSSQS;
 using Serilog;
+using Serilog.Extensions.Logging;
 
 namespace GreetingsSender
 {
@@ -44,18 +46,17 @@ namespace GreetingsSender
                 .CreateLogger();
 
             var serviceCollection = new ServiceCollection();
-
-
+            serviceCollection.AddSingleton<ILoggerFactory>(new SerilogLoggerFactory());
+            
             if (new CredentialProfileStoreChain().TryGetAWSCredentials("default", out var credentials))
             {
                 var awsConnection = new AWSMessagingGatewayConnection(credentials, RegionEndpoint.EUWest1);
                 var producer = new SqsMessageProducer(awsConnection);
 
-                serviceCollection.AddBrighter(options =>
-                {
-                    var outBox = new InMemoryOutbox();
-                    options.BrighterMessaging = new BrighterMessaging(outBox, outBox, producer, null);
-                }).AutoFromAssemblies();
+                serviceCollection.AddBrighter()
+                    .UseInMemoryOutbox()
+                    .UseExternalBus(producer)
+                    .AutoFromAssemblies();
 
                 var serviceProvider = serviceCollection.BuildServiceProvider();
 

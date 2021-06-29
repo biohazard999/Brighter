@@ -1,20 +1,30 @@
 ﻿using System;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
 using Paramore.Brighter.MessagingGateway.MsSql.SqlQueues;
+using Paramore.Brighter.MsSql;
 
 namespace Paramore.Brighter.MessagingGateway.MsSql
 {
     public class MsSqlMessageConsumer : IAmAMessageConsumer
     {
         private readonly string _topic;
-        private static readonly Lazy<ILog> Logger = new Lazy<ILog>(LogProvider.For<MsSqlMessageConsumer>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MsSqlMessageConsumer>();
         private readonly MsSqlMessageQueue<Message> _sqlQ;
 
-        public MsSqlMessageConsumer(MsSqlMessagingGatewayConfiguration msSqlMessagingGatewayConfiguration, string topic)
+        public MsSqlMessageConsumer(
+            MsSqlConfiguration msSqlConfiguration, 
+            string topic, IMsSqlConnectionProvider connectionProvider)
         {
             _topic = topic ?? throw new ArgumentNullException(nameof(topic));
-            _sqlQ = new MsSqlMessageQueue<Message>(msSqlMessagingGatewayConfiguration);
+            _sqlQ = new MsSqlMessageQueue<Message>(msSqlConfiguration, connectionProvider);
+        }
+
+        public MsSqlMessageConsumer(
+            MsSqlConfiguration msSqlConfiguration,
+            string topic) :this(msSqlConfiguration, topic, new MsSqlSqlAuthConnectionProvider(msSqlConfiguration))
+        {
         }
 
         /// <summary>
@@ -44,19 +54,19 @@ namespace Paramore.Brighter.MessagingGateway.MsSql
         /// Rejects the specified message.
         /// </summary>
         /// <param name="message">The message.</param>
-        /// <param name="requeue">if set to <c>true</c> [requeue].</param>
-        public void Reject(Message message, bool requeue)
-        {
-            Logger.Value.Info(
-                $"MsSqlMessagingConsumer: rejecting message with topic {message.Header.Topic} and id {message.Id.ToString()}, NOT IMPLEMENTED");
-        }
+        public void Reject(Message message)
+         {
+             s_logger.LogInformation(
+                 "MsSqlMessagingConsumer: rejecting message with topic {Topic} and id {Id}, NOT IMPLEMENTED",
+                 message.Header.Topic, message.Id.ToString());
+         }
 
         /// <summary>
         /// Purges the specified queue name.
         /// </summary>
         public void Purge()
         {
-            Logger.Value.Debug("MsSqlMessagingConsumer: purging queue");
+            s_logger.LogDebug("MsSqlMessagingConsumer: purging queue");
             _sqlQ.Purge();
         }
 
@@ -69,8 +79,8 @@ namespace Paramore.Brighter.MessagingGateway.MsSql
         {
             var topic = message.Header.Topic;
 
-            Logger.Value.Debug(
-                $"MsSqlMessagingConsumer: requeuing message with topic {topic} and id {message.Id.ToString()}");
+            s_logger.LogDebug("MsSqlMessagingConsumer: re-queuing message with topic {Topic} and id {Id}", topic,
+                message.Id.ToString());
 
             _sqlQ.Send(message, topic);
         }

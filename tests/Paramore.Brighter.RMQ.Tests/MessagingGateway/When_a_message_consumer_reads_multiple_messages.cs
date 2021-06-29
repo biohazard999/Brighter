@@ -6,7 +6,6 @@ using Xunit;
 
 namespace Paramore.Brighter.RMQ.Tests.MessagingGateway
 {
-    [Collection("RMQ")]
     [Trait("Category", "RMQ")]
     public class RMQBufferedConsumerTests : IDisposable
     {
@@ -24,7 +23,7 @@ namespace Paramore.Brighter.RMQ.Tests.MessagingGateway
             };
 
             _messageProducer = new RmqMessageProducer(rmqConnection);
-            _messageConsumer = new RmqMessageConsumer(rmqConnection, _topic, _topic, false, false, BatchSize);
+            _messageConsumer = new RmqMessageConsumer(connection:rmqConnection, queueName:_topic, routingKey:_topic, isDurable:false, highAvailability:false, batchSize:BatchSize);
             
             //create the queue, so that we can receive messages posted to it
             new QueueFactory(rmqConnection, _topic).Create(3000);

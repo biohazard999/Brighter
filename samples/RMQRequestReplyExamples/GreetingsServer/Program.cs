@@ -49,15 +49,15 @@ namespace GreetingsServer
             var host = new HostBuilder()
                 .ConfigureServices((hostContext, services) =>
                 {
-                    var connections = new Connection[]
+                    var subscriptions = new Subscription[]
                     {
-                    new Connection<GreetingRequest>(
-                        new ConnectionName("paramore.example.greeting"),
-                        new ChannelName("Greeting.Request"),
-                        new RoutingKey("Greeting.Request"),
-                        timeoutInMilliseconds: 200,
-                        isDurable: true,
-                        highAvailability: true)
+                        new RmqSubscription<GreetingRequest>(
+                            new SubscriptionName("paramore.example.greeting"),
+                            new ChannelName("Greeting.Request"),
+                            new RoutingKey("Greeting.Request"),
+                            timeoutInMilliseconds: 200,
+                            isDurable: true,
+                            highAvailability: true)
                     };
 
                     var rmqConnection = new RmqMessagingGatewayConnection
@@ -68,15 +68,16 @@ namespace GreetingsServer
 
                     var rmqMessageConsumerFactory = new RmqMessageConsumerFactory(rmqConnection);
                     ChannelFactory amAChannelFactory = new ChannelFactory(rmqMessageConsumerFactory);
-                    var amAMessageProducer = new RmqMessageProducer(rmqConnection);
+                    var producer = new RmqMessageProducer(rmqConnection);
 
                     services.AddServiceActivator(options =>
                     {
-                        options.Connections = connections;
+                        options.Subscriptions = subscriptions;
                         options.ChannelFactory = amAChannelFactory;
-                        var outBox = new InMemoryOutbox();
-                        options.BrighterMessaging = new BrighterMessaging(outBox, outBox, amAMessageProducer, null);
-                    }).AutoFromAssemblies();
+                    })
+                        .UseInMemoryOutbox()
+                        .UseExternalBus(producer, true)
+                        .AutoFromAssemblies();
 
 
                     services.AddHostedService<ServiceActivatorHostedService>();

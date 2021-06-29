@@ -12,7 +12,7 @@ namespace Paramore.Brighter.ServiceActivator.Extensions.Hosting
 
         public ServiceActivatorHostedService(ILogger<ServiceActivatorHostedService> logger, IDispatcher dispatcher)
         {
-            _logger = logger;
+            _logger= logger;
             _dispatcher = dispatcher;
         }
 
@@ -21,7 +21,7 @@ namespace Paramore.Brighter.ServiceActivator.Extensions.Hosting
             _logger.LogInformation("Starting hosted service dispatcher");
             _dispatcher.Receive();
 
-            var completionSource = new TaskCompletionSource<IDispatcher>();
+            var completionSource = new TaskCompletionSource<IDispatcher>(TaskCreationOptions.RunContinuationsAsynchronously);
             completionSource.SetResult(_dispatcher);
 
             return completionSource.Task;

@@ -30,6 +30,7 @@ using Microsoft.Extensions.Hosting;
 using Paramore.Brighter;
 using Paramore.Brighter.Extensions.DependencyInjection;
 using Paramore.Brighter.MessagingGateway.MsSql;
+using Paramore.Brighter.MsSql;
 using Paramore.Brighter.ServiceActivator.Extensions.DependencyInjection;
 using Paramore.Brighter.ServiceActivator.Extensions.Hosting;
 using Serilog;
@@ -50,10 +51,10 @@ namespace GreetingsReceiverConsole
                 .ConfigureServices((hostContext, services) =>
 
                 {
-                    var connections = new Connection[]
+                    var subscriptions = new Subscription[]
                     {
-                        new Connection<GreetingEvent>(
-                            new ConnectionName("paramore.example.greeting"),
+                        new Subscription<GreetingEvent>(
+                            new SubscriptionName("paramore.example.greeting"),
                             new ChannelName("greeting.event"),
                             new RoutingKey("greeting.event"),
                             timeoutInMilliseconds: 200)
@@ -61,16 +62,17 @@ namespace GreetingsReceiverConsole
 
                     //create the gateway
                     var messagingConfiguration =
-                        new MsSqlMessagingGatewayConfiguration(
-                            @"Database=BrighterSqlQueue;Server=.\sqlexpress;Integrated Security=SSPI;", "QueueData");
+                        new MsSqlConfiguration(
+                            @"Database=BrighterSqlQueue;Server=.\sqlexpress;Integrated Security=SSPI;", queueStoreTable: "QueueData");
                     var messageConsumerFactory = new MsSqlMessageConsumerFactory(messagingConfiguration);
                     services.AddServiceActivator(options =>
                     {
-                        options.Connections = connections;
+                        options.Subscriptions = subscriptions;
                         options.ChannelFactory = new ChannelFactory(messageConsumerFactory);
-                        var outBox = new InMemoryOutbox();
-                        options.BrighterMessaging = new BrighterMessaging(outBox, outBox, new MsSqlMessageProducer(messagingConfiguration), null);
-                    }).AutoFromAssemblies();
+                    })
+                        .UseInMemoryOutbox()
+                        .UseExternalBus(new MsSqlMessageProducer(messagingConfiguration))
+                        .AutoFromAssemblies();
 
 
                     services.AddHostedService<ServiceActivatorHostedService>();

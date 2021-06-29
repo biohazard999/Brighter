@@ -1,17 +1,18 @@
 ﻿using System;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
 
 namespace Paramore.Brighter.MessagingGateway.MsSql
 {
     public class ChannelFactory : IAmAChannelFactory
     {
-        private static readonly Lazy<ILog> Logger = new Lazy<ILog>(LogProvider.For<ChannelFactory>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<ChannelFactory>();
         private readonly MsSqlMessageConsumerFactory _msSqlMessageConsumerFactory;
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="KafkaInputChannelFactory"/> class.
+        /// Initializes a new instance of the <see cref="MsSqlMessageConsumerFactory"/> class.
         /// </summary>
-        /// <param name="kafkaMessageConsumerFactory">The messageConsumerFactory.</param>
+        /// <param name="msSqlMessageConsumerFactory"></param>
         public ChannelFactory(MsSqlMessageConsumerFactory msSqlMessageConsumerFactory)
         {
             _msSqlMessageConsumerFactory = msSqlMessageConsumerFactory ??
@@ -21,15 +22,19 @@ namespace Paramore.Brighter.MessagingGateway.MsSql
         /// <summary>
         /// Creates the input channel
         /// </summary>
-        /// <param name="connection">The connection parameters with which to create the channel</param>
+        /// <param name="subscription">The subscription parameters with which to create the channel</param>
         /// <returns></returns>
-        public IAmAChannel CreateChannel(Connection connection)
+        public IAmAChannel CreateChannel(Subscription subscription)
         {
-            Logger.Value.Debug($"MsSqlInputChannelFactory: create input channel {connection.ChannelName} for topic {connection.RoutingKey}");
+            MsSqlSubscription rmqSubscription = subscription as MsSqlSubscription;  
+            if (rmqSubscription == null)
+                throw new ConfigurationException("We expect an MsSqlSubscription or MsSqlSubscription<T> as a parameter");
+            
+            s_logger.LogDebug("MsSqlInputChannelFactory: create input channel {ChannelName} for topic {Topic}", subscription.ChannelName, subscription.RoutingKey);
             return new Channel(
-                connection.ChannelName,
-                _msSqlMessageConsumerFactory.Create(connection),
-                connection.BufferSize);
+                subscription.ChannelName,
+                _msSqlMessageConsumerFactory.Create(subscription),
+                subscription.BufferSize);
         }
     }
 }

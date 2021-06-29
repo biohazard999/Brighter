@@ -23,14 +23,14 @@ THE SOFTWARE. */
 #endregion
 
 using System;
-using Greetings.Ports.CommandHandlers;
 using Greetings.Ports.Commands;
-using Greetings.Ports.Mappers;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter;
 using Paramore.Brighter.Extensions.DependencyInjection;
 using Paramore.Brighter.MessagingGateway.RMQ;
 using Serilog;
+using Serilog.Extensions.Logging;
 
 namespace GreetingsSender
 {
@@ -45,6 +45,7 @@ namespace GreetingsSender
                 .CreateLogger();
 
             var serviceCollection = new ServiceCollection();
+            serviceCollection.AddSingleton<ILoggerFactory>(new SerilogLoggerFactory());
 
             var rmqConnection = new RmqMessagingGatewayConnection
             {
@@ -59,8 +60,10 @@ namespace GreetingsSender
             {
                 var outBox = new InMemoryOutbox();
                 options.ChannelFactory = new ChannelFactory(rmqMessageConsumerFactory);
-                options.BrighterMessaging = new BrighterMessaging(outBox, outBox, producer, null);
-            }).AutoFromAssemblies();
+            })
+                .UseInMemoryOutbox()
+                .UseExternalBus(producer, true)
+                .AutoFromAssemblies();
 
             var serviceProvider = serviceCollection.BuildServiceProvider();
 

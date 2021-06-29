@@ -26,9 +26,10 @@ THE SOFTWARE. */
 using System;
 using System.Data;
 using System.Data.Common;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
+using Microsoft.Extensions.Logging;
 using Npgsql;
 using NpgsqlTypes;
 using Paramore.Brighter.Inbox.Exceptions;
@@ -39,7 +40,7 @@ namespace Paramore.Brighter.Inbox.Postgres
     public class PostgresSqlInbox : IAmAnInbox, IAmAnInboxAsync
     {
         private readonly PostgresSqlInboxConfiguration _configuration;
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<PostgresSqlInbox>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<PostgresSqlInbox>();
         /// <summary>
         ///     If false we the default thread synchronization context to run any continuation, if true we re-use the original
         ///     synchronization context.
@@ -73,8 +74,8 @@ namespace Paramore.Brighter.Inbox.Postgres
                   {
                       if (sqlException.SqlState == PostgresErrorCodes.UniqueViolation)
                       {
-                          _logger.Value.WarnFormat(
-                              "PostgresSqlOutbox: A duplicate Command with the CommandId {0} was inserted into the Outbox, ignoring and continuing",
+                          s_logger.LogWarning(
+                              "PostgresSqlOutbox: A duplicate Command with the CommandId {Id} was inserted into the Outbox, ignoring and continuing",
                               command.Id);
                           return;
                       }
@@ -125,8 +126,8 @@ namespace Paramore.Brighter.Inbox.Postgres
                 {
                     if (sqlException.SqlState == PostgresErrorCodes.UniqueViolation)
                     {
-                        _logger.Value.WarnFormat(
-                            "PostgresSqlOutbox: A duplicate Command with the CommandId {0} was inserted into the Outbox, ignoring and continuing",
+                        s_logger.LogWarning(
+                            "PostgresSqlOutbox: A duplicate Command with the CommandId {Id} was inserted into the Outbox, ignoring and continuing",
                             command.Id);
                         return;
                     }
@@ -203,7 +204,7 @@ namespace Paramore.Brighter.Inbox.Postgres
 
         private DbParameter[] InitAddDbParameters<T>(T command, string contextKey) where T : class, IRequest
         {
-            var commandJson = JsonConvert.SerializeObject(command);
+            var commandJson = JsonSerializer.Serialize(command, JsonSerialisationOptions.Options);
             var parameters = new[]
             {
                 CreateNpgsqlParameter("CommandID", command.Id),
@@ -256,7 +257,7 @@ namespace Paramore.Brighter.Inbox.Postgres
             if (dr.Read())
             {
                 var body = dr.GetString(dr.GetOrdinal("CommandBody"));
-                return JsonConvert.DeserializeObject<TResult>(body);
+                return JsonSerializer.Deserialize<TResult>(body, JsonSerialisationOptions.Options);
             }
 
             throw new RequestNotFoundException<TResult>(commandId);

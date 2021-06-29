@@ -1,9 +1,11 @@
-using System.Linq;
+﻿using System.Linq;
 using FluentAssertions;
 using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
+using Xunit;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors
 {
+    [Collection("CommandProcessor")]
     public class PipelineWithHandlerDependenciesTests
     {
         private readonly PipelineBuilder<MyCommand> _pipelineBuilder;
@@ -19,7 +21,8 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors
             PipelineBuilder<MyCommand>.ClearPipelineCache();
         }
 
-        public void When_Finding_A_Hander_That_Has_Dependencies()
+        [Fact]
+        public void When_Finding_A_Handler_That_Has_Dependencies()
         {
             _pipeline = _pipelineBuilder.Build(new RequestContext()).First();
 

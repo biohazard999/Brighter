@@ -26,10 +26,12 @@ THE SOFTWARE. */
 using System;
 using Greetings.Ports.Events;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter;
 using Paramore.Brighter.Extensions.DependencyInjection;
 using Paramore.Brighter.MessagingGateway.Redis;
 using Serilog;
+using Serilog.Extensions.Logging;
 
 namespace GreetingsSender
 {
@@ -44,6 +46,7 @@ namespace GreetingsSender
                 .CreateLogger();
 
             var serviceCollection = new ServiceCollection();
+            serviceCollection.AddSingleton<ILoggerFactory>(new SerilogLoggerFactory());
 
             var redisConnection = new RedisMessagingGatewayConfiguration
             {
@@ -53,11 +56,10 @@ namespace GreetingsSender
             };
             var producer = new RedisMessageProducer(redisConnection);
 
-            serviceCollection.AddBrighter(options =>
-            {
-                var outBox = new InMemoryOutbox();
-                options.BrighterMessaging = new BrighterMessaging(outBox, outBox, producer, null);
-            }).AutoFromAssemblies();
+            serviceCollection.AddBrighter()
+                .UseInMemoryOutbox()
+                .UseExternalBus(producer)
+                .AutoFromAssemblies();
 
             var serviceProvider = serviceCollection.BuildServiceProvider();
 

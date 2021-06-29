@@ -1,10 +1,11 @@
 ﻿using System;
-using System.Data.Common;
-using System.Data.SqlClient;
+using Microsoft.Data.SqlClient;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
+using Paramore.Brighter.MsSql;
 
 namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
 {
@@ -15,19 +16,20 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
     public class MsSqlMessageQueue<T>
     {
         private const int RetryDelay = 100;
-        private static readonly Lazy<ILog> Logger = new Lazy<ILog>(LogProvider.For<MsSqlMessageQueue<T>>);
-        private readonly MsSqlMessagingGatewayConfiguration _configuration;
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MsSqlMessageQueue<T>>();
+        private readonly MsSqlConfiguration _configuration;
+        private readonly IMsSqlConnectionProvider _connectionProvider;
 
         /// <summary>
         ///     Initializes a new instance of the <see cref="MsSqlMessageQueue{T}" /> class.
         /// </summary>
         /// <param name="configuration"></param>
-        public MsSqlMessageQueue(MsSqlMessagingGatewayConfiguration configuration)
+        public MsSqlMessageQueue(MsSqlConfiguration configuration, IMsSqlConnectionProvider connectionProvider)
         {
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
-            if (Logger.Value.IsDebugEnabled())
-                Logger.Value.Debug(
-                    $"MsSqlMessageQueue({_configuration.ConnectionString}, {_configuration.QueueStoreTable})");
+            _connectionProvider = connectionProvider;
+            if (s_logger.IsEnabled(LogLevel.Debug))
+                s_logger.LogDebug("MsSqlMessageQueue({ConnectionString}, {QueueStoreTable})", _configuration.ConnectionString, _configuration.QueueStoreTable);
             ContinueOnCapturedContext = false;
         }
 
@@ -49,11 +51,11 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
         /// <param name="timeoutInMilliseconds">Timeout in milliseconds; -1 for default timeout</param>
         public void Send(T message, string topic, int timeoutInMilliseconds = -1)
         {
-            if (Logger.Value.IsDebugEnabled()) Logger.Value.Debug($"Send<{typeof(T).FullName}>(..., {topic})");
+            if (s_logger.IsEnabled(LogLevel.Debug)) s_logger.LogDebug("Send<{CommandType}>(..., {Topic})", typeof(T).FullName, topic);
 
             var parameters = InitAddDbParameters(topic, message);
 
-            using (var connection = GetConnection())
+            using (var connection = _connectionProvider.GetConnection())
             {
                 connection.Open();
                 var sqlCmd = InitAddDbCommand(timeoutInMilliseconds, connection, parameters);
@@ -72,11 +74,11 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
         public async Task SendAsync(T message, string topic, int timeoutInMilliseconds = -1,
             CancellationToken cancellationToken = default(CancellationToken))
         {
-            if (Logger.Value.IsDebugEnabled()) Logger.Value.Debug($"SendAsync<{typeof(T).FullName}>(..., {topic})");
+            if (s_logger.IsEnabled(LogLevel.Debug)) s_logger.LogDebug("SendAsync<{CommandType}>(..., {Topic})", typeof(T).FullName, topic);
 
             var parameters = InitAddDbParameters(topic, message);
 
-            using (var connection = GetConnection())
+            using (var connection = await _connectionProvider.GetConnectionAsync())
             {
                 await connection.OpenAsync(cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
                 var sqlCmd = InitAddDbCommand(timeoutInMilliseconds, connection, parameters);
@@ -92,8 +94,8 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
         /// <returns>The message received -or- ReceivedResult&lt;T&gt;.Empty when no message arrives within the timeout period</returns>
         public ReceivedResult<T> TryReceive(string topic, int timeoutInMilliseconds)
         {
-            if (Logger.Value.IsDebugEnabled())
-                Logger.Value.Debug($"TryReceive<{typeof(T).FullName}>(..., {timeoutInMilliseconds})");
+            if (s_logger.IsEnabled(LogLevel.Debug))
+                s_logger.LogDebug("TryReceive<{CommandType}>(..., {Timeout)", typeof(T).FullName, timeoutInMilliseconds);
             var rc = TryReceive(topic);
             var timeleft = timeoutInMilliseconds;
             while (!rc.IsDataValid && timeleft > 0)
@@ -113,11 +115,11 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
         /// <returns>The message received -or- ReceivedResult&lt;T&gt;.Empty when no message is waiting</returns>
         private ReceivedResult<T> TryReceive(string topic)
         {
-            if (Logger.Value.IsDebugEnabled()) Logger.Value.Debug($"TryReceive<{typeof(T).FullName}>(...)");
+            if (s_logger.IsEnabled(LogLevel.Debug)) s_logger.LogDebug("TryReceive<{CommandType}>(...)", typeof(T).FullName);
 
             var parameters = InitRemoveDbParameters(topic);
 
-            using (var connection = GetConnection())
+            using (var connection = _connectionProvider.GetConnection())
             {
                 connection.Open();
                 var sqlCmd = InitRemoveDbCommand(connection, parameters);
@@ -127,9 +129,7 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
                 var json = (string) reader[0];
                 var messageType = (string) reader[1];
                 var id = (long) reader[3];
-                var contractResolver = new MessageDefaultContractResolver();
-                var settings = new JsonSerializerSettings {ContractResolver = contractResolver};
-                var message = JsonConvert.DeserializeObject<T>(json, settings);
+                var message = JsonSerializer.Deserialize<T>(json, JsonSerialisationOptions.Options);
                 return new ReceivedResult<T>(true, json, topic, messageType, id, message);
             }
         }
@@ -143,11 +143,11 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
         public async Task<ReceivedResult<T>> TryReceiveAsync(string topic,
             CancellationToken cancellationToken = default(CancellationToken))
         {
-            if (Logger.Value.IsDebugEnabled()) Logger.Value.Debug($"TryReceiveAsync<{typeof(T).FullName}>(...)");
+            if (s_logger.IsEnabled(LogLevel.Debug)) s_logger.LogDebug("TryReceiveAsync<{CommandType}>(...)", typeof(T).FullName);
 
             var parameters = InitRemoveDbParameters(topic);
 
-            using (var connection = GetConnection())
+            using (var connection = await _connectionProvider.GetConnectionAsync())
             {
                 await connection.OpenAsync(cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
                 var sqlCmd = InitRemoveDbCommand(connection, parameters);
@@ -158,9 +158,7 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
                 var json = (string) reader[0];
                 var messageType = (string) reader[1];
                 var id = (int) reader[3];
-                var contractResolver = new MessageDefaultContractResolver();
-                var settings = new JsonSerializerSettings {ContractResolver = contractResolver};
-                var message = JsonConvert.DeserializeObject<T>(json, settings);
+                var message = JsonSerializer.Deserialize<T>(json, JsonSerialisationOptions.Options);
                 return new ReceivedResult<T>(true, json, topic, messageType, id, message);
             }
         }
@@ -172,8 +170,8 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
 
         public int NumberOfMessageReady(string topic)
         {
-            var sql = $"select COUNT(*) from Queues where Topic='{topic}'";
-            using (var connection = GetConnection())
+            var sql = $"select COUNT(*) from [{_configuration.QueueStoreTable}] where Topic='{topic}'";
+            using (var connection = _connectionProvider.GetConnection())
             {
                 var sqlCmd = connection.CreateCommand();
                 sqlCmd.CommandText = sql;
@@ -186,38 +184,36 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
         /// </summary>
         public void Purge()
         {
-            if (Logger.Value.IsDebugEnabled()) Logger.Value.Debug("Purge()");
+            if (s_logger.IsEnabled(LogLevel.Debug)) s_logger.LogDebug("Purge()");
 
-            using (var connection = GetConnection())
+            using (var connection = _connectionProvider.GetConnection())
             {
                 connection.Open();
                 var sqlCmd = InitPurgeDbCommand(connection);
                 sqlCmd.ExecuteNonQuery();
             }
         }
-
-        private DbConnection GetConnection() => new SqlConnection(_configuration.ConnectionString);
-
-        private static DbParameter CreateSqlParameter(string parameterName, object value)
+        
+        private static SqlParameter CreateSqlParameter(string parameterName, object value)
         {
             return new SqlParameter(parameterName, value);
         }
 
-        private static DbParameter[] InitAddDbParameters(string topic, T message)
+        private static SqlParameter[] InitAddDbParameters(string topic, T message)
         {
             var parameters = new[]
             {
                 CreateSqlParameter("topic", topic),
                 CreateSqlParameter("messageType", typeof(T).FullName),
-                CreateSqlParameter("payload", JsonConvert.SerializeObject(message))
+                CreateSqlParameter("payload", JsonSerializer.Serialize(message, JsonSerialisationOptions.Options))
             };
             return parameters;
         }
 
-        private DbCommand InitAddDbCommand(int timeoutInMilliseconds, DbConnection connection, DbParameter[] parameters)
+        private SqlCommand InitAddDbCommand(int timeoutInMilliseconds, SqlConnection connection, SqlParameter[] parameters)
         {
             var sql =
-                $"set nocount on;insert into {_configuration.QueueStoreTable} (Topic, MessageType, Payload) values(@topic, @messageType, @payload);";
+                $"set nocount on;insert into [{_configuration.QueueStoreTable}] (Topic, MessageType, Payload) values(@topic, @messageType, @payload);";
             var sqlCmd = connection.CreateCommand();
             if (timeoutInMilliseconds != -1) sqlCmd.CommandTimeout = timeoutInMilliseconds;
 
@@ -226,7 +222,7 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
             return sqlCmd;
         }
 
-        private static DbParameter[] InitRemoveDbParameters(string topic)
+        private static SqlParameter[] InitRemoveDbParameters(string topic)
         {
             var parameters = new[]
             {
@@ -235,10 +231,10 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
             return parameters;
         }
 
-        private DbCommand InitRemoveDbCommand(DbConnection connection, DbParameter[] parameters)
+        private SqlCommand InitRemoveDbCommand(SqlConnection connection, SqlParameter[] parameters)
         {
             var sql =
-                $"set nocount on;with cte as (select top(1) Payload, MessageType, Topic, Id from {_configuration.QueueStoreTable}" +
+                $"set nocount on;with cte as (select top(1) Payload, MessageType, Topic, Id from [{_configuration.QueueStoreTable}]" +
                 " with (rowlock, readpast) where Topic = @topic order by Id) delete from cte output deleted.Payload, deleted.MessageType, deleted.Topic, deleted.Id;";
             var sqlCmd = connection.CreateCommand();
             sqlCmd.CommandText = sql;
@@ -246,9 +242,9 @@ namespace Paramore.Brighter.MessagingGateway.MsSql.SqlQueues
             return sqlCmd;
         }
 
-        private DbCommand InitPurgeDbCommand(DbConnection connection)
+        private SqlCommand InitPurgeDbCommand(SqlConnection connection)
         {
-            var sql = $"delete from from {_configuration.QueueStoreTable}";
+            var sql = $"delete from [{_configuration.QueueStoreTable}]";
             var sqlCmd = connection.CreateCommand();
             sqlCmd.CommandText = sql;
             return sqlCmd;

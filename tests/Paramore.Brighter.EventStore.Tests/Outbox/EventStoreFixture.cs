@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2019 Jonny Olliff-Lee <jonny.ollifflee@gmail.com>
 
@@ -75,20 +75,13 @@ namespace Paramore.Brighter.EventStore.Tests.Outbox
                 }
             }
         }
-        
-        protected Message CreateMessage(int eventNumber, string streamName)
-        {
-            var body = new MessageBody("{companyId:123}");
-            var header = new MessageHeader(Guid.NewGuid(), "Topic", MessageType.MT_EVENT);
-            header.Bag.Add("impersonatorId", 123);
-            header.Bag.Add("eventNumber", eventNumber);
-            header.Bag.Add("streamId", streamName);
-            return new Message(header, body);
-        }
 
         public async Task DisposeAsync()
         {
             Connection.Close();
+            var completionSource = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+            completionSource.SetResult(null);
+            await completionSource.Task;
         }
     }
 }

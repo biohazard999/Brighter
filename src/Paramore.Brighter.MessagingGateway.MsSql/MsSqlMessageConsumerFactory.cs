@@ -1,30 +1,32 @@
 ﻿using System;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
+using Paramore.Brighter.MsSql;
 
 namespace Paramore.Brighter.MessagingGateway.MsSql
 {
     public class MsSqlMessageConsumerFactory : IAmAMessageConsumerFactory
     {
-        private static readonly Lazy<ILog> Logger = new Lazy<ILog>(LogProvider.For<MsSqlMessageConsumerFactory>);
-        private readonly MsSqlMessagingGatewayConfiguration _msSqlMessagingGatewayConfiguration;
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MsSqlMessageConsumerFactory>();
+        private readonly MsSqlConfiguration _msSqlConfiguration;
 
-        public MsSqlMessageConsumerFactory(MsSqlMessagingGatewayConfiguration msSqlMessagingGatewayConfiguration)
+        public MsSqlMessageConsumerFactory(MsSqlConfiguration msSqlConfiguration)
         {
-            _msSqlMessagingGatewayConfiguration = msSqlMessagingGatewayConfiguration ??
+            _msSqlConfiguration = msSqlConfiguration ??
                                                   throw new ArgumentNullException(
-                                                      nameof(msSqlMessagingGatewayConfiguration));
+                                                      nameof(msSqlConfiguration));
         }
 
         /// <summary>
         /// Creates a consumer for the specified queue.
         /// </summary>
-        /// <param name="connection">The queue to connect to</param>
+        /// <param name="subscription">The queue to connect to</param>
         /// <returns>IAmAMessageConsumer</returns>
-         public IAmAMessageConsumer Create(Connection connection)
+         public IAmAMessageConsumer Create(Subscription subscription)
         {
-            if (connection.ChannelName == null) throw new ArgumentNullException(nameof(connection.ChannelName));
-            Logger.Value.Debug($"MsSqlMessageConsumerFactory: create consumer for topic {connection.ChannelName}");
-            return new MsSqlMessageConsumer(_msSqlMessagingGatewayConfiguration, connection.ChannelName);
+            if (subscription.ChannelName == null) throw new ArgumentNullException(nameof(subscription.ChannelName));
+            s_logger.LogDebug("MsSqlMessageConsumerFactory: create consumer for topic {ChannelName}", subscription.ChannelName);
+            return new MsSqlMessageConsumer(_msSqlConfiguration, subscription.ChannelName);
         }
     }
 }

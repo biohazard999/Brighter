@@ -24,8 +24,8 @@ THE SOFTWARE. */
 
 using System;
 using System.Linq;
+using System.Text.Json;
 using FluentAssertions;
-using Newtonsoft.Json;
 using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
 using Polly;
 using Polly.Registry;
@@ -33,6 +33,7 @@ using Xunit;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors
 {
+    [Collection("CommandProcessor")]
     public class CommandProcessorPostBoxClearTests : IDisposable
     {
         private readonly CommandProcessor _commandProcessor;
@@ -49,7 +50,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors
 
             _message = new Message(
                 new MessageHeader(myCommand.Id, "MyCommand", MessageType.MT_COMMAND),
-                new MessageBody(JsonConvert.SerializeObject(myCommand))
+                new MessageBody(JsonSerializer.Serialize(myCommand, JsonSerialisationOptions.Options))
                 );
 
             var messageMapperRegistry = new MessageMapperRegistry(new SimpleMessageMapperFactory((_) => new MyCommandMessageMapper()));
@@ -82,7 +83,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors
             _fakeMessageProducer.MessageWasSent.Should().BeTrue();
 
             var sentMessage = _fakeMessageProducer.SentMessages.FirstOrDefault();
-            sentMessage.Should().NotBe(null);
+            sentMessage.Should().NotBeNull();
             sentMessage.Id.Should().Be(_message.Id);
             sentMessage.Header.Topic.Should().Be(_message.Header.Topic);
             sentMessage.Body.Value.Should().Be(_message.Body.Value);

@@ -33,6 +33,7 @@ using Xunit;
 
 namespace Paramore.Brighter.InMemory.Tests.Outbox
 {
+    [Trait("Category", "InMemory")]
     public class InMemoryOutboxTests
     {
         [Fact]
@@ -75,7 +76,7 @@ namespace Paramore.Brighter.InMemory.Tests.Outbox
             
             //Act
             outbox.Add(messageToAdd);
-            var dispatchedAt = DateTime.Now;
+            var dispatchedAt = DateTime.UtcNow;
             outbox.MarkDispatched(messageId, dispatchedAt);
 
             var dispatchedMessages = outbox.DispatchedMessages(500);
