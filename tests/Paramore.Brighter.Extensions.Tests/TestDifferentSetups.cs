@@ -1,63 +1,94 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
-using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter;
 using Paramore.Brighter.Extensions.DependencyInjection;
+using Paramore.Brighter.Extensions.Tests.TestDoubles;
+using Paramore.Brighter.Observability;
 using Polly;
 using Polly.Registry;
 using Xunit;
 
 namespace Tests
 {
-    public class TestBrighterExtension
+    public partial class TestBrighterExtension
     {
         [Fact]
         public void BasicSetup()
         {
             var serviceCollection = new ServiceCollection();
-            
+
             serviceCollection.AddBrighter().AutoFromAssemblies();
 
             var serviceProvider = serviceCollection.BuildServiceProvider();
 
             var commandProcessor = serviceProvider.GetService<IAmACommandProcessor>();
-            
+
             Assert.NotNull(commandProcessor);
         }
 
-        [Fact]
-        public void WithProducer()
+        [Theory]
+        [InlineData(typeof(Paramore.Brighter.Extensions.Tests.TestDoubles.TestBrighterExtension.SomeSqlConnectionProvider), typeof(Paramore.Brighter.Extensions.Tests.TestDoubles.TestBrighterExtension.StubSqlTransactionProvider))]
+        [InlineData(typeof(Paramore.Brighter.Extensions.Tests.TestDoubles.TestBrighterExtension.StubSqlTransactionProvider), typeof(Paramore.Brighter.Extensions.Tests.TestDoubles.TestBrighterExtension.StubSqlTransactionProvider))]
+        public void WithExternalBus(Type connectionProvider, Type transactionProvider)
         {
             var serviceCollection = new ServiceCollection();
-            
-            serviceCollection
-                .AddBrighter(options =>
+            const string mytopic = "MyTopic";
+            var routingKey = new RoutingKey(mytopic);
+
+            var producerRegistry = new ProducerRegistry(
+                new Dictionary<RoutingKey, IAmAMessageProducer>
                 {
-                    var outBox = new InMemoryOutbox();
-                    var producer = new FakeProducer();
-                    options.BrighterMessaging = new BrighterMessaging(outBox, outBox, producer, producer);
+                    {
+                        routingKey, new InMemoryMessageProducer(new InternalBus(), new Publication{ Topic = routingKey})
+                    },
+                });
+
+            var messageMapperRegistry = new MessageMapperRegistry(
+                new SimpleMessageMapperFactory(type => new TestEventMessageMapper()),
+                new SimpleMessageMapperFactoryAsync(type => new TestEventMessageMapperAsync())
+            );
+
+            var outbox = new Paramore.Brighter.Extensions.Tests.TestDoubles.TestBrighterExtension.StubSqlOutbox(
+                DbSystem.MySql,
+                new Paramore.Brighter.Extensions.Tests.TestDoubles.TestBrighterExtension.StubSqlDbConfiguration(),
+                new Paramore.Brighter.Extensions.Tests.TestDoubles.TestBrighterExtension.SomeSqlConnectionProvider(),
+                new Paramore.Brighter.Extensions.Tests.TestDoubles.TestBrighterExtension.StubRelationDatabaseOutboxQueries(),
+                new Logger<Paramore.Brighter.Extensions.Tests.TestDoubles.TestBrighterExtension.StubSqlOutbox>(new LoggerFactory()));
+
+            serviceCollection.AddSingleton<ILoggerFactory, LoggerFactory>();
+
+            serviceCollection
+                .AddBrighter()
+                .AddProducers(config =>
+                {
+                    config.ProducerRegistry = producerRegistry;
+                    config.MessageMapperRegistry = messageMapperRegistry;
+                    config.ConnectionProvider = connectionProvider;
+                    config.TransactionProvider = transactionProvider;
+                    config.Outbox = outbox;
                 })
                 .AutoFromAssemblies();
 
             var serviceProvider = serviceCollection.BuildServiceProvider();
 
             var commandProcessor = serviceProvider.GetService<IAmACommandProcessor>();
-            
+
             Assert.NotNull(commandProcessor);
         }
 
-        
         [Fact]
         public void WithCustomPolicy()
         {
             var serviceCollection = new ServiceCollection();
 
-            var retryPolicy = Policy.Handle<Exception>().WaitAndRetry(new[] { TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150) });
+            var retryPolicy = Policy.Handle<Exception>().WaitAndRetry([TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150)]);
             var circuitBreakerPolicy = Policy.Handle<Exception>().CircuitBreaker(1, TimeSpan.FromMilliseconds(500));
-            var retryPolicyAsync = Policy.Handle<Exception>().WaitAndRetryAsync(new[] { TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150) });
+            var retryPolicyAsync = Policy.Handle<Exception>().WaitAndRetryAsync([TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150)]);
             var circuitBreakerPolicyAsync = Policy.Handle<Exception>().CircuitBreakerAsync(1, TimeSpan.FromMilliseconds(500));
-            var policyRegistry = new PolicyRegistry()
+            var policyRegistry = new PolicyRegistry
             {
                 { CommandProcessor.RETRYPOLICY, retryPolicy },
                 { CommandProcessor.CIRCUITBREAKER, circuitBreakerPolicy },
@@ -65,7 +96,6 @@ namespace Tests
                 { CommandProcessor.CIRCUITBREAKERASYNC, circuitBreakerPolicyAsync }
             };
 
-            
             serviceCollection
                 .AddBrighter(options => options.PolicyRegistry = policyRegistry)
                 .AutoFromAssemblies();
@@ -73,7 +103,7 @@ namespace Tests
             var serviceProvider = serviceCollection.BuildServiceProvider();
 
             var commandProcessor = serviceProvider.GetService<IAmACommandProcessor>();
-            
+
             Assert.NotNull(commandProcessor);
         }
 
@@ -81,42 +111,17 @@ namespace Tests
         public void WithScopedLifetime()
         {
             var serviceCollection = new ServiceCollection();
-            
-            serviceCollection.AddBrighter(options => options.CommandProcessorLifetime = ServiceLifetime.Scoped
+
+            serviceCollection.AddBrighter(
                 ).AutoFromAssemblies();
 
-            Assert.Equal( ServiceLifetime.Scoped, serviceCollection.SingleOrDefault(x => x.ServiceType == typeof(IAmACommandProcessor))?.Lifetime);
+            Assert.Equal(ServiceLifetime.Singleton, serviceCollection.SingleOrDefault(x => x.ServiceType == typeof(IAmACommandProcessor))?.Lifetime);
 
             var serviceProvider = serviceCollection.BuildServiceProvider();
 
             var commandProcessor = serviceProvider.GetService<IAmACommandProcessor>();
-            
+
             Assert.NotNull(commandProcessor);
-        }
-
-    }
-
-    internal class FakeProducer : IAmAMessageProducer, IAmAMessageProducerAsync
-
-    {
-        public void Dispose()
-        {
-            throw new NotImplementedException();
-        }
-
-        public Task SendAsync(Message message)
-        {
-            throw new NotImplementedException();
-        }
-
-        public void Send(Message message)
-        {
-            throw new NotImplementedException();
-        }
-
-        public void SendWithDelay(Message message, int delayMilliseconds = 0)
-        {
-            throw new NotImplementedException();
         }
     }
 }

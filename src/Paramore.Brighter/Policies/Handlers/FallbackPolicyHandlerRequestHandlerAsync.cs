@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -36,13 +36,13 @@ namespace Paramore.Brighter.Policies.Handlers
         /// </summary>
         public const string CAUSE_OF_FALLBACK_EXCEPTION = "Fallback_Exception_Cause";
 
-        private Func<TRequest, CancellationToken, Task<TRequest>> _exceptionHandlerFunc;
+        private Func<TRequest, CancellationToken, Task<TRequest>>? _exceptionHandlerFunc;
 
         /// <summary>
         /// Initializes from attribute parameters.
         /// </summary>
         /// <param name="initializerList">The initializer list.</param>
-        public override void InitializeFromAttributeParams(params object[] initializerList)
+        public override void InitializeFromAttributeParams(params object?[] initializerList)
         {
             var catchAll = Convert.ToBoolean(initializerList[0]);
             var catchBrokenCircuit = Convert.ToBoolean(initializerList[1]);
@@ -69,12 +69,14 @@ namespace Paramore.Brighter.Policies.Handlers
         /// <param name="command">The command.</param>
         /// <param name="cancellationToken">Allow the sender to cancel the request</param>
         /// <returns>TRequest.</returns>
-        public override async Task<TRequest> HandleAsync(TRequest command, CancellationToken cancellationToken = default(CancellationToken))
+        public override Task<TRequest> HandleAsync(TRequest command, CancellationToken cancellationToken = default)
         {
-            return await _exceptionHandlerFunc(command, cancellationToken);
+            if (_exceptionHandlerFunc is null)
+                throw new ArgumentException("ExceptionHandler must be set before handling.");
+            return _exceptionHandlerFunc(command, cancellationToken);
         }
 
-        private async Task<TRequest> CatchAll(TRequest command, CancellationToken cancellationToken = default(CancellationToken))
+        private async Task<TRequest> CatchAll(TRequest command, CancellationToken cancellationToken = default)
         {
             try
             {
@@ -82,27 +84,27 @@ namespace Paramore.Brighter.Policies.Handlers
             }
             catch (Exception exception)
             {
-                Context.Bag.Add(CAUSE_OF_FALLBACK_EXCEPTION, exception);
+                Context?.Bag.AddOrUpdate(CAUSE_OF_FALLBACK_EXCEPTION, exception, (s, o) => exception);
             }
             return await FallbackAsync(command, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
         }
 
-        private async Task<TRequest> CatchBrokenCircuit(TRequest command, CancellationToken cancellationToken = default(CancellationToken))
+        private async Task<TRequest> CatchBrokenCircuit(TRequest command, CancellationToken cancellationToken = default)
         {
             try
             {
                 return await base.HandleAsync(command, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
             }
-            catch (BrokenCircuitException brokenCircuitExceptionexception)
+            catch (BrokenCircuitException brokenCircuitException)
             {
-                Context.Bag.Add(CAUSE_OF_FALLBACK_EXCEPTION, brokenCircuitExceptionexception);
+                Context?.Bag.AddOrUpdate(CAUSE_OF_FALLBACK_EXCEPTION, brokenCircuitException, (s, o) => brokenCircuitException);
             }
             return await FallbackAsync(command, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
         }
 
-        private async Task<TRequest> CatchNone(TRequest command, CancellationToken cancellationToken = default(CancellationToken))
+        private async Task<TRequest> CatchNone(TRequest command, CancellationToken cancellationToken = default)
         {
-            var tcs = new TaskCompletionSource<TRequest>();
+            var tcs = new TaskCompletionSource<TRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
             if (cancellationToken.IsCancellationRequested)
             {
                 tcs.SetCanceled();

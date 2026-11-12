@@ -1,9 +1,8 @@
-﻿using System;
-
-namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
+﻿namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyCommandToFail : ICommand
-    { 
-        public Guid Id { get; set; }
+    internal sealed class MyCommandToFail : ICommand
+    {
+        public Id? CorrelationId { get; set; }
+        public Id Id { get; set; } = Id.Random();
     }
 }

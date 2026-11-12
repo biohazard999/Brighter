@@ -1,14 +1,19 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Description>This is an implementation of the inbox used for decoupled invocation of commands by Paramore.Brighter, using Sqlite</Description>
+    <Description>SQLite inbox provider for Paramore.Brighter Command Processor. Enables inbox pattern implementation for idempotent command and event handling using SQLite as the persistence layer.</Description>
     <Authors>Ian Cooper</Authors>
-    <TargetFrameworks>netstandard2.0</TargetFrameworks>
-    <PackageTags>RabbitMQ;AMQP;Command;Event;Service Activator;Decoupled;Invocation;Messaging;Remote;Command Dispatcher;Command Processor;Request;Service;Task Queue;Work Queue;Retry;Circuit Breaker;Availability</PackageTags>
+    <TargetFrameworks>$(BrighterTargetFrameworks)</TargetFrameworks>
+    <!-- Remove these XML documentation suppressions as the existing comments are corrected. -->
+    <NoWarn>$(NoWarn);CS1573</NoWarn>
+    <PackageTags>SQLite;Database;Inbox;Idempotent;Command;Event;Command Processor;Embedded Database;Brighter</PackageTags>
+    <Nullable>enable</Nullable>
   </PropertyGroup>
+
   <ItemGroup>
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="5.0.3" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\Paramore.Brighter.Sqlite\Paramore.Brighter.Sqlite.csproj" />
     <ProjectReference Include="..\Paramore.Brighter\Paramore.Brighter.csproj" />
   </ItemGroup>
 </Project>

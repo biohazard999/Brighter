@@ -1,0 +1,1089 @@
+﻿using MongoDB.Driver;
+using Paramore.Brighter.MongoDb;
+using Paramore.Brighter.Observability;
+
+namespace Paramore.Brighter.Outbox.MongoDb;
+
+/// <summary>
+/// The implementation for MongoDB for outbox
+/// </summary>
+public class MongoDbOutbox : BaseMongoDb<OutboxMessage>, IAmAnOutboxAsync<Message, IClientSessionHandle>,
+    IAmAnOutboxSync<Message, IClientSessionHandle>, IAmACausationTrackingOutbox, IAmATopicCountingOutbox
+{
+    private const int MAX_TOPIC_AGE_DAYS = 365;
+
+    /// <summary>
+    /// The implementation for MongoDB for the Outbox pattern within Brighter.
+    /// This class manages the storage and retrieval of outgoing messages, ensuring
+    /// atomic operations between database writes and message publishing through
+    /// the use of MongoDB. It supports both asynchronous and synchronous operations
+    /// and leverages MongoDB sessions for transactional consistency.
+    /// </summary>
+    public MongoDbOutbox(IAmAMongoDbConnectionProvider connectionProvider, IAmAMongoDbConfiguration configuration)
+        : base(connectionProvider, configuration, configuration.Outbox ?? throw new ArgumentException("Outbox can't be null"))
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="MongoDbOutbox"/> class using only the
+    /// main MongoDB configuration. A <see cref="MongoDbConnectionProvider"/> will be
+    /// created internally.
+    /// </summary>
+    /// <param name="configuration">The overall MongoDB configuration, which must include outbox settings.</param>
+    public MongoDbOutbox(IAmAMongoDbConfiguration configuration)
+        : this(new MongoDbConnectionProvider(configuration), configuration)
+    {
+        
+    }
+
+    /// <inheritdoc />
+    public IAmABrighterTracer? Tracer { get; set; }
+
+    /// <inheritdoc />
+    public bool ContinueOnCapturedContext { get; set; }
+
+    /// <summary>
+    /// Returns all messages in the store
+    /// </summary>
+    /// <param name="pageSize">Number of messages to return in search results (default = 100)</param>
+    /// <param name="pageNumber">Page number of results to return (default = 1)</param>
+    /// <param name="args">Additional parameters required for search, if any</param>
+    /// <param name="cancellationToken">The cancellation token</param>
+    /// <returns>A list of messages</returns>
+    public async Task<IList<Message>> GetAsync(
+        int pageSize = 100,
+        int pageNumber = 1,
+        Dictionary<string, object>? args = null,
+        CancellationToken cancellationToken = default)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Get,
+                CollectionConfiguration.Name),
+            null,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.Empty;
+            if (args != null && args.TryGetValue("Topic", out var topic))
+            {
+                filter &= Builders<OutboxMessage>.Filter.Eq(x => x.Topic, topic);
+            }
+
+            var cursor = await Collection.FindAsync(filter,
+                    new FindOptions<OutboxMessage> { Skip = pageSize * Math.Max(pageNumber - 1, 0), Limit = pageSize },
+                    cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+
+            var messages = new List<Message>(pageSize);
+            while (await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(ContinueOnCapturedContext))
+            {
+                messages.AddRange(cursor.Current.Select(x => x.ConvertToMessage()));
+            }
+
+            span?.AddTag("db.response.returned_rows", messages.Count);
+            return messages;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <summary>
+    /// Returns messages specified by the Ids
+    /// </summary>
+    /// <param name="messageIds">The Ids of the messages</param>
+    /// <param name="requestContext">What is the context for this request; used to access the Span</param>        
+    /// <param name="outBoxTimeout">The Timeout of the outbox.</param>
+    /// <param name="cancellationToken">Cancellation Token.</param>
+    /// <returns></returns>
+    public async Task<IEnumerable<Message>> GetAsync(
+        IEnumerable<Id> messageIds,
+        RequestContext? requestContext,
+        int outBoxTimeout = -1,
+        Dictionary<string, object>? args = null,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var ids = messageIds.Select(id => id.Value ).ToArray();
+        
+        var dbAttributes = new Dictionary<string, string>()
+        {
+            {"db.operation.parameter.message.ids", string.Join(",", ids)}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Get,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.In(x => x.MessageId, ids);
+
+            var cursor = await Collection.FindAsync(filter,
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+
+            var messages = new List<Message>();
+            while (await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(ContinueOnCapturedContext))
+            {
+                messages.AddRange(cursor.Current.Select(x => x.ConvertToMessage()));
+            }
+
+            span?.AddTag("db.response.returned_rows", messages.Count);
+            return messages;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <summary>
+    /// Get the number of messages in the Outbox that are not dispatched
+    /// </summary>
+    /// <param name="cancellationToken">Cancel the async operation</param>
+    /// <returns></returns>
+    public async Task<long> GetNumberOfOutstandingMessagesAsync(CancellationToken cancellationToken = default)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Get,
+                CollectionConfiguration.Name),
+            null,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            return await Collection.CountDocumentsAsync(
+                    Builders<OutboxMessage>.Filter.Eq(x => x.Dispatched, null),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task AddAsync(Message message,
+        RequestContext? requestContext,
+        int outBoxTimeout = -1,
+        IAmABoxTransactionProvider<IClientSessionHandle>? transactionProvider = null,
+        CancellationToken cancellationToken = default)
+    {
+        var dbAttributes = new Dictionary<string, string>()
+        {
+            {"db.operation.parameter.message.id", message.Id.Value}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Add,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var messageToStore = new OutboxMessage(message, ExpireAfterSeconds)
+            {
+                CausationId = ReadCausationId(requestContext)
+            };
+
+            if (transactionProvider != null)
+            {
+                var session = await transactionProvider.GetTransactionAsync(cancellationToken)
+                    .ConfigureAwait(ContinueOnCapturedContext);
+
+                await Collection
+                    .InsertOneAsync(session, messageToStore, cancellationToken: cancellationToken)
+                    .ConfigureAwait(ContinueOnCapturedContext);
+            }
+            else
+            {
+                await Collection
+                    .InsertOneAsync(messageToStore, cancellationToken: cancellationToken)
+                    .ConfigureAwait(ContinueOnCapturedContext);
+            }
+        }
+        catch (MongoWriteException e)
+        {
+            if (e.WriteError.Category != ServerErrorCategory.DuplicateKey)
+            {
+                throw;
+            }
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task AddAsync(IEnumerable<Message> messages,
+        RequestContext? requestContext,
+        int outBoxTimeout = -1,
+        IAmABoxTransactionProvider<IClientSessionHandle>? transactionProvider = null,
+        CancellationToken cancellationToken = default)
+    {
+        var dbAttributes = new Dictionary<string, string>()
+        {
+          {"db.operation.parameter.message.ids", string.Join(",", messages.Select(m => m.Id.Value))}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Add,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+        try
+        {
+            var causationId = ReadCausationId(requestContext);
+            var messageItems = messages.Select(message => new OutboxMessage(message, ExpireAfterSeconds)
+            {
+                CausationId = causationId
+            });
+            if (transactionProvider != null)
+            {
+                var session = await transactionProvider.GetTransactionAsync(cancellationToken)
+                    .ConfigureAwait(ContinueOnCapturedContext);
+                await Collection
+                    .InsertManyAsync(session, messageItems, cancellationToken: cancellationToken)
+                    .ConfigureAwait(ContinueOnCapturedContext);
+            }
+            else
+            {
+                await Collection
+                    .InsertManyAsync(messageItems, cancellationToken: cancellationToken)
+                    .ConfigureAwait(ContinueOnCapturedContext);
+            }
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task DeleteAsync(
+        Id[] messageIds,
+        RequestContext requestContext,
+        Dictionary<string, object>? args = null,
+        CancellationToken cancellationToken = default)
+    {
+        var dbAttributes = new Dictionary<string, string>()
+        {
+            {"db.operation.parameter.message.ids", string.Join(",", messageIds.Select(id => id.Value))}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Delete,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.In(x => x.MessageId, messageIds.Select(id => id.Value));
+            await Collection.DeleteManyAsync(filter, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<IEnumerable<Message>> DispatchedMessagesAsync(
+        TimeSpan dispatchedSince,
+        RequestContext requestContext,
+        int pageSize = 100,
+        int pageNumber = 1, int outboxTimeout = -1, Dictionary<string, object>? args = null,
+        CancellationToken cancellationToken = default)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.DispatchedMessages,
+                CollectionConfiguration.Name),
+            requestContext.Span,
+            options: Configuration.InstrumentationOptions);
+        try
+        {
+            var olderThan = Configuration.TimeProvider.GetLocalNow() - dispatchedSince;
+            var filter = Builders<OutboxMessage>.Filter.Lt(x => x.Dispatched, olderThan);
+            if (args != null && args.TryGetValue("Topic", out var topic))
+            {
+                filter &= Builders<OutboxMessage>.Filter.Eq(x => x.Topic, topic);
+            }
+
+            var cursor = await Collection.FindAsync(filter,
+                    new FindOptions<OutboxMessage, OutboxMessage>
+                    {
+                        Limit = pageSize,
+                        Skip = pageSize * Math.Max(pageNumber - 1, 0),
+                        Sort = Builders<OutboxMessage>.Sort.Ascending(x => x.TimeStamp)
+                    }, cancellationToken: cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+
+            var messages = new List<Message>(pageSize);
+            while (await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(ContinueOnCapturedContext))
+            {
+                messages.AddRange(cursor.Current.Select(x => x.ConvertToMessage()));
+            }
+
+            span?.AddTag("db.response.returned_rows", messages.Count);
+            return messages;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<Message> GetAsync(
+        Id messageId, 
+        RequestContext requestContext, 
+        int outBoxTimeout = -1,
+        Dictionary<string, object>? args = null,
+        CancellationToken cancellationToken = default)
+    {
+        var dbAttributes = new Dictionary<string, string>()
+        {
+            {"db.operation.parameter.message.id", messageId.Value}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Get,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var find = await Collection
+                .FindAsync(x => x.MessageId == messageId.Value, cancellationToken: cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+
+            var first = await find
+                .FirstOrDefaultAsync(cancellationToken: cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+
+            return first == null ? new Message() : first.ConvertToMessage();
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task MarkDispatchedAsync(Id id, RequestContext requestContext, DateTimeOffset? dispatchedAt = null,
+        Dictionary<string, object>? args = null, CancellationToken cancellationToken = default)
+    {
+        var dbAttributes = new Dictionary<string, string>()
+        {
+            {"db.operation.parameter.message.id", id.Value}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.MarkDispatched,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.Eq(x => x.MessageId, id.Value);
+
+            dispatchedAt ??= Configuration.TimeProvider.GetUtcNow();
+            var update = Builders<OutboxMessage>.Update
+                .Set(x => x.Dispatched, dispatchedAt.Value);
+
+            await Collection.UpdateOneAsync(filter, update, cancellationToken: cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task MarkDispatchedAsync(
+        IEnumerable<Id> ids,
+        RequestContext requestContext,
+        DateTimeOffset? dispatchedAt = null,
+        Dictionary<string, object>? args = null, CancellationToken cancellationToken = default)
+    {
+        var idStrings = ids.Select(id => id.Value).ToArray();
+        var dbAttributes = new Dictionary<string, string>()
+        {
+            {"db.operation.parameter.message.ids", string.Join(",", idStrings)}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.MarkDispatched,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext.Span,
+            options: Configuration.InstrumentationOptions);
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.In(x => x.MessageId, idStrings);
+
+            dispatchedAt ??= Configuration.TimeProvider.GetUtcNow();
+            var update = Builders<OutboxMessage>.Update
+                .Set(x => x.Dispatched, dispatchedAt.Value);
+
+            await Collection.UpdateManyAsync(filter, update, cancellationToken: cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<IEnumerable<Message>> OutstandingMessagesAsync(
+        TimeSpan dispatchedSince,
+        RequestContext? requestContext,
+        int pageSize = 100,
+        int pageNumber = 1,
+        IEnumerable<RoutingKey>? trippedTopics = null,
+        Dictionary<string, object>? args = null,
+        CancellationToken cancellationToken = default)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.OutStandingMessages,
+                CollectionConfiguration.Name),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+        try
+        {
+            var olderThan = Configuration.TimeProvider.GetLocalNow() - dispatchedSince;
+            
+            var filter = Builders<OutboxMessage>.Filter.Eq(x => x.Dispatched, null);
+            filter &= Builders<OutboxMessage>.Filter.Lt(x => x.TimeStamp, olderThan);
+
+            trippedTopics = trippedTopics?.ToList();
+            if (trippedTopics != null && trippedTopics.Any())
+            {
+                filter &= Builders<OutboxMessage>.Filter.Nin(x => x.Topic,  trippedTopics.Select(x => x.Value));
+            }
+            
+            if (args != null && args.TryGetValue("Topic", out var topic))
+            {
+                filter &= Builders<OutboxMessage>.Filter.Eq(x => x.Topic, topic);
+            }
+
+            var cursor = await Collection.FindAsync(filter,
+                    new FindOptions<OutboxMessage, OutboxMessage>
+                    {
+                        Limit = pageSize,
+                        Skip = pageSize * Math.Max(pageNumber - 1, 0),
+                        Sort = Builders<OutboxMessage>.Sort.Ascending(x => x.TimeStamp)
+                    }, cancellationToken: cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+
+            var messages = new List<Message>(pageSize);
+            while (await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(ContinueOnCapturedContext))
+            {
+                messages.AddRange(cursor.Current.Select(x => x.ConvertToMessage()));
+            }
+
+            span?.AddTag("db.response.returned_rows", messages.Count);
+            return messages;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <summary>
+    /// Returns all messages in the store
+    /// </summary>
+    /// <param name="pageSize">Number of messages to return in search results (default = 100)</param>
+    /// <param name="pageNumber">Page number of results to return (default = 1)</param>
+    /// <param name="args">Additional parameters required for search, if any</param>
+    /// <returns>A list of messages</returns>
+    public IList<Message> Get(int pageSize = 100, int pageNumber = 1, Dictionary<string, object>? args = null)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Get,
+                CollectionConfiguration.Name),
+            null,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.Empty;
+            if (args != null && args.TryGetValue("Topic", out var topic))
+            {
+                filter &= Builders<OutboxMessage>.Filter.Eq(x => x.Topic, topic);
+            }
+
+            var cursor = Collection.FindSync(filter,
+                new FindOptions<OutboxMessage> { Skip = pageSize * Math.Max(pageNumber - 1, 0), Limit = pageSize });
+
+            var messages = new List<Message>(pageSize);
+            while (cursor.MoveNext())
+            {
+                messages.AddRange(cursor.Current.Select(x => x.ConvertToMessage()));
+            }
+
+            span?.AddTag("db.response.returned_rows", messages.Count);
+            return messages;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public IEnumerable<Message> Get(
+        IEnumerable<Id> messageIds,
+        RequestContext? requestContext = null,
+        int outBoxTimeout = -1,
+        Dictionary<string, object>? args = null
+    )
+    {
+        var ids = messageIds.Select(id => id.Value).ToArray();
+        
+        var dbAttributes = new Dictionary<string, string>()
+        {
+            {"db.operation.parameter.message.ids", string.Join(",", ids)}
+        };
+        
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Get,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.In(x => x.MessageId, ids);
+
+            var cursor = Collection.FindSync(filter);
+
+            var messages = new List<Message>();
+            while (cursor.MoveNext())
+            {
+                messages.AddRange(cursor.Current.Select(x => x.ConvertToMessage()));
+            }
+
+            span?.AddTag("db.response.returned_rows", messages.Count);
+            return messages;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <summary>
+    /// Get the number of messages in the Outbox that are not dispatched
+    /// </summary>
+    /// <returns></returns>
+    public long GetNumberOfOutstandingMessages()
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Get,
+                CollectionConfiguration.Name),
+            null,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            return Collection.CountDocuments(Builders<OutboxMessage>.Filter.Eq(x => x.Dispatched, null));
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public void Add(Message message, RequestContext? requestContext, int outBoxTimeout = -1,
+        IAmABoxTransactionProvider<IClientSessionHandle>? transactionProvider = null)
+    {
+        var dbAttributes = new Dictionary<string, string>()
+        {
+            {"db.operation.parameter.message.id", message.Id.Value}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Add,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var messageToStore = new OutboxMessage(message, ExpireAfterSeconds)
+            {
+                CausationId = ReadCausationId(requestContext)
+            };
+
+            if (transactionProvider != null)
+            {
+                var session = transactionProvider.GetTransaction();
+                Collection.InsertOne(session, messageToStore);
+            }
+            else
+            {
+                Collection.InsertOne(messageToStore);
+            }
+        }
+        catch (MongoWriteException e)
+        {
+            if (e.WriteError.Category != ServerErrorCategory.DuplicateKey)
+            {
+                throw;
+            }
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public void Add(IEnumerable<Message> messages, RequestContext? requestContext, int outBoxTimeout = -1,
+        IAmABoxTransactionProvider<IClientSessionHandle>? transactionProvider = null)
+    {
+        var dbAttributes = new Dictionary<string, string>
+        {
+            {"db.operation.parameter.message.ids", string.Join(",", messages.Select(m => m.Id.Value))}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Add,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+        try
+        {
+            var causationId = ReadCausationId(requestContext);
+            var messageItems = messages.Select(message => new OutboxMessage(message, ExpireAfterSeconds)
+            {
+                CausationId = causationId
+            });
+            if (transactionProvider != null)
+            {
+                var session = transactionProvider.GetTransaction();
+                Collection.InsertMany(session, messageItems);
+            }
+            else
+            {
+                Collection.InsertMany(messageItems);
+            }
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public void Delete(Id[] messageIds, RequestContext? requestContext, Dictionary<string, object>? args = null)
+    {
+        var dbAttributes = new Dictionary<string, string>()
+        {
+            {"db.operation.parameter.message.ids", string.Join(",", messageIds.Select(id => id.Value))}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Delete,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.In(x => x.MessageId, messageIds.Select(id => id.Value));
+            Collection.DeleteMany(filter);
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public IEnumerable<Message> DispatchedMessages(
+        TimeSpan dispatchedSince, 
+        RequestContext? requestContext,
+        int pageSize = 100,
+        int pageNumber = 1, int outBoxTimeout = -1, Dictionary<string, object>? args = null)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.DispatchedMessages,
+                CollectionConfiguration.Name),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var olderThan = Configuration.TimeProvider.GetLocalNow() - dispatchedSince;
+            var filter = Builders<OutboxMessage>.Filter.Lt(x => x.Dispatched, olderThan);
+            if (args != null && args.TryGetValue("Topic", out var topic))
+            {
+                filter &= Builders<OutboxMessage>.Filter.Eq(x => x.Topic, topic);
+            }
+
+            var cursor = Collection.FindSync(filter,
+                new FindOptions<OutboxMessage, OutboxMessage>
+                {
+                    Limit = pageSize,
+                    Skip = pageSize * Math.Max(pageNumber - 1, 0),
+                    Sort = Builders<OutboxMessage>.Sort.Ascending(x => x.TimeStamp)
+                });
+
+            var messages = new List<Message>(pageSize);
+            while (cursor.MoveNext())
+            {
+                messages.AddRange(cursor.Current.Select(x => x.ConvertToMessage()));
+            }
+
+            span?.AddTag("db.response.returned_rows", messages.Count);
+            return messages;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public Message Get(Id messageId, RequestContext? requestContext, int outBoxTimeout = -1, Dictionary<string, object>? args = null)
+    {
+        var dbAttributes = new Dictionary<string, string>()
+        {
+            {"db.operation.parameter.message.id", messageId.Value}
+        };
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Get,
+                CollectionConfiguration.Name,
+                dbAttributes: dbAttributes),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var find = Collection.FindSync(x => x.MessageId == messageId.Value);
+            var first = find.FirstOrDefault();
+            return first?.ConvertToMessage() ?? new Message();
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public void MarkDispatched(Id id, RequestContext? requestContext, DateTimeOffset? dispatchedAt = null, Dictionary<string, object>? args = null)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.MarkDispatched,
+                CollectionConfiguration.Name),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.Eq(x => x.MessageId, id.Value);
+
+            dispatchedAt ??= Configuration.TimeProvider.GetUtcNow();
+            var update = Builders<OutboxMessage>.Update
+                .Set(x => x.Dispatched, dispatchedAt.Value);
+
+            Collection.UpdateOne(filter, update);
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public bool SupportsCausationTracking() => true;
+
+    /// <inheritdoc />
+    public Task<bool> SupportsCausationTrackingAsync(CancellationToken cancellationToken = default)
+        => Task.FromResult(true);
+
+    /// <inheritdoc />
+    public bool ReplayCausation(string causationId, RequestContext? requestContext,
+        Dictionary<string, object>? args = null)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.MarkDispatched,
+                CollectionConfiguration.Name),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.Eq(x => x.CausationId, causationId);
+            var update = Builders<OutboxMessage>.Update.Set(x => x.Dispatched, (DateTimeOffset?)null);
+            Collection.UpdateMany(filter, update);
+
+            // The MongoDB store always supports causation tracking, so the replay is always performed.
+            return true;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> ReplayCausationAsync(string causationId, RequestContext? requestContext,
+        Dictionary<string, object>? args = null, CancellationToken cancellationToken = default)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.Replay,
+                CollectionConfiguration.Name),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+
+        try
+        {
+            var filter = Builders<OutboxMessage>.Filter.Eq(x => x.CausationId, causationId);
+            var update = Builders<OutboxMessage>.Update.Set(x => x.Dispatched, (DateTimeOffset?)null);
+            await Collection.UpdateManyAsync(filter, update, cancellationToken: cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+
+            // The MongoDB store always supports causation tracking, so the replay is always performed.
+            return true;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    private static string? ReadCausationId(RequestContext? requestContext)
+        => requestContext?.Bag.TryGetValue(RequestContextBagNames.CausationId, out var value) == true
+            ? value as string
+            : null;
+
+    /// <inheritdoc />
+    public IEnumerable<Message> OutstandingMessages(TimeSpan dispatchedSince, RequestContext? requestContext,
+        int pageSize = 100,
+        int pageNumber = 1,
+        IEnumerable<RoutingKey>? trippedTopics = null,
+        Dictionary<string, object>? args = null)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb,
+                Configuration.DatabaseName,
+                BoxDbOperation.OutStandingMessages,
+                CollectionConfiguration.Name),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+        try
+        {
+            var olderThan = Configuration.TimeProvider.GetLocalNow() - dispatchedSince;
+            
+            var filter = Builders<OutboxMessage>.Filter.Eq(x => x.Dispatched, null);
+            filter &= Builders<OutboxMessage>.Filter.Lt(x => x.TimeStamp, olderThan);
+            
+            trippedTopics = trippedTopics?.ToList();
+            if (trippedTopics != null && trippedTopics.Any())
+            {
+                filter &= Builders<OutboxMessage>.Filter.Nin(x => x.Topic,  trippedTopics.Select(x => x.Value));
+            }
+            
+            if (args != null && args.TryGetValue("Topic", out var topic))
+            {
+                filter &= Builders<OutboxMessage>.Filter.Eq(x => x.Topic, topic);
+            }
+
+            var cursor = Collection.FindSync(filter,
+                new FindOptions<OutboxMessage, OutboxMessage>
+                {
+                    Limit = pageSize,
+                    Skip = pageSize * Math.Max(pageNumber - 1, 0),
+                    Sort = Builders<OutboxMessage>.Sort.Ascending(x => x.TimeStamp)
+                });
+
+            var messages = new List<Message>(pageSize);
+            while (cursor.MoveNext())
+            {
+                messages.AddRange(cursor.Current.Select(x => x.ConvertToMessage()));
+            }
+
+            span?.AddTag("db.response.returned_rows", messages.Count);
+            return messages;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc/>
+    public int GetOutstandingMessageCount(TimeSpan dispatchedSince, RequestContext? requestContext, int maxCount = 100, Dictionary<string, object>? args = null)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb, Configuration.DatabaseName,
+                BoxDbOperation.OutStandingMessages, CollectionConfiguration.Name),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+        try
+        {
+            var count = Collection.CountDocuments(CreateOutstandingCountFilter(dispatchedSince, args),
+                new CountOptions { Limit = maxCount == 0 ? null : maxCount });
+            span?.AddTag("db.response.returned_rows", 1);
+            return checked((int)count);
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task<int> GetOutstandingMessageCountAsync(TimeSpan dispatchedSince, RequestContext? requestContext, int maxCount = 100, Dictionary<string, object>? args = null, CancellationToken cancellationToken = default)
+    {
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb, Configuration.DatabaseName,
+                BoxDbOperation.OutStandingMessages, CollectionConfiguration.Name),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+        try
+        {
+            var count = await Collection.CountDocumentsAsync(CreateOutstandingCountFilter(dispatchedSince, args),
+                new CountOptions { Limit = maxCount == 0 ? null : maxCount }, cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+            span?.AddTag("db.response.returned_rows", 1);
+            return checked((int)count);
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    private FilterDefinition<OutboxMessage> CreateOutstandingCountFilter(TimeSpan dispatchedSince, Dictionary<string, object>? args)
+    {
+        var olderThan = Configuration.TimeProvider.GetLocalNow() - dispatchedSince;
+        var filter = Builders<OutboxMessage>.Filter.Eq(x => x.Dispatched, null);
+        filter &= Builders<OutboxMessage>.Filter.Lt(x => x.TimeStamp, olderThan);
+        if (args != null && args.TryGetValue("Topic", out var topic))
+            filter &= Builders<OutboxMessage>.Filter.Eq(x => x.Topic, topic);
+        return filter;
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyDictionary<RoutingKey, int>> GetOutstandingMessageCountsByTopicAsync(
+        IReadOnlyDictionary<RoutingKey, TimeSpan> dispatchedSinceByTopic,
+        RequestContext? requestContext,
+        int maxCountPerTopic,
+        Dictionary<string, object>? args = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (dispatchedSinceByTopic is null)
+            throw new ArgumentNullException(nameof(dispatchedSinceByTopic));
+        if (maxCountPerTopic < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxCountPerTopic), maxCountPerTopic, "The ceiling per topic must be at least 1.");
+        CheckRequestedTopics(dispatchedSinceByTopic);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var counts = new Dictionary<RoutingKey, int>();
+        if (dispatchedSinceByTopic.Count == 0)
+            return counts;
+
+        var span = Tracer?.CreateDbSpan(
+            new BoxSpanInfo(DbSystem.Mongodb, Configuration.DatabaseName,
+                BoxDbOperation.OutStandingMessageCount, CollectionConfiguration.Name),
+            requestContext?.Span,
+            options: Configuration.InstrumentationOptions);
+        try
+        {
+            var now = Configuration.TimeProvider.GetLocalNow();
+            var options = new CountOptions { Limit = maxCountPerTopic, Collation = Collation.Simple };
+            foreach (var request in dispatchedSinceByTopic)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var filter = Builders<OutboxMessage>.Filter.Eq(x => x.Dispatched, null)
+                    & Builders<OutboxMessage>.Filter.Lt(x => x.TimeStamp, now - request.Value)
+                    & Builders<OutboxMessage>.Filter.Eq(x => x.Topic, request.Key.Value);
+                var count = await Collection.CountDocumentsAsync(filter, options, cancellationToken)
+                    .ConfigureAwait(ContinueOnCapturedContext);
+                counts.Add(request.Key, checked((int)count));
+            }
+
+            span?.AddTag("db.response.returned_rows", counts.Count);
+            return counts;
+        }
+        finally
+        {
+            Tracer?.EndSpan(span);
+        }
+    }
+
+    private static void CheckRequestedTopics(IReadOnlyDictionary<RoutingKey, TimeSpan> dispatchedSinceByTopic)
+    {
+        foreach (var request in dispatchedSinceByTopic)
+        {
+            if (RoutingKey.IsNullOrEmpty(request.Key))
+                throw new ArgumentException("A requested topic is null or empty.", nameof(dispatchedSinceByTopic));
+            if (request.Value <= TimeSpan.Zero || request.Value > TimeSpan.FromDays(MAX_TOPIC_AGE_DAYS))
+                throw new ArgumentException(
+                    $"The age requested for topic {request.Key} must be greater than zero and no greater than {MAX_TOPIC_AGE_DAYS} days.",
+                    nameof(dispatchedSinceByTopic));
+        }
+    }
+}

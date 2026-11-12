@@ -22,108 +22,490 @@ THE SOFTWARE. */
 #endregion
 
 using System;
+using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
 using Confluent.Kafka;
-using Paramore.Brighter.Logging;
+using Microsoft.Extensions.Logging;
+using Paramore.Brighter.Observability;
+using Paramore.Brighter.Tasks;
 
 namespace Paramore.Brighter.MessagingGateway.Kafka
 {
-    internal class KafkaMessageProducer : IAmAMessageProducer, IAmAMessageProducerAsync
+    public partial class KafkaMessageProducer : KafkaMessagingGateway, IAmAMessageProducerSync, IAmAMessageProducerAsync, ISupportPublishConfirmation, ISupportPublishConfirmationAsync
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<KafkaMessageProducer>);
-        private IProducer<Null, string> _producer;
-        private readonly ProducerConfig _producerConfig;
-        private readonly KafkaMessagePublisher _publisher;
-        private bool _disposedValue = false;
+        // Bounds the dispose-time wait for confirmation callbacks still running after Flush() has
+        // drained the delivery reports; without it a hung Outbox write would block dispose forever.
+        // Fixed rather than configurable: KafkaPublication has no confirm-wait setting (unlike
+        // RmqPublication's WaitForConfirmsTimeOutInMilliseconds), and none of its existing timeouts
+        // describe this wait. 5s matches the RMQ.Async producer's active-sends shutdown bound.
+        private const int ConfirmationCallbacksShutdownTimeoutMs = 5000;
 
-        public KafkaMessageProducer(KafkaMessagingGatewayConfiguration globalConfiguration, 
-            KafkaMessagingProducerConfiguration producerConfiguration)
+        /// <summary>
+        /// Action taken when a message is published, following receipt of a confirmation from the broker
+        /// see https://www.rabbitmq.com/blog/2011/02/10/introducing-publisher-confirms#how-confirms-work for more
+        /// </summary>
+        public event Action<PublishConfirmationResult>? OnMessagePublished;
+
+        /// <inheritdoc cref="ISupportPublishConfirmationAsync.UseAsyncPublishConfirmation"/>
+        bool ISupportPublishConfirmationAsync.UseAsyncPublishConfirmation => true;
+
+        event Func<PublishConfirmationResult, Task> ISupportPublishConfirmationAsync.OnMessagePublishedAsync
         {
-            _producerConfig = new ProducerConfig
+            add => _onMessagePublishedAsync += value;
+            remove => _onMessagePublishedAsync -= value;
+        }
+      
+        /// <summary>
+        /// The publication configuration for this producer
+        /// </summary>
+        public Publication Publication { get; set; }
+        
+        /// <summary>
+        /// The OTel Span we are writing Producer events too
+        /// </summary>
+        public Activity? Span { get; set; }
+
+        /// <inheritdoc />
+        public IAmAMessageScheduler? Scheduler { get; set; }
+
+        private IProducer<string, byte[]>? _producer;
+        private readonly IKafkaMessageHeaderBuilder _headerBuilder;
+        private readonly ProducerConfig _producerConfig;
+        private KafkaMessagePublisher? _publisher;
+        private bool _hasFatalProducerError;
+        private int _disposed;
+        private readonly InstrumentationOptions _instrumentation;
+        private event Func<PublishConfirmationResult, Task>? _onMessagePublishedAsync;
+        // Confirmation raises run on a single worker, in batches started in delivery order (never on Confluent's
+        // poll thread, and never one thread-pool item per report); the queue lets Dispose wait for those
+        // callbacks — including the awaited Outbox mark-dispatched — after Flush() has drained the delivery
+        // reports themselves.
+        private readonly BatchedCallbackQueue _confirmationCallbacks;
+
+        public KafkaMessageProducer(
+            KafkaMessagingGatewayConfiguration configuration, 
+            KafkaPublication publication,
+            InstrumentationOptions instrumentation = InstrumentationOptions.All)
+        {
+            if (publication is null)
+                throw new ArgumentNullException(nameof(publication));
+            
+            if (string.IsNullOrEmpty(publication.Topic!))
+                throw new ConfigurationException("Topic is required for a publication");
+
+            Publication = publication;
+            _confirmationCallbacks = new BatchedCallbackQueue(MessagingSystem.Kafka, publication.Topic!);
+
+            ClientConfig = new ClientConfig
             {
-                BootstrapServers = string.Join(",", globalConfiguration.BootStrapServers),
-                ClientId = globalConfiguration.Name,
-                MaxInFlight = globalConfiguration.MaxInFlightRequestsPerConnection,
-                QueueBufferingMaxMessages = producerConfiguration.QueueBufferingMaxMessages,
-                Acks = producerConfiguration.Acks,
-                QueueBufferingMaxKbytes = producerConfiguration.QueueBufferingMaxKbytes,
-                MessageSendMaxRetries = producerConfiguration.MessageSendMaxRetries,
-                BatchNumMessages = producerConfiguration.BatchNumberMessages,
-                LingerMs = producerConfiguration.QueueBufferingMax,
-                RequestTimeoutMs = producerConfiguration.RequestTimeout,
-                MessageTimeoutMs = producerConfiguration.MessageTimeout,
-                RetryBackoffMs = producerConfiguration.RetryBackoff
+                Acks = (Confluent.Kafka.Acks)((int)publication.Replication),
+                BootstrapServers = string.Join(",", configuration.BootStrapServers),
+                ClientId = configuration.Name,
+                Debug = configuration.Debug,
+                SaslMechanism = configuration.SaslMechanisms.HasValue ? (Confluent.Kafka.SaslMechanism?)((int)configuration.SaslMechanisms.Value) : null,
+                SaslKerberosPrincipal = configuration.SaslKerberosPrincipal,
+                SaslUsername = configuration.SaslUsername,
+                SaslPassword = configuration.SaslPassword,
+                SecurityProtocol = configuration.SecurityProtocol.HasValue ? (Confluent.Kafka.SecurityProtocol?)((int)configuration.SecurityProtocol.Value) : null,
+                SslCaLocation = configuration.SslCaLocation,
+                SslKeyLocation = configuration.SslKeystoreLocation,
             };
 
-            _producer = new ProducerBuilder<Null, string>(_producerConfig).Build();
-            _publisher = new KafkaMessagePublisher(_producer);
-        }
-
-        public void Send(Message message)
-        {
-            SendAsync(message).Wait();
-        }
-
-        
-        public void SendWithDelay(Message message, int delayMilliseconds = 0)
-        {
-            //No delay support implemented
-            Send(message);
-        }
-        
-        
-        public async Task SendAsync(Message message)
-        {
-            if (message == null)
-                throw new ArgumentNullException(nameof(message));
-
-            try
+            //We repeat properties because copying them from them to the producer config updates in client config in place
+            _producerConfig = new ProducerConfig()
             {
-                _logger.Value.DebugFormat(
-                    "Sending message to Kafka. Servers {0} Topic: {1} Body: {2}", 
-                    _producerConfig.BootstrapServers,
-                    message.Header.Topic,
-                    message.Body.Value
-                    );
+                Acks = (Confluent.Kafka.Acks)((int)publication.Replication),
+                BootstrapServers = string.Join(",", configuration.BootStrapServers),
+                ClientId = configuration.Name,
+                Debug = configuration.Debug,
+                SaslMechanism = configuration.SaslMechanisms.HasValue ? (Confluent.Kafka.SaslMechanism?)((int)configuration.SaslMechanisms.Value) : null,
+                SaslKerberosPrincipal = configuration.SaslKerberosPrincipal,
+                SaslUsername = configuration.SaslUsername,
+                SaslPassword = configuration.SaslPassword,
+                SecurityProtocol = configuration.SecurityProtocol.HasValue ? (Confluent.Kafka.SecurityProtocol?)((int)configuration.SecurityProtocol.Value) : null,
+                SslCaLocation = configuration.SslCaLocation,
+                SslKeyLocation = configuration.SslKeystoreLocation,
+                BatchNumMessages = publication.BatchNumberMessages,
+                EnableIdempotence = publication.EnableIdempotence,
+                EnableDeliveryReports = true,   //don't change this, we need it for the callback
+                MaxInFlight = publication.MaxInFlightRequestsPerConnection,
+                LingerMs = publication.LingerMs,
+                MessageTimeoutMs = publication.MessageTimeoutMs,
+                MessageSendMaxRetries = publication.MessageSendMaxRetries,
+                Partitioner = (Confluent.Kafka.Partitioner)((int)publication.Partitioner),
+                QueueBufferingMaxMessages = publication.QueueBufferingMaxMessages,
+                QueueBufferingMaxKbytes = publication.QueueBufferingMaxKbytes,
+                RequestTimeoutMs = publication.RequestTimeoutMs,
+                RetryBackoffMs = publication.RetryBackoff,
+                TransactionalId = publication.TransactionalId,
+            };
 
-                await _publisher.PublishMessageAsync(message);
-
-            }
-            catch (ProduceException<Null, string> exception)
-            {
-                _logger.Value.ErrorException(
-                    "Error sending message to Kafka servers {0} because {1} ", 
-                    exception, 
-                    _producerConfig.BootstrapServers, 
-                    exception.Error.Reason
-                    );
-                throw new ChannelFailureException("Error talking to the broker, see inner exception for details", exception);
-            }
+            MakeChannels = publication.MakeChannels;
+            Topic = publication.Topic;
+            NumPartitions = publication.NumPartitions;
+            ReplicationFactor = publication.ReplicationFactor;
+            TopicFindTimeout = TimeSpan.FromMilliseconds(publication.TopicFindTimeoutMs);
+            _headerBuilder = publication.MessageHeaderBuilder;
+            _instrumentation = instrumentation;
         }
-
-        protected virtual void Dispose(bool disposing)
-        {
-            if (!_disposedValue)
-            {
-                if (disposing)
-                {
-                    _producer.Dispose();
-                    _producer = null;
-                }
-
-                _disposedValue = true;
-            }
-        }
-
-        ~KafkaMessageProducer()
-        {
-           Dispose(false);
-        }
-
+        
+        /// <summary>
+        /// Disposes of the producer. Repeated calls are no-ops.
+        /// </summary>
+        /// <remarks>Flush, confirmation-callback draining and handle disposal are attempted before any errors are rethrown.</remarks>
+        /// <exception cref="AggregateException">More than one cleanup step failed.</exception>
         public void Dispose()
         {
             Dispose(true);
             GC.SuppressFinalize(this);
+        }
+    
+        
+        /// <summary>
+        /// Disposes of the producer. Repeated calls are no-ops, including calls after <see cref="Dispose()"/>.
+        /// </summary>
+        /// <returns>A completed value task after the synchronous Kafka teardown has finished.</returns>
+        /// <remarks>Flush, confirmation-callback draining and handle disposal are attempted before any errors are rethrown.</remarks>
+        /// <exception cref="AggregateException">More than one cleanup step failed.</exception>
+        public ValueTask DisposeAsync()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+            return new ValueTask(Task.CompletedTask);
+        }
+
+        /// <summary>
+        /// There are a **lot** of properties that we can set to configure Kafka. We expose only those of high importance
+        /// This gives you a chance to set additional parameter before we create the producer. Because it depends on the Confluent
+        /// client, we recommend using our version of the properties, which would persist if we changed clients.
+        /// This is for properties we **don't** expose
+        /// </summary>
+        /// <param name="configHook"></param>
+        public void ConfigHook(Action<ProducerConfig> configHook)
+        {
+            configHook(_producerConfig);
+        }
+        
+        /// <summary>
+        /// Flushes the producer to ensure all messages in the internal buffer have been sent
+        /// </summary>
+        /// <param name="cancellationToken">Used to timeout the flush operation</param>
+        public void Flush(CancellationToken cancellationToken = default)
+        {
+            _producer?.Flush(cancellationToken);
+        }
+
+        /// <summary>
+        /// Initialize the producer => two stage construction to allow for a hook if needed
+        /// </summary>
+        public void Init()
+        {
+            _producer = new ProducerBuilder<string, byte[]>(_producerConfig)
+                .SetErrorHandler((_, error) => HandleError(error))
+                .Build();
+            _publisher = new KafkaMessagePublisher(_producer, _headerBuilder);
+
+            EnsureTopic();
+        }
+
+        /// <summary>
+        /// Handles an error raised by the underlying Kafka producer. Extracted from the
+        /// <c>SetErrorHandler</c> callback so the behaviour is reachable from tests. Not intended to be
+        /// called directly outside of the error-callback wiring.
+        /// </summary>
+        public void HandleError(Error error)
+        {
+            // Latch: once librdkafka reports a fatal error the producer is unrecoverable. Errors arrive
+            // in bursts, so we must never clear the latch when a later non-fatal error follows a fatal one.
+            if (error.IsFatal)
+                _hasFatalProducerError = true;
+
+            // Log against the error we actually received, independent of the latch, so a non-fatal error
+            // that arrives after a fatal one is still logged as non-fatal.
+            if (error.IsFatal)
+                Log.FatalProducerError(s_logger, error.Code, error.Reason, true);
+            else
+                Log.NonFatalProducerError(s_logger, error.Code, error.Reason, false);
+        }
+        
+        /// <summary>
+        /// Sends the specified message.
+        /// </summary>
+        /// <param name="message">The message.</param>
+        /// <exception cref="ArgumentNullException">The message was missing</exception>
+        /// <exception cref="ChannelFailureException">The Kafka client  has entered an unrecoverable state</exception>
+        public void Send(Message message)
+        {
+            SendWithDelay(message, TimeSpan.Zero);
+        }
+
+        /// <summary>
+        /// Sends the specified message.
+        /// </summary>
+        /// <remarks>
+        ///  Usage of the Kafka async producer is much slower than the sync producer. This is because the async producer
+        /// produces a single message and waits for the result before producing the next message. By contrast the synchronous
+        /// producer queues work and uses a dedicated thread to dispatch
+        /// </remarks>
+        /// <param name="message">The message.</param>
+        /// <param name="cancellationToken">Allows cancellation of the in-flight send operation</param>
+        public async Task SendAsync(Message message, CancellationToken cancellationToken = default)
+        {
+            await SendWithDelayAsync(message, TimeSpan.Zero, cancellationToken);
+        }
+        
+        /// <summary>
+        /// Sends the message with the given delay
+        /// </summary>
+        /// <remarks>
+        /// No delay support implemented
+        /// </remarks>
+        /// <param name="message">The message to send</param>
+        /// <param name="delay">The delay to use</param>
+        public void SendWithDelay(Message message, TimeSpan? delay = null)
+        {
+            if (message is null)
+                throw new ArgumentNullException(nameof(message));
+
+            delay ??= TimeSpan.Zero;
+            if (delay != TimeSpan.Zero)
+            {
+                if (Scheduler is IAmAMessageSchedulerSync sync)
+                {
+                    sync.Schedule(message, delay.Value);
+                    return;
+                }
+
+                if (Scheduler is IAmAMessageSchedulerAsync async)
+                {
+                    BrighterAsyncContext.Run(() => async.ScheduleAsync(message, delay.Value));
+                    return;
+                }
+
+                throw new ConfigurationException(
+                    $"KafkaMessageProducer: delay of {delay} was requested but no scheduler is configured; configure a scheduler via MessageSchedulerFactory.");
+            }
+
+            if (_publisher is null)
+                throw new InvalidOperationException("The publisher cannot be null");
+
+            if (_hasFatalProducerError)
+                throw new ChannelFailureException("Producer is in unrecoverable state");
+
+            try
+            {
+                //Capture the publish span context synchronously, before any closure runs, so the
+                //confirmation can be linked back to the original publish even on the synthetic path.
+                var publishContext = Activity.Current?.Context;
+                BrighterTracer.WriteProducerEvent(Span, MessagingSystem.Kafka, message, _instrumentation);
+                Log.SendingMessageToKafka(s_logger, _producerConfig.BootstrapServers, message.Header.Topic.Value, message.Body.Value);
+                _publisher.PublishMessage(message, report => PublishResults(report.Status, report.Headers, message.Header.Topic, publishContext));
+            }
+            catch (ProduceException<string, string> pe)
+            {
+                Log.ErrorSendingMessageToKafka(s_logger, pe, _producerConfig.BootstrapServers, pe.Error.Reason);
+                throw new ChannelFailureException("Error talking to the broker, see inner exception for details", pe);
+            }
+            catch (InvalidOperationException ioe)
+            {
+                Log.ErrorSendingMessageToKafka(s_logger, ioe, _producerConfig.BootstrapServers, ioe.Message);
+                throw new ChannelFailureException("Error talking to the broker, see inner exception for details", ioe);
+
+            }
+            catch (ArgumentException ae)
+            {
+                Log.ErrorSendingMessageToKafka(s_logger, ae, _producerConfig.BootstrapServers, ae.Message);
+                throw new ChannelFailureException("Error talking to the broker, see inner exception for details", ae);
+
+            }
+            catch (KafkaException kafkaException)
+            {
+                Log.KafkaExceptionError(s_logger, kafkaException, Topic?.Value ?? RoutingKey.Empty.Value);
+
+                if (kafkaException.Error.IsFatal) //this can't be recovered and requires a new producer
+                    throw;
+
+                throw new ChannelFailureException("Error connecting to Kafka, see inner exception for details", kafkaException);
+            }
+        }
+
+        /// <summary>
+        /// Sends the message with the given delay
+        /// </summary>
+        /// <remarks>
+        /// No delay support implemented
+        /// </remarks>
+        /// <param name="message">The message to send</param>
+        /// <param name="delay">The delay to use</param>
+        /// <param name="cancellationToken">Cancels the send operation</param>
+        public async Task SendWithDelayAsync(Message message, TimeSpan? delay, CancellationToken cancellationToken = default)
+        {
+             if (message is null)
+                 throw new ArgumentNullException(nameof(message));
+
+             delay ??= TimeSpan.Zero;
+             if (delay != TimeSpan.Zero)
+             {
+                if (Scheduler is IAmAMessageSchedulerAsync async)
+                {
+                    await async.ScheduleAsync(message, delay.Value, cancellationToken);
+                    return;
+                }
+
+                if (Scheduler is IAmAMessageSchedulerSync sync)
+                {
+                    sync.Schedule(message, delay.Value);
+                    return;
+                }
+
+                throw new ConfigurationException(
+                    $"KafkaMessageProducer: delay of {delay} was requested but no scheduler is configured; configure a scheduler via MessageSchedulerFactory.");
+             }
+
+             if (_publisher is null)
+                 throw new InvalidOperationException("The publisher cannot be null");
+
+             if (_hasFatalProducerError)
+                 throw new ChannelFailureException("Producer is in unrecoverable state");
+              
+             try
+             {
+                 //Capture the publish span context synchronously, before any closure runs, so the
+                 //confirmation can be linked back to the original publish even on the synthetic path.
+                 var publishContext = Activity.Current?.Context;
+                 BrighterTracer.WriteProducerEvent(Span, MessagingSystem.Kafka, message, _instrumentation);
+                 Log.SendingMessageToKafka(s_logger, _producerConfig.BootstrapServers, message.Header.Topic.Value, message.Body.Value);
+                 await _publisher.PublishMessageAsync(message, result => PublishResults(result.Status, result.Headers, message.Header.Topic, publishContext), cancellationToken);
+
+             }
+             catch (ProduceException<string, string> pe)
+             {
+                 Log.ErrorSendingMessageToKafka(s_logger, pe, _producerConfig.BootstrapServers, pe.Error.Reason);
+                 throw new ChannelFailureException("Error talking to the broker, see inner exception for details", pe);
+             }
+             catch (InvalidOperationException ioe)
+             {
+                 Log.ErrorSendingMessageToKafka(s_logger, ioe, _producerConfig.BootstrapServers, ioe.Message);
+                 throw new ChannelFailureException("Error talking to the broker, see inner exception for details", ioe);
+            
+             }
+             catch (ArgumentException ae)
+             {
+                 Log.ErrorSendingMessageToKafka(s_logger, ae, _producerConfig.BootstrapServers, ae.Message);
+                 throw new ChannelFailureException("Error talking to the broker, see inner exception for details", ae);
+                           
+             }
+        }
+
+        private void Dispose(bool disposing)
+        {
+            if (!disposing || Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            var cleanup = new KafkaResourceCleanup();
+            // Delivery reports can start confirmation callbacks that outlive the flush.
+            cleanup.Try(() => Flush());
+            cleanup.Try(WaitForConfirmationCallbacks);
+            cleanup.Try(_confirmationCallbacks.Complete);
+            cleanup.Try(() => _producer?.Dispose());
+            cleanup.ThrowIfFailed();
+        }
+        
+        private void PublishResults(PersistenceStatus status, Headers headers, RoutingKey topic, ActivityContext? publishContext)
+        {
+            if (status == PersistenceStatus.Persisted)
+            {
+                // A Persisted report is always a success: the broker accepted the message. The id is
+                // expected (Brighter stamps MESSAGE_ID on every publish), but if it is ever missing we
+                // must NOT fall through to the failure path — doing so would trip the circuit breaker
+                // for a topic whose own delivery report says the message was persisted. Degrade to
+                // Id.Empty instead so the outcome still reflects the persisted status.
+                var persistedId = Id.Empty;
+                if (headers.TryGetLastBytesIgnoreCase(HeaderNames.MESSAGE_ID, out byte[]? messageIdBytes))
+                {
+                    var val = messageIdBytes.FromByteArray();
+                    if (!string.IsNullOrEmpty(val))
+                        persistedId = new Id(val);
+                }
+
+                // Should not happen on the current path (MESSAGE_ID is always stamped). Log it so the
+                // degraded state is diagnosable: MarkDispatched(Id.Empty) matches no Outbox row, so the
+                // message stays un-dispatched and the Sweeper re-delivers it rather than being marked sent.
+                if (Id.IsNullOrEmpty(persistedId))
+                    Log.PersistedReportMissingId(s_logger, topic.Value);
+
+                RaisePublishConfirmation(new PublishConfirmationResult(true, persistedId, topic, publishContext));
+                return;
+            }
+
+            //Not persisted (or no id on the persisted path): raise a failure confirmation carrying
+            //the message id read from the report-level headers (the synthetic NotPersisted result
+            //adds MESSAGE_ID there), falling back to Id.Empty when it is absent. The wire topic and
+            //the captured publish context come from the send call, since the synthetic NotPersisted
+            //delivery report never sets .Topic and has no active publish activity of its own.
+            var failureId = Id.Empty;
+            if (headers.TryGetLastBytesIgnoreCase(HeaderNames.MESSAGE_ID, out byte[]? failureIdBytes))
+            {
+                var val = failureIdBytes.FromByteArray();
+                if (!string.IsNullOrEmpty(val))
+                    failureId = new Id(val);
+            }
+
+            RaisePublishConfirmation(new PublishConfirmationResult(false, failureId, topic, publishContext));
+        }
+
+        private void RaisePublishConfirmation(PublishConfirmationResult result)
+        {
+            // Raise on the confirmation queue's worker so we never block Confluent's delivery-report handler,
+            // and confirmations reach subscribers in batches started in delivery order. Wrap the invoke so a
+            // faulting subscriber is logged. Brighter's own mediator callback is already self-contained;
+            // this guards any other subscriber and the queue's worker.
+            _confirmationCallbacks.Enqueue(async () =>
+            {
+                try
+                {
+                    OnMessagePublished?.Invoke(result);
+                    await _onMessagePublishedAsync.InvokeAllAsync(result);
+                }
+                catch (Exception ex)
+                {
+                    Log.PublishConfirmationRaiseFault(s_logger, ex);
+                }
+            });
+        }
+
+        private void WaitForConfirmationCallbacks()
+        {
+            if (!_confirmationCallbacks.TryWait(TimeSpan.FromMilliseconds(ConfirmationCallbacksShutdownTimeoutMs), out int stillInFlight))
+                Log.FailedToAwaitConfirmationCallbacks(s_logger, stillInFlight, ConfirmationCallbacksShutdownTimeoutMs);
+        }
+
+        private static partial class Log
+        {
+            [LoggerMessage(LogLevel.Error, "Code: {ErrorCode}, Reason: {ErrorMessage}, Fatal: {FatalError}")]
+            public static partial void FatalProducerError(ILogger logger, ErrorCode errorCode, string errorMessage, bool fatalError);
+
+            [LoggerMessage(LogLevel.Warning, "Code: {ErrorCode}, Reason: {ErrorMessage}, Fatal: {FatalError}")]
+            public static partial void NonFatalProducerError(ILogger logger, ErrorCode errorCode, string errorMessage, bool fatalError);
+
+            [LoggerMessage(LogLevel.Debug, "Sending message to Kafka. Servers {Servers} Topic: {Topic} Body: {Request}")]
+            public static partial void SendingMessageToKafka(ILogger logger, string servers, string topic, object request);
+
+            [LoggerMessage(LogLevel.Error, "Error sending message to Kafka servers {Servers} because {ErrorMessage} ")]
+            public static partial void ErrorSendingMessageToKafka(ILogger logger, Exception exception, string servers, string errorMessage);
+
+            [LoggerMessage(LogLevel.Warning, "A publish-confirmation subscriber threw while handling a Kafka delivery report; the fault was contained")]
+            public static partial void PublishConfirmationRaiseFault(ILogger logger, Exception exception);
+
+            [LoggerMessage(LogLevel.Warning, "Kafka reported topic {Topic} as persisted but the delivery report carried no message id; confirmation degraded to an empty id so the message stays un-dispatched for Sweeper retry")]
+            public static partial void PersistedReportMissingId(ILogger logger, string topic);
+            
+            [LoggerMessage(LogLevel.Error, "KafkaMessageProducer: There was an error sending to topic {Topic})")]
+            public static partial void KafkaExceptionError(ILogger logger, Exception exception, string topic);
+
+            [LoggerMessage(LogLevel.Warning, "Failed to await {CallbackCount} confirmation callbacks after {TimeoutMs}ms when shutting down")]
+            public static partial void FailedToAwaitConfirmationCallbacks(ILogger logger, int callbackCount, int timeoutMs);
         }
     }
 }

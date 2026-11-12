@@ -27,7 +27,7 @@ using System.Threading.Tasks;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    class MyCancellableCommandHandlerAsync : RequestHandlerAsync<MyCommand>
+    sealed class MyCancellableCommandHandlerAsync : RequestHandlerAsync<MyCommand>
     {
         private static MyCommand s_command;
 
@@ -36,7 +36,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
             s_command = null;
         }
 
-        public override async Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default(CancellationToken))
+        public override async Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default)
         {
             LogCommand(command);
             return await base.HandleAsync(command, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);

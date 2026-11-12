@@ -28,6 +28,7 @@ using Paramore.Brighter.Core.Tests.OnceOnly.TestDoubles;
 using Paramore.Brighter.Inbox.Exceptions;
 using Polly.Registry;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Time.Testing;
 using Paramore.Brighter.Extensions.DependencyInjection;
 using Xunit;
 using Paramore.Brighter.Inbox.Handlers;
@@ -37,12 +38,12 @@ namespace Paramore.Brighter.Core.Tests.OnceOnly
     public class OnceOnlyAttributeWithThrowExceptionTests
     {
         private readonly MyCommand _command;
-        private readonly IAmAnInbox _inbox;
+        private readonly IAmAnInboxSync _inbox;
         private readonly IAmACommandProcessor _commandProcessor;
 
         public OnceOnlyAttributeWithThrowExceptionTests()
         {
-            _inbox = new InMemoryInbox();
+            _inbox = new InMemoryInbox(new FakeTimeProvider());
             
             var registry = new SubscriberRegistry();
             registry.Register<MyCommand, MyStoredCommandToThrowHandler>();
@@ -51,12 +52,14 @@ namespace Paramore.Brighter.Core.Tests.OnceOnly
             container.AddTransient<MyStoredCommandToThrowHandler>();
             container.AddSingleton(_inbox);
             container.AddTransient<UseInboxHandler<MyCommand>>();
+            container.AddSingleton<IBrighterOptions>(new BrighterOptions {HandlerLifetime = ServiceLifetime.Transient});
 
             var handlerFactory = new ServiceProviderHandlerFactory(container.BuildServiceProvider());
             
             _command = new MyCommand {Value = "My Test String"};
             
-            _commandProcessor = new CommandProcessor(registry, (IAmAHandlerFactory)handlerFactory, new InMemoryRequestContextFactory(), new PolicyRegistry());
+            _commandProcessor = new CommandProcessor(registry, handlerFactory, new InMemoryRequestContextFactory(), 
+                new PolicyRegistry(), new ResiliencePipelineRegistry<string>(),new InMemorySchedulerFactory());
         }
 
         [Fact]

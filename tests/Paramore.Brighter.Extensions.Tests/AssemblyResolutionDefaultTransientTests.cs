@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Linq;
 using Microsoft.Extensions.DependencyInjection;
+using Paramore.Brighter.Extensions.Tests.TestDoubles;
 using Paramore.Brighter.Inbox.Handlers;
 using Paramore.Brighter.Logging.Handlers;
 using Paramore.Brighter.Monitoring.Handlers;
@@ -21,7 +22,7 @@ namespace Paramore.Brighter.Extensions.Tests
         {
             _services = new ServiceCollection();
 
-            _services.AddServiceActivator().AutoFromAssemblies();
+            _services.AddConsumers().AutoFromAssemblies();
               
             _provider = _services.BuildServiceProvider();
         }
@@ -47,7 +48,7 @@ namespace Paramore.Brighter.Extensions.Tests
         [Fact]
         public void ShouldHaveTestMapperRegisteredCorrectly()
         {
-            TestRegistration(typeof(TestEventMessageMapper), ServiceLifetime.Singleton);
+            TestRegistration(typeof(TestEventMessageMapper), ServiceLifetime.Transient);
         }
 
         [Fact]

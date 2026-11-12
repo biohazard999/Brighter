@@ -1,11 +1,12 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.DataModel;
 using Amazon.DynamoDBv2.DocumentModel;
 using Amazon.DynamoDBv2.Model;
-using Newtonsoft.Json.Linq;
-using Paramore.Brighter.DynamoDb.Extensions;
+using Paramore.Brighter.DynamoDb;
+using Paramore.Brighter.JsonConverters;
 using Paramore.Brighter.Outbox.DynamoDB;
 using Xunit;
 
@@ -20,7 +21,7 @@ namespace Paramore.Brighter.DynamoDB.Tests.DynamoDbExtensions
             var tableRequestFactory = new DynamoDbTableFactory();
 
             //act
-            CreateTableRequest tableRequest = tableRequestFactory.GenerateCreateTableMapper<DynamoDbEntity>(
+            CreateTableRequest tableRequest = tableRequestFactory.GenerateCreateTableRequest<DynamoDbEntity>(
                 new DynamoDbCreateProvisionedThroughput
                 (
                     new ProvisionedThroughput {ReadCapacityUnits = 10, WriteCapacityUnits = 10},
@@ -40,7 +41,7 @@ namespace Paramore.Brighter.DynamoDB.Tests.DynamoDbExtensions
         }
 
         [DynamoDBTable("MyEntity")]
-        private class DynamoDbEntity
+        private sealed class DynamoDbEntity
         {
             [DynamoDBHashKey] [DynamoDBProperty] public string Id { get; set; }
 
@@ -93,42 +94,51 @@ namespace Paramore.Brighter.DynamoDB.Tests.DynamoDbExtensions
             return !Equals(left, right);
         }
     }
-    
-        public class MoneyTypeConverter : IPropertyConverter
-        {        
-            private const string Amount = "amount";
-            private const string Currency = "currency";
-    
-            public DynamoDBEntry ToEntry(object value)
-            {
-                var money = value as Money;
-                if (money == null) throw new InvalidOperationException($"Supplied type was of type {value.GetType().Name} not DirectBooking.Application.Money");
-    
-                var json = new JObject(new JProperty(Amount, money.Amount), new JProperty(Currency, money.Currency));
-                
-                DynamoDBEntry entry = new Primitive
-                {
-                    Type = DynamoDBEntryType.String,
-                    Value = json.ToString()
-                };
-    
-                return entry;
-    
-            }
-    
-            public object FromEntry(DynamoDBEntry entry)
-            {
-                var primitive = entry as Primitive;
-                if (primitive == null || !(primitive.Value is String) || string.IsNullOrEmpty((string)primitive.Value))
-                    throw new ArgumentOutOfRangeException();
-                
-                var value = JObject.Parse(entry.AsString());
-                
-                var name = new Money((int)value[Amount], (string)value[Currency]);
-                return name;
-    
-            }
-     
-}
 
+    public class MoneyTypeConverter : IPropertyConverter
+    {
+        private const string Amount = "amount";
+        private const string Currency = "currency";
+
+        public DynamoDBEntry ToEntry(object value)
+        {
+            var money = value as Money;
+            if (money == null)
+                throw new InvalidOperationException($"Supplied type was of type {value.GetType().Name} not DirectBooking.Application.Money");
+
+            var json = JsonSerializer.Serialize(new MoneyDTO(money.Amount, money.Currency), JsonSerialisationOptions.Options);
+
+            DynamoDBEntry entry = new Primitive
+            {
+                Type = DynamoDBEntryType.String,
+                Value = json
+            };
+
+            return entry;
+        }
+
+        public object FromEntry(DynamoDBEntry entry)
+        {
+            var primitive = entry as Primitive;
+            if (primitive == null || !(primitive.Value is String) || string.IsNullOrEmpty((string)primitive.Value))
+                throw new ArgumentOutOfRangeException();
+
+            var value = JsonSerializer.Deserialize<MoneyDTO>(entry.AsString(), JsonSerialisationOptions.Options);
+
+            var name = new Money((int)value.Amount, value.Currency);
+            return name;
+        }
+    }
+
+    public class MoneyDTO
+    {
+        public double Amount { get; set; }
+        public string Currency { get; set; }
+
+        public MoneyDTO(double amount, string currency)
+        {
+            Amount = amount;
+            Currency = currency;
+        }
+    }
 }

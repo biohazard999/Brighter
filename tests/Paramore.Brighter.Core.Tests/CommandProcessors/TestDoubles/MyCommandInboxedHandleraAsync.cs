@@ -28,7 +28,7 @@ using Paramore.Brighter.Inbox.Attributes;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyCommandInboxedHandlerAsync : RequestHandlerAsync<MyCommand>
+    internal sealed class MyCommandInboxedHandlerAsync : RequestHandlerAsync<MyCommand>
     {
         private static MyCommand s_command;
 
@@ -38,7 +38,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
         }
 
         [UseInboxAsync(step:0, contextKey: typeof(MyCommandInboxedHandlerAsync), onceOnly: false)]
-        public override Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default(CancellationToken))
+        public override Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default)
         {
             LogCommand(command);
             return base.HandleAsync(command, cancellationToken);

@@ -3,7 +3,7 @@ using System.Linq;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.DataModel;
 using Amazon.DynamoDBv2.Model;
-using Paramore.Brighter.DynamoDb.Extensions;
+using Paramore.Brighter.DynamoDb;
 using Paramore.Brighter.Outbox.DynamoDB;
 using Xunit;
 
@@ -16,21 +16,21 @@ namespace Paramore.Brighter.DynamoDB.Tests.DynamoDbExtensions
         {
             //arrange
             var tableRequestFactory = new DynamoDbTableFactory();
-            
+
             //act
-            CreateTableRequest tableRequest = tableRequestFactory.GenerateCreateTableMapper<DynamoDbEntity>(
+            CreateTableRequest tableRequest = tableRequestFactory.GenerateCreateTableRequest<DynamoDbEntity>(
                 new DynamoDbCreateProvisionedThroughput
                 (
                     new ProvisionedThroughput{ReadCapacityUnits = 10, WriteCapacityUnits = 10},
                     new Dictionary<string, ProvisionedThroughput>
                     {
                         {
-                            "GlobalSecondaryIndex", new ProvisionedThroughput{ReadCapacityUnits = 10, WriteCapacityUnits = 10} 
+                            "GlobalSecondaryIndex", new ProvisionedThroughput{ReadCapacityUnits = 10, WriteCapacityUnits = 10}
                         }
                     }
                 )
             );
-            
+
             //assert
             Assert.Equal("MyEntity", tableRequest.TableName);
             Assert.Contains(tableRequest.AttributeDefinitions, attr => attr.AttributeName == "StringProperty" && attr.AttributeType == ScalarAttributeType.S);
@@ -44,33 +44,32 @@ namespace Paramore.Brighter.DynamoDB.Tests.DynamoDbExtensions
                 gsi => gsi.IndexName == "GlobalSecondaryIndex"
                        && Enumerable.Any<KeySchemaElement>(gsi.KeySchema, kse => kse.AttributeName == "GlobalSecondaryId" && kse.KeyType == KeyType.HASH)
                        && Enumerable.Any<KeySchemaElement>(gsi.KeySchema, kse => kse.AttributeName == "GlobalSecondaryRangeKey" && kse.KeyType == KeyType.RANGE));
-            Assert.Contains(tableRequest.LocalSecondaryIndexes, lsi => lsi.IndexName == "LocalSecondaryIndex" 
+            Assert.Contains(tableRequest.LocalSecondaryIndexes, lsi => lsi.IndexName == "LocalSecondaryIndex"
                         && Enumerable.Any<KeySchemaElement>(lsi.KeySchema, kse => kse.AttributeName == "LocalSecondaryRangeKey" && kse.KeyType == KeyType.RANGE));
-
         }
 
         //Required
         [DynamoDBTable("MyEntity")]
-        private class DynamoDbEntity
+        private sealed class DynamoDbEntity
         {
             [DynamoDBProperty]
             public string StringProperty { get; set; }
 
             [DynamoDBProperty]
             public int NumberProperty { get; set; }
-            
+
             [DynamoDBProperty]
             public byte[] ByteArrayProperty { get; set; }
-            
+
             //We only issue create table statements for explicitly marked fields; others can still be persisted though
             public string UnMarkedProperty { get; set; }
-           
+
             [DynamoDBProperty("MappedName")]
             public string RenamedProperty { get; set; }
-            
+
             [DynamoDBIgnore]
             public string IgnoredProperty { get; set; }
-            
+
             //Required
             [DynamoDBHashKey]
             public string Id { get; set; }
@@ -80,13 +79,13 @@ namespace Paramore.Brighter.DynamoDB.Tests.DynamoDbExtensions
 
             [DynamoDBVersion]
             public int? Version { get; set; }
-            
+
             [DynamoDBGlobalSecondaryIndexHashKey("GlobalSecondaryIndex")]
             public string GlobalSecondaryId { get; set; }
 
-            [DynamoDBGlobalSecondaryIndexRangeKey("GlobalSecondaryIndex")] 
+            [DynamoDBGlobalSecondaryIndexRangeKey("GlobalSecondaryIndex")]
             public string GlobalSecondaryRangeKey { get; set; }
-            
+
             [DynamoDBLocalSecondaryIndexRangeKey(indexName:"LocalSecondaryIndex")]
             public string LocalSecondaryRangeKey { get; set; }
         }

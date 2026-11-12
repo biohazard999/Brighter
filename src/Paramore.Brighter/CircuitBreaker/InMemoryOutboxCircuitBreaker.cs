@@ -1,0 +1,219 @@
+﻿#region License
+
+/* The MIT License (MIT)
+Copyright © 2025 Michael Freeman <mike.c.freeman@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the “Software”), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+
+# endregion
+
+
+using System.Collections.Concurrent;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using Microsoft.Extensions.Logging;
+using Paramore.Brighter.Logging;
+using Paramore.Brighter.Observability;
+
+namespace Paramore.Brighter.CircuitBreaker;
+
+/// <summary>
+/// In-memory implementation of IAmAnOutboxCircuitBreaker; Tracks dispatch failures per topic,
+/// if a topic is marked as tripped, record that topic as a failure and cooldown by decrementing
+/// cool down count.
+/// </summary>
+public partial class InMemoryOutboxCircuitBreaker : IAmAnOutboxCircuitBreaker
+{
+    private const string COOLDOWN_CAUSE = "cooldown";
+    private const string MAXIMUM_TRIP_DURATION_CAUSE = "maximum trip duration";
+    private static readonly TimeSpan s_longestPermittedTripDuration = TimeSpan.FromHours(24);
+
+    private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<InMemoryOutboxCircuitBreaker>();
+
+    private readonly OutboxCircuitBreakerOptions _outboxCircuitBreakerOptions;
+    private readonly TimeSpan _maximumTripDuration;
+    private readonly IAmABrighterTracer? _tracer;
+    private readonly InstrumentationOptions _instrumentationOptions;
+    private readonly TimeProvider _timeProvider;
+
+    private readonly ConcurrentDictionary<RoutingKey, TripEntry> _trippedTopics = new();
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="InMemoryOutboxCircuitBreaker"/> class.
+    /// </summary>
+    /// <param name="options">The cooldown and maximum trip duration; defaults are used when null</param>
+    /// <param name="tracer">Optional tracer used to export a span for each trip/re-trip/reset transition</param>
+    /// <param name="instrumentationOptions">How verbose should the exported spans be</param>
+    /// <param name="timeProvider">The clock used to timestamp trips; defaults to <see cref="TimeProvider.System"/></param>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when MaximumTripDuration is not greater than zero and at most 24 hours</exception>
+    public InMemoryOutboxCircuitBreaker(
+        OutboxCircuitBreakerOptions? options = null,
+        IAmABrighterTracer? tracer = null,
+        InstrumentationOptions instrumentationOptions = InstrumentationOptions.All,
+        TimeProvider? timeProvider = null)
+    {
+        _outboxCircuitBreakerOptions = options ?? new OutboxCircuitBreakerOptions();
+        _maximumTripDuration = ValidatedMaximumTripDuration(_outboxCircuitBreakerOptions);
+        _tracer = tracer;
+        _instrumentationOptions = instrumentationOptions;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+    }
+
+    private static TimeSpan ValidatedMaximumTripDuration(OutboxCircuitBreakerOptions options)
+    {
+        var maximumTripDuration = options.MaximumTripDuration;
+        if (maximumTripDuration <= TimeSpan.Zero || maximumTripDuration > s_longestPermittedTripDuration)
+            throw new ArgumentOutOfRangeException(nameof(options), maximumTripDuration,
+                "MaximumTripDuration must be greater than zero and at most 24 hours");
+
+        return maximumTripDuration;
+    }
+
+    private sealed record TripEntry(int Count, long Timestamp)
+    {
+        public bool Equals(TripEntry? other) => ReferenceEquals(this, other);
+
+        public override int GetHashCode() => RuntimeHelpers.GetHashCode(this);
+    }
+
+    /// <summary>
+    /// A collection of tripped topics.
+    /// </summary>
+    public IEnumerable<RoutingKey> TrippedTopics
+    {
+        get
+        {
+            EndExpiredTrips();
+            return ListLiveTopics();
+        }
+    }
+
+    private void EndExpiredTrips()
+    {
+        foreach (var trip in _trippedTopics.ToArray())
+        {
+            if (HasExpired(trip.Value))
+                RemoveAndAnnounceReset(trip.Key, trip.Value, MAXIMUM_TRIP_DURATION_CAUSE);
+        }
+    }
+
+    private RoutingKey[] ListLiveTopics() =>
+        _trippedTopics.Where(trip => !HasExpired(trip.Value)).Select(trip => trip.Key).ToArray();
+
+    private bool HasExpired(TripEntry entry) => _timeProvider.GetElapsedTime(entry.Timestamp) >= _maximumTripDuration;
+
+    private bool RemoveEntry(RoutingKey topic, TripEntry entry) =>
+        ((ICollection<KeyValuePair<RoutingKey, TripEntry>>)_trippedTopics)
+            .Remove(new KeyValuePair<RoutingKey, TripEntry>(topic, entry));
+
+
+    /// <summary>
+    /// Each time an attempt to ClearOutstandingFromOutbox the IAmAnOutboxCircuitBreaker is cooled down,
+    /// this decrements the tripped topics, making them available for publication once the Cooldown
+    /// period is set to zero.
+    /// </summary>
+    public void CoolDown()
+    {
+        EndExpiredTrips();
+
+        foreach (var trippedTopicsKey in _trippedTopics.Keys)
+        {
+            if (TryDecrement(trippedTopicsKey, out var cooled))
+                TryEvictAndAnnounceReset(trippedTopicsKey, cooled);
+        }
+    }
+
+    private bool TryDecrement(RoutingKey topic, out TripEntry cooled)
+    {
+        while (_trippedTopics.TryGetValue(topic, out var observed))
+        {
+            cooled = observed with { Count = observed.Count - 1 };
+            if (_trippedTopics.TryUpdate(topic, cooled, observed))
+                return true;
+        }
+
+        cooled = null!;
+        return false;
+    }
+
+    private void TryEvictAndAnnounceReset(RoutingKey topic, TripEntry cooled)
+    {
+        if (cooled.Count >= 0)
+            return;
+
+        RemoveAndAnnounceReset(topic, cooled, COOLDOWN_CAUSE);
+    }
+
+    private void RemoveAndAnnounceReset(RoutingKey topic, TripEntry entry, string resetCause)
+    {
+        if (!RemoveEntry(topic, entry))
+            return;
+
+        var span = _tracer?.CreateCircuitBreakerSpan(new CircuitBreakerSpanInfo(CircuitBreakerSpanOperation.Reset, topic, 0), _instrumentationOptions);
+        _tracer?.EndSpan(span);
+
+        Log.Reset(s_logger, topic.Value, resetCause);
+    }
+
+    /// <summary>
+    /// If a topic exceeds a configurable failure threshold within a time window, mark it as "tripped" 
+    /// </summary>
+    /// <param name="topic">Name of the entity to circuit break</param>
+    public void TripTopic(RoutingKey topic)
+    {
+        EndExpiredTrips();
+
+        var cooldownCount = _outboxCircuitBreakerOptions.CooldownCount;
+        var isReTrip = false;
+
+        var entry = new TripEntry(cooldownCount, _timeProvider.GetTimestamp());
+
+        _trippedTopics.AddOrUpdate(topic,
+            addValueFactory: _ => entry,
+            updateValueFactory: (_, _) =>
+            {
+                isReTrip = true;
+                return entry;
+            });
+
+        var operation = isReTrip ? CircuitBreakerSpanOperation.ReTrip : CircuitBreakerSpanOperation.Trip;
+        var span = _tracer?.CreateCircuitBreakerSpan(new CircuitBreakerSpanInfo(operation, topic, cooldownCount), _instrumentationOptions);
+        _tracer?.EndSpan(span);
+
+        if (isReTrip)
+            Log.ReTripped(s_logger, topic.Value, cooldownCount);
+        else
+            Log.Tripped(s_logger, topic.Value, cooldownCount);
+    }
+
+    private static partial class Log
+    {
+        [LoggerMessage(LogLevel.Warning, "Circuit breaker tripped for topic {Topic}; suppressing publish for {CooldownCount} cooldown cycle(s)")]
+        public static partial void Tripped(ILogger logger, string topic, int cooldownCount);
+
+        [LoggerMessage(LogLevel.Debug, "Circuit breaker re-tripped for topic {Topic}; cooldown extended to {CooldownCount} cycle(s)")]
+        public static partial void ReTripped(ILogger logger, string topic, int cooldownCount);
+
+        [LoggerMessage(LogLevel.Information, "Circuit breaker reset for topic {Topic} ({ResetCause}); publish suppression lifted")]
+        public static partial void Reset(ILogger logger, string topic, string resetCause);
+    }
+}
+

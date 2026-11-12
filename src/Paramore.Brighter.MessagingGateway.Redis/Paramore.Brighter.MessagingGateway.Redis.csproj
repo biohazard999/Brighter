@@ -1,16 +1,21 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Description>Provides an implementation of the messaging gateway for decoupled invocation in the Paramore.Brighter pipeline, using Redis&lt;</Description>
+    <Description>Redis messaging gateway implementation for Paramore.Brighter Command Processor. Provides decoupled message transport using Redis with support for pub/sub patterns and high-performance in-memory messaging.</Description>
     <Authors>Ian Cooper</Authors>
-    <TargetFrameworks>netstandard2.0</TargetFrameworks>
-    <PackageTags>Redis;Command;Event;Service Activator;Decoupled;Invocation;Messaging;Remote;Command Dispatcher;Command Processor;Request;Service;Task Queue;Work Queue;Retry;Circuit Breaker;Availability</PackageTags>
+    <TargetFrameworks>$(BrighterTargetFrameworks)</TargetFrameworks>
+    <!-- Remove these XML documentation suppressions as the existing comments are corrected. -->
+    <NoWarn>$(NoWarn);CS1570;CS1573;CS1723</NoWarn>
+    <Nullable>enable</Nullable>
+    <PackageTags>Redis;Message Gateway;Pub/Sub;Command;Event;Service Activator;Decoupled;Invocation;Messaging;Remote;Command Dispatcher;Command Processor;Request;Service;Task Queue;Work Queue;Retry;Circuit Breaker;Availability;Brighter</PackageTags>
+    <!-- ServiceStack.Redis.Core is not strong-named, so this assembly cannot be signed -->
     <SignAssembly>false</SignAssembly>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Paramore.Brighter\Paramore.Brighter.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="ServiceStack.Redis.Core" Version="5.10.4" />
-    <PackageReference Include="System.Reflection.TypeExtensions" Version="4.7.0" />
+    <PackageReference Include="ServiceStack.Redis.Core" />
+    <PackageReference Include="System.Text.RegularExpressions" />
+    <PackageReference Include="System.Reflection.TypeExtensions" />
   </ItemGroup>
 </Project>

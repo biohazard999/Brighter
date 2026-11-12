@@ -1,48 +1,227 @@
-﻿using System;
+﻿#region Licence
+
+/* The MIT License (MIT)
+Copyright © 2022 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the “Software”), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+
+#endregion
+
+using System;
+using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
 using Paramore.Brighter.MessagingGateway.MsSql.SqlQueues;
+using Paramore.Brighter.MsSql;
+using Paramore.Brighter.Observability;
+using Paramore.Brighter.Tasks;
 
 namespace Paramore.Brighter.MessagingGateway.MsSql
 {
-    public class MsSqlMessageProducer : IAmAMessageProducer, IAmAMessageProducerAsync
+    /// <summary>
+    /// The <see cref="MsSqlMessageProducer"/> class is responsible for producing messages to an MS SQL database.
+    /// </summary>
+    public partial class MsSqlMessageProducer : IAmAMessageProducerSync, IAmAMessageProducerAsync
     {
-        private static readonly Lazy<ILog> Logger = new Lazy<ILog>(LogProvider.For<MsSqlMessageProducer>);
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MsSqlMessageProducer>();
+        private readonly InstrumentationOptions _instrumentation;
         private readonly MsSqlMessageQueue<Message> _sqlQ;
+        private MsSqlPublicationSnapshot _publication;
 
-        public MsSqlMessageProducer(MsSqlMessagingGatewayConfiguration msSqlMessagingGatewayConfiguration)
+        /// <summary>
+        /// Gets or sets the publication used to configure the producer.
+        /// </summary>
+        /// <remarks>
+        /// Assignment captures and validates fan-out routing and the send timeout atomically.
+        /// Mutating the supplied publication afterward does not change active sends.
+        /// Reassign this property to apply a new configuration.
+        /// </remarks>
+        public Publication Publication
         {
-            _sqlQ = new MsSqlMessageQueue<Message>(msSqlMessagingGatewayConfiguration);
+            get => Volatile.Read(ref _publication).Publication;
+            set => Volatile.Write(ref _publication, new MsSqlPublicationSnapshot(value));
         }
 
+        /// <summary>
+        /// Gets or sets the OTel span for writing producer events.
+        /// </summary>
+        public Activity? Span { get; set; }
+
+        /// <inheritdoc />
+        public IAmAMessageScheduler? Scheduler { get; set; }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="MsSqlMessageProducer"/> class.
+        /// </summary>
+        /// <param name="msSqlConfiguration">The MS SQL configuration.</param>
+        /// <param name="connectonProvider">The connection provider.</param>
+        /// <param name="publication">The publication configuration.</param>
+        /// <param name="instrumentation">The <see cref="InstrumentationOptions"/></param>
+        public MsSqlMessageProducer(
+            RelationalDatabaseConfiguration msSqlConfiguration,
+            IAmARelationalDbConnectionProvider connectonProvider,
+            Publication? publication = null,
+            InstrumentationOptions instrumentation = InstrumentationOptions.All
+        )
+        {
+            _publication = new MsSqlPublicationSnapshot(publication ?? new Publication { MakeChannels = OnMissingChannel.Create });
+            _sqlQ = new MsSqlMessageQueue<Message>(msSqlConfiguration, connectonProvider);
+            _instrumentation = instrumentation;
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="MsSqlMessageProducer"/> class.
+        /// </summary>
+        /// <param name="msSqlConfiguration">The MS SQL configuration.</param>
+        /// <param name="publication">The publication configuration.</param>
+        public MsSqlMessageProducer(
+            RelationalDatabaseConfiguration msSqlConfiguration,
+            Publication? publication = null)
+            : this(msSqlConfiguration, new MsSqlConnectionProvider(msSqlConfiguration), publication)
+        {
+        }
+
+        /// <summary>
+        /// Sends the specified message.
+        /// </summary>
+        /// <param name="message">The message to send.</param>
         public void Send(Message message)
         {
+            SendWithDelay(message, TimeSpan.Zero);
+        }
+
+        /// <summary>
+        /// Sends the specified message asynchronously.
+        /// </summary>
+        /// <param name="message">The message to send.</param>
+        /// <param name="cancellationToken">A cancellation token to observe while waiting for the task to complete.</param>
+        /// <returns>A task that represents the asynchronous send operation.</returns>
+        public async Task SendAsync(Message message, CancellationToken cancellationToken = default)
+        {
+            await SendWithDelayAsync(message, TimeSpan.Zero, cancellationToken);
+        }
+
+        /// <summary>
+        /// Sends the specified message with a delay.
+        /// </summary>
+        /// <remarks>No delay support implemented.</remarks>
+        /// <param name="message">The message to send.</param>
+        /// <param name="delay">The delay to use.</param>
+        public void SendWithDelay(Message message, TimeSpan? delay = null)
+        { 
+            delay ??= TimeSpan.Zero;
+            var publication = Volatile.Read(ref _publication);
+            publication.ValidateMessageTopic(message.Header.Topic);
+            var subscriberChannels = publication.SubscriberChannels;
+            if (delay != TimeSpan.Zero)
+            {
+                if (Scheduler is IAmAMessageSchedulerSync sync)
+                {
+                    sync.Schedule(message, delay.Value);
+                    return;
+                }
+                  
+                if (Scheduler is IAmAMessageSchedulerAsync async)
+                {
+                    BrighterAsyncContext.Run(() => async.ScheduleAsync(message, delay.Value));
+                    return;
+                } 
+                  
+                throw new ConfigurationException(
+                    $"MsSqlMessageProducer: delay of {delay} was requested but no scheduler is configured; configure a scheduler via MessageSchedulerFactory.");
+            }
+              
+            BrighterTracer.WriteProducerEvent(Span, "microsoft_sql_server", message, _instrumentation);
             var topic = message.Header.Topic;
 
-            Logger.Value.Debug($"MsSqlMessageProducer: send message with topic {topic} and id {message.Id.ToString()}");
+            Log.SendMessage(s_logger, topic.Value, message.Id.Value);
 
-            _sqlQ.Send(message, topic);
+            if (subscriberChannels == null)
+                _sqlQ.Send(message, topic);
+            else
+                _sqlQ.SendToChannels(message, message.Header.Topic, subscriberChannels, publication.SendTimeoutSeconds);
         }
-        
-        public void SendWithDelay(Message message, int delayMilliseconds = 0)
-        {
-            //No delay support implemented
-            Send(message);
-        }
-   
 
-        public async Task SendAsync(Message message)
+        /// <summary>
+        /// Sends the specified message with a delay asynchronously.
+        /// </summary>
+        /// <remarks>No delay support implemented.</remarks>
+        /// <param name="message">The message to send.</param>
+        /// <param name="delay">The delay to use.</param>
+        /// <param name="cancellationToken">A cancellation token to observe while waiting for the task to complete.</param>
+        /// <returns>A task that represents the asynchronous send operation.</returns>
+        public async Task SendWithDelayAsync(Message message, TimeSpan? delay, CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            delay ??= TimeSpan.Zero;
+            var publication = Volatile.Read(ref _publication);
+            publication.ValidateMessageTopic(message.Header.Topic);
+            var subscriberChannels = publication.SubscriberChannels;
+            if (delay != TimeSpan.Zero)
+            {
+                if (Scheduler is IAmAMessageSchedulerAsync async)
+                {
+                    await async.ScheduleAsync(message, delay.Value, cancellationToken);
+                    return;
+                }
+
+                if (Scheduler is IAmAMessageSchedulerSync sync)
+                {
+                    sync.Schedule(message, delay.Value);
+                    return;
+                }
+                
+                throw new ConfigurationException(
+                    $"MsSqlMessageProducer: delay of {delay} was requested but no scheduler is configured; configure a scheduler via MessageSchedulerFactory.");
+            }
+
+            BrighterTracer.WriteProducerEvent(Span, "microsoft_sql_server", message, _instrumentation);
             var topic = message.Header.Topic;
 
-            Logger.Value.Debug(
-                $"MsSqlMessageProducer: send async message with topic {topic} and id {message.Id.ToString()}");
+            Log.SendMessageAsync(s_logger, topic.Value, message.Id.Value);
 
-            await _sqlQ.SendAsync(message, topic);
+            if (subscriberChannels == null)
+                await _sqlQ.SendAsync(message, topic.Value, TimeSpan.Zero, cancellationToken);
+            else
+                await _sqlQ.SendToChannelsAsync(message, message.Header.Topic, subscriberChannels, publication.SendTimeoutSeconds, cancellationToken);
         }
 
-        public void Dispose()
+        /// <summary>
+        /// Disposes the message producer.
+        /// </summary>
+        public void Dispose() { }
+
+        public ValueTask DisposeAsync()
         {
+            return new ValueTask(Task.CompletedTask);
+        }
+
+        private static partial class Log
+        {
+            [LoggerMessage(LogLevel.Debug, "MsSqlMessageProducer: send message with topic {Topic} and id {Id}")]
+            public static partial void SendMessage(ILogger logger, string topic, string id);
+            
+            [LoggerMessage(LogLevel.Debug, "MsSqlMessageProducer: send async message with topic {Topic} and id {Id}")]
+            public static partial void SendMessageAsync(ILogger logger, string topic, string id);
         }
     }
 }
+

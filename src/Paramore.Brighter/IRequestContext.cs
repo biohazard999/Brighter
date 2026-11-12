@@ -22,8 +22,12 @@ THE SOFTWARE. */
 
 #endregion
 
-using System.Collections.Generic;
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using Paramore.Brighter.FeatureSwitch;
+using Paramore.Brighter.Observability;
+using Polly;
 using Polly.Registry;
 
 namespace Paramore.Brighter
@@ -36,20 +40,90 @@ namespace Paramore.Brighter
     public interface IRequestContext
     {
         /// <summary>
+        /// The destination topic and cloud event type can be used to override the topic and cloud event type that the request is posted to.
+        /// </summary>
+        ProducerKey? Destination { get; set; }
+        
+        /// <summary>
         /// Gets the bag.
         /// </summary>
         /// <value>The bag.</value>
-        Dictionary<string, object> Bag { get; }
+        ConcurrentDictionary<string, object> Bag { get; }
         
-        /// <summary>
-        /// Gets the policies.
-        /// </summary>
-        /// <value>The policies.</value>
-        IPolicyRegistry<string>  Policies { get; }
-
         /// <summary>
         /// Gets the Feature Switches
         /// </summary>
-        IAmAFeatureSwitchRegistry FeatureSwitches { get; }
+        IAmAFeatureSwitchRegistry? FeatureSwitches { get; }
+        
+        /// <summary>
+        /// When we pass a requestContext through a receiver pipeline, we may want to pass the original message that started the pipeline.
+        /// This is primarily useful for debugging - how did we get to this request?. But it is also useful for some request metadata that we
+        /// do not want to transfer to the Request.
+        /// This is not thread-safe; the assumption is that you set this from a single thread and access the message from multiple threads. It is
+        /// not intended to be set from multiple threads.
+        ///</summary>
+        /// <value>The originating message</value> 
+        public Message? OriginatingMessage { get; set; }
+        
+        /// <summary>
+        /// [Obsolete] Gets the legacy policy registry.
+        /// </summary>
+        /// <value>
+        /// The policy registry containing resilience policies. Returns <c>null</c> if no policies are configured.
+        /// </value>
+        /// <remarks>
+        /// This property is obsolete and will be removed in a future version. 
+        /// Migrate to <see cref="ResiliencePipeline"/> for new resilience implementations.
+        /// </remarks> 
+        [Obsolete("Migrate to ResiliencePipeline")]
+        IPolicyRegistry<string>?  Policies { get; }
+        
+        /// <summary>
+        /// Gets the registry of resilience pipelines.
+        /// </summary>
+        /// <value>
+        /// The registry containing named resilience pipeline instances. Returns <c>null</c> if no pipelines are configured.
+        /// </value>
+        /// <remarks>
+        /// Use this registry to retrieve pre-configured resilience pipelines by name. 
+        /// This replaces the obsolete <see cref="Policies"/> property for modern resilience implementations.
+        /// </remarks> 
+        ResiliencePipelineRegistry<string>? ResiliencePipeline { get; }
+        
+        /// <summary>
+        /// Gets the <see cref="ResilienceContext"/> associated with Polly-based resilience operations.
+        /// This context can be used to share data across different resilience policies during execution.
+        /// </summary>
+        ResilienceContext? ResilienceContext { get; }
+        
+        /// <summary>
+        /// Gets the Span [Activity] associated with the request
+        /// </summary>
+        Activity? Span { get; set; }
+
+        /// <summary>
+        /// Gets the <see cref="InstrumentationOptions"/> that were configured for the pipeline that created this context.
+        /// </summary>
+        /// <remarks>
+        /// This is the same value the <see cref="CommandProcessor"/> used when it created the <see cref="Span"/>, so
+        /// middleware handlers can gate their own telemetry on it (for example on <see cref="InstrumentationOptions.Brighter"/>)
+        /// without taking a dependency on how the processor was configured. Defaults to <see cref="InstrumentationOptions.All"/>.
+        /// </remarks>
+        /// <remarks>
+        /// Added in the Replay-outbox feature (Spec 0027). As there is no default interface implementation, adding this
+        /// member is a source- and binary-breaking change for any external type that implements <see cref="IRequestContext"/>
+        /// directly; it should ship in a minor-version bump. The in-box <see cref="RequestContext"/> already provides it.
+        /// </remarks>
+        InstrumentationOptions InstrumentationOptions { get; set; }
+
+        /// <summary>
+        /// Create a new copy of the Request Context
+        /// </summary>
+        /// <remarks>
+        /// Copies must not share <see cref="ResilienceContext"/> across independent executions.
+        /// Retain the resilience pipeline registry, but omit the execution context.
+        /// </remarks>
+        /// <returns>a new copy of the request context</returns>
+        IRequestContext CreateCopy();
     }
 }

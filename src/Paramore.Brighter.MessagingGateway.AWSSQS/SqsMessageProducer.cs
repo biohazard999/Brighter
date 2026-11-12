@@ -1,90 +1,221 @@
-﻿// ***********************************************************************
-// Assembly         : paramore.brighter.messaginggateway.awssqs
-// Author           : ian
-// Created          : 08-17-2015
-//
-// Last Modified By : ian
-// Last Modified On : 10-25-2015
-// ***********************************************************************
-// <copyright file="SqsMessageProducer.cs" company="">
-//     Copyright ©  2015
-// </copyright>
-// <summary></summary>
-// ***********************************************************************
+﻿#region Licence
+
+/* The MIT License (MIT)
+Copyright © 2022 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the “Software”), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+
+#endregion
 
 using System;
-using System.Net;
-using Amazon.SimpleNotificationService;
-using Amazon.SimpleNotificationService.Model;
-using Paramore.Brighter.Logging;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Paramore.Brighter.Observability;
+using Paramore.Brighter.Tasks;
 
-namespace Paramore.Brighter.MessagingGateway.AWSSQS
+namespace Paramore.Brighter.MessagingGateway.AWSSQS;
+
+/// <summary>
+/// The SQS Message producer
+/// </summary>
+public partial class SqsMessageProducer : AwsMessagingGateway, IAmAMessageProducerAsync, IAmAMessageProducerSync
 {
+    private readonly SqsPublication _publication;
+    private readonly AWSClientFactory _clientFactory;
+    private readonly InstrumentationOptions _instrumentation;
+
     /// <summary>
-    /// Class SqsMessageProducer.
+    /// The publication configuration for this producer
     /// </summary>
-    public class SqsMessageProducer : IAmAMessageProducer
+    public Publication Publication => _publication;
+
+    /// <summary>
+    /// The OTel Span we are writing Producer events too
+    /// </summary>
+    public Activity? Span { get; set; }
+
+    /// <inheritdoc />
+    public IAmAMessageScheduler? Scheduler { get; set; }
+
+    /// <summary>
+    /// Initialize a new instance of the <see cref="SqsMessageProducer"/>.
+    /// </summary>
+    /// <param name="connection">How do we connect to AWS in order to manage middleware</param>
+    /// <param name="publication">Configuration of a producer. Required.</param>
+    /// <param name="instrumentation"></param>
+    public SqsMessageProducer(AWSMessagingGatewayConnection connection, 
+        SqsPublication publication,
+        InstrumentationOptions instrumentation = InstrumentationOptions.All)
+        : base(connection)
     {
-        private readonly AWSMessagingGatewayConnection _connection;
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<SqsMessageProducer>);
+        _publication = publication ?? throw new ArgumentNullException(nameof(publication));
+        if (_publication.ChannelName is null) 
+            throw new InvalidOperationException($"We must have a valid Channel Name on the Publication, either a queue name or a Url");
+        _clientFactory = new AWSClientFactory(connection);
+        _instrumentation = instrumentation;
 
-        /// <summary>
-        /// Initializes a new instance of the <see cref="SqsMessageProducer"/> class.
-        /// </summary>
-        /// <param name="credentials">The credentials for the AWS account being used</param>
-        public SqsMessageProducer(AWSMessagingGatewayConnection connection)
+        if (publication.FindQueueBy == QueueFindBy.Url)
         {
-            _connection = connection;
+            ChannelQueueUrl = publication.ChannelName!.Value;
         }
+    }
 
-        /// <summary>
-        /// Sends the specified message.
-        /// </summary>
-        /// <param name="message">The message.</param>
-        public void Send(Message message)
+    /// <summary>
+    /// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
+    /// </summary>
+    public void Dispose()
+    {
+    }
+
+    /// <summary>
+    /// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
+    /// </summary>
+    public ValueTask DisposeAsync() => new();
+
+    /// <summary>
+    /// Confirm the queue exists.
+    /// </summary>
+    /// <param name="queue">The queue name.</param>
+    public bool ConfirmQueueExists(string? queue = null)
+        => BrighterAsyncContext.Run(() => ConfirmQueueExistsAsync());
+
+    /// <summary>
+    /// Confirm the queue exists.
+    /// </summary>
+    /// <param name="cancellationToken">The <see cref="CancellationToken"/>.</param>
+    /// <returns>Return true if the queue exists otherwise return false</returns>
+    public async Task<bool> ConfirmQueueExistsAsync(CancellationToken cancellationToken = default)
+    {
+        //Only do this on first send for a queue for efficiency; won't auto-recreate when goes missing at runtime as a result
+        if (!string.IsNullOrEmpty(ChannelQueueUrl))
+            return true;
+        
+        if (_publication is null)
+            throw new ConfigurationException("No publication specified for producer");
+        
+        if (_publication.ChannelName is null)
+            throw new ConfigurationException("No channel name specified for publication");
+
+        var queueUrl = await EnsureQueueAsync(
+            _publication.ChannelName!,
+            _publication.ChannelType,
+            _publication.FindQueueBy,
+            _publication.QueueAttributes,
+            _publication.MakeChannels,
+            cancellationToken);
+        
+        ChannelQueueUrl = queueUrl;
+
+        return !string.IsNullOrEmpty(queueUrl);
+    }
+
+    /// <inheritdoc />
+    public async Task SendAsync(Message message, CancellationToken cancellationToken = default)
+        => await SendWithDelayAsync(message, TimeSpan.Zero, cancellationToken);
+
+    /// <inheritdoc />
+    /// <exception cref="ConfigurationException">
+    /// The delay requires scheduling, but no supported message scheduler is configured.
+    /// </exception>
+    public async Task SendWithDelayAsync(Message message, TimeSpan? delay, CancellationToken cancellationToken = default)
+        => await SendWithDelayAsync(message, delay, true, cancellationToken);
+    
+    
+    private async Task SendWithDelayAsync(Message message, TimeSpan? delay, bool useAsyncScheduler, CancellationToken cancellationToken = default)
+    {
+        if (_publication is null)
+            throw new ConfigurationException("No publication specified for producer");
+        
+        delay ??= TimeSpan.Zero;
+        // FIFO has no per-message delay; Standard supports at most 15 minutes natively.
+        if (delay > TimeSpan.Zero &&
+            (_publication.QueueAttributes.Type == SqsType.Fifo || delay > TimeSpan.FromMinutes(15)))
         {
-            _logger.Value.DebugFormat("SQSMessageProducer: Publishing message with topic {0} and id {1} and message: {2}", 
-                message.Header.Topic, message.Id, message.Body);
-
-            using (var client = new AmazonSimpleNotificationServiceClient(_connection.Credentials, _connection.Region))
+            if (useAsyncScheduler)
             {
-                var topicArn = EnsureTopic(message.Header.Topic, client);
-                var publisher = new SqsMessagePublisher(topicArn, client);
-                publisher.Publish(message);
-            }
-        }
+                if (Scheduler is IAmAMessageSchedulerAsync schedulerAsync)
+                {
+                    await schedulerAsync.ScheduleAsync(message, delay.Value, cancellationToken);
+                    return;
+                }
 
-        /// <summary>
-        /// Sends the specified message.
-        /// </summary>
-        /// <param name="message">The message.</param>
-        /// <param name="delayMilliseconds">The sending delay</param>
-        /// <returns>Task.</returns>
-        public void SendWithDelay(Message message, int delayMilliseconds = 0)
-        {
-            Send(message);
+                if (Scheduler is IAmAMessageSchedulerSync schedulerSync)
+                {
+                    schedulerSync.Schedule(message, delay.Value);
+                    return;
+                }
+            }
+            else
+            {
+                if (Scheduler is IAmAMessageSchedulerSync schedulerSync)
+                {
+                    schedulerSync.Schedule(message, delay.Value);
+                    return;
+                }
+
+                if (Scheduler is IAmAMessageSchedulerAsync schedulerAsync)
+                {
+                    await schedulerAsync.ScheduleAsync(message, delay.Value, cancellationToken);
+                    return;
+                }
+            }
+
+            throw new ConfigurationException(
+                $"SqsMessageProducer: delay of {delay} was requested but no usable scheduler is configured; configure a scheduler via MessageSchedulerFactory.");
         }
         
-        /// <summary>
-        /// Ensures the topic. The call to create topic is idempotent and just returns the arn if it already exists. Therefore there is 
-        /// no nee to check then create if it does not exist, as this would be extra calls
-        /// </summary>
-        /// <param name="topicName">Name of the topic.</param>
-        /// <param name="client">The client.</param>
-        /// <returns>System.String.</returns>
-        private string EnsureTopic(string topicName, AmazonSimpleNotificationServiceClient client)
+        Log.PublishingMessage(s_logger, message.Header.Topic.Value, message.Id.Value, message.Body);
+
+        BrighterTracer.WriteProducerEvent(Span, MessagingSystem.AWSSQS, message, _instrumentation);
+        await ConfirmQueueExistsAsync(cancellationToken);
+
+        using var client = _clientFactory.CreateSqsClient();
+        var sender = new SqsMessageSender(ChannelQueueUrl!, client);
+        var messageId = await sender.SendAsync(message, delay, cancellationToken);
+
+        if (messageId == null)
         {
-            _logger.Value.DebugFormat("Topic with name {0} does not exist. Creating new topic", topicName);
-            var topicResult = client.CreateTopicAsync(new CreateTopicRequest(topicName)).Result;
-            return topicResult.HttpStatusCode == HttpStatusCode.OK ? topicResult.TopicArn : string.Empty;
+            throw new InvalidOperationException(
+                $"Failed to publish message with topic {message.Header.Topic} and id {message.Id} and message: {message.Body}");
         }
 
-        /// <summary>
-        /// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
-        /// </summary>
-        public void Dispose()
-        {
-            
-        }
+        Log.PublishedMessage(s_logger, message.Header.Topic.Value, message.Id.Value, messageId);
+    }
+
+    public void Send(Message message) => SendWithDelay(message, null);
+
+    /// <inheritdoc />
+    /// <exception cref="ConfigurationException">
+    /// The delay requires scheduling, but no supported message scheduler is configured.
+    /// </exception>
+    public void SendWithDelay(Message message, TimeSpan? delay)
+        => BrighterAsyncContext.Run(() => SendWithDelayAsync(message, delay, false));
+
+
+    private static partial class Log
+    {
+        [LoggerMessage(LogLevel.Debug, "SQSMessageProducer: Publishing message with topic {Topic} and id {Id} and message: {Request}")]
+        public static partial void PublishingMessage(ILogger logger, string topic, string id, MessageBody request);
+
+        [LoggerMessage(LogLevel.Debug, "SQSMessageProducer: Published message with topic {Topic}, Brighter messageId {MessageId} and SNS messageId {SNSMessageId}")]
+        public static partial void PublishedMessage(ILogger logger, string topic, string messageId, string snsMessageId);
     }
 }

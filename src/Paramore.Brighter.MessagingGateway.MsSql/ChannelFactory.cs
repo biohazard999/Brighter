@@ -1,35 +1,125 @@
 ﻿using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
 
-namespace Paramore.Brighter.MessagingGateway.MsSql
+namespace Paramore.Brighter.MessagingGateway.MsSql;
+
+/// <summary>
+/// Factory class for creating MS SQL channels.
+/// </summary>
+public partial class ChannelFactory : MsSqlMessagingGateway, IAmAChannelFactory, IAmAChannelFactoryWithScheduler
 {
-    public class ChannelFactory : IAmAChannelFactory
+    private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<ChannelFactory>();
+    private readonly MsSqlMessageConsumerFactory _msSqlMessageConsumerFactory;
+
+    /// <summary>
+    /// Gets or sets the message scheduler for delayed requeue support.
+    /// Setting this property forwards the scheduler to the underlying consumer factory.
+    /// </summary>
+    public IAmAMessageScheduler? Scheduler
     {
-        private static readonly Lazy<ILog> Logger = new Lazy<ILog>(LogProvider.For<ChannelFactory>);
-        private readonly MsSqlMessageConsumerFactory _msSqlMessageConsumerFactory;
+        get => _msSqlMessageConsumerFactory.Scheduler;
+        set => _msSqlMessageConsumerFactory.Scheduler = value;
+    }
 
-        /// <summary>
-        /// Initializes a new instance of the <see cref="KafkaInputChannelFactory"/> class.
-        /// </summary>
-        /// <param name="kafkaMessageConsumerFactory">The messageConsumerFactory.</param>
-        public ChannelFactory(MsSqlMessageConsumerFactory msSqlMessageConsumerFactory)
-        {
-            _msSqlMessageConsumerFactory = msSqlMessageConsumerFactory ??
-                                           throw new ArgumentNullException(nameof(msSqlMessageConsumerFactory));
-        }
+    /// <summary>
+    /// Initializes a new instance of the <see cref="ChannelFactory"/> class.
+    /// </summary>
+    /// <param name="msSqlMessageConsumerFactory">The factory for creating MS SQL message consumers.</param>
+    /// <exception cref="ArgumentNullException">Thrown when the msSqlMessageConsumerFactory is null.</exception>
+    public ChannelFactory(MsSqlMessageConsumerFactory msSqlMessageConsumerFactory)
+        : base(ConfigurationOf(msSqlMessageConsumerFactory))
+    {
+        _msSqlMessageConsumerFactory = msSqlMessageConsumerFactory;
+    }
 
-        /// <summary>
-        /// Creates the input channel
-        /// </summary>
-        /// <param name="connection">The connection parameters with which to create the channel</param>
-        /// <returns></returns>
-        public IAmAChannel CreateChannel(Connection connection)
-        {
-            Logger.Value.Debug($"MsSqlInputChannelFactory: create input channel {connection.ChannelName} for topic {connection.RoutingKey}");
-            return new Channel(
-                connection.ChannelName,
-                _msSqlMessageConsumerFactory.Create(connection),
-                connection.BufferSize);
-        }
+    // The base call has to run before the field is set, and it needs the configuration the consumer
+    // factory was built with; naming that here keeps the existing ArgumentNullException.
+    private static RelationalDatabaseConfiguration ConfigurationOf(
+        MsSqlMessageConsumerFactory msSqlMessageConsumerFactory) =>
+        (msSqlMessageConsumerFactory ??
+         throw new ArgumentNullException(nameof(msSqlMessageConsumerFactory))).Configuration;
+
+    /// <summary>
+    /// Creates a synchronous MS SQL channel.
+    /// </summary>
+    /// <param name="subscription">The subscription details for the channel.</param>
+    /// <returns>A synchronous MS SQL channel instance.</returns>
+    /// <exception cref="ConfigurationException">Thrown when the subscription is not an MsSqlSubscription.</exception>
+    public IAmAChannelSync CreateSyncChannel(Subscription subscription)
+    {
+        MsSqlSubscription? msSqlSubscription = subscription as MsSqlSubscription;
+        if (msSqlSubscription == null)
+            throw new ConfigurationException("MS SQL ChannelFactory We expect an MsSqlSubscription or MsSqlSubscription<T> as a parameter");
+
+        _msSqlMessageConsumerFactory.ValidateSubscription(msSqlSubscription, false);
+        EnsureQueueStoreExists(msSqlSubscription.MakeChannels);
+
+        Log.MsSqlInputChannelFactoryCreateInputChannel(s_logger, subscription.ChannelName, subscription.RoutingKey.Value);
+        return new Channel(
+            subscription.ChannelName,
+            subscription.RoutingKey,
+            _msSqlMessageConsumerFactory.Create(subscription),
+            subscription.BufferSize);
+    }
+
+    /// <summary>
+    /// Creates an asynchronous MS SQL channel.
+    /// </summary>
+    /// <param name="subscription">The subscription details for the channel.</param>
+    /// <returns>An asynchronous MS SQL channel instance.</returns>
+    /// <exception cref="ConfigurationException">Thrown when the subscription is not an MsSqlSubscription.</exception>
+    public IAmAChannelAsync CreateAsyncChannel(Subscription subscription)
+    {
+        MsSqlSubscription? msSqlSubscription = subscription as MsSqlSubscription;
+        if (msSqlSubscription == null)
+            throw new ConfigurationException("MS SQL ChannelFactory We expect an MsSqlSubscription or MsSqlSubscription<T> as a parameter");
+
+        _msSqlMessageConsumerFactory.ValidateSubscription(msSqlSubscription, true);
+        EnsureQueueStoreExists(msSqlSubscription.MakeChannels);
+
+        Log.MsSqlInputChannelFactoryCreateInputChannel(s_logger, subscription.ChannelName, subscription.RoutingKey.Value);
+        return new ChannelAsync(
+            subscription.ChannelName,
+            subscription.RoutingKey,
+            _msSqlMessageConsumerFactory.CreateAsync(subscription),
+            subscription.BufferSize);
+
+    }
+
+    /// <summary>
+    /// Asynchronously creates an asynchronous MS SQL channel.
+    /// </summary>
+    /// <param name="subscription">The subscription details for the channel.</param>
+    /// <param name="ct">A token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation, with an asynchronous MS SQL channel instance as the result.</returns>
+    /// <exception cref="ConfigurationException">Thrown when the subscription is not an MsSqlSubscription.</exception>
+    public async Task<IAmAChannelAsync> CreateAsyncChannelAsync(Subscription subscription, CancellationToken ct = default)
+    {
+        MsSqlSubscription? msSqlSubscription = subscription as MsSqlSubscription;
+        if (msSqlSubscription == null)
+            throw new ConfigurationException("MS SQL ChannelFactory We expect an MsSqlSubscription or MsSqlSubscription<T> as a parameter");
+
+        ct.ThrowIfCancellationRequested();
+        _msSqlMessageConsumerFactory.ValidateSubscription(msSqlSubscription, true);
+        await EnsureQueueStoreExistsAsync(msSqlSubscription.MakeChannels, ct);
+
+        Log.MsSqlInputChannelFactoryCreateInputChannel(s_logger, subscription.ChannelName, subscription.RoutingKey.Value);
+        var channel = new ChannelAsync(
+            subscription.ChannelName, 
+            subscription.RoutingKey,
+            _msSqlMessageConsumerFactory.CreateAsync(subscription),
+            subscription.BufferSize);
+
+        return channel;
+    }
+
+    private static partial class Log
+    {
+        [LoggerMessage(LogLevel.Debug, "MsSqlInputChannelFactory: create input channel {ChannelName} for topic {Topic}")]
+        public static partial void MsSqlInputChannelFactoryCreateInputChannel(ILogger logger, string? channelName, string topic);
     }
 }
+

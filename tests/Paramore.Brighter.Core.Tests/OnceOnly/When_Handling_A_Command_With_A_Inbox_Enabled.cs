@@ -23,11 +23,11 @@ THE SOFTWARE. */
 #endregion
 
 using System;
-using FluentAssertions;
 using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
 using Paramore.Brighter.Core.Tests.OnceOnly.TestDoubles;
 using Polly.Registry;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Time.Testing;
 using Paramore.Brighter.Extensions.DependencyInjection;
 using Xunit;
 using Paramore.Brighter.Inbox.Handlers;
@@ -37,13 +37,13 @@ namespace Paramore.Brighter.Core.Tests.OnceOnly
     public class CommandProcessorUsingInboxTests
     {
         private readonly MyCommand _command;
-        private readonly IAmAnInbox _inbox;
+        private readonly IAmAnInboxSync _inbox;
         private readonly IAmACommandProcessor _commandProcessor;
         private readonly string _contextKey;
 
         public CommandProcessorUsingInboxTests()
         {
-            _inbox = new InMemoryInbox();
+            _inbox = new InMemoryInbox(new FakeTimeProvider());
 
             var registry = new SubscriberRegistry();
             registry.Register<MyCommand, MyStoredCommandHandler>();
@@ -55,13 +55,15 @@ namespace Paramore.Brighter.Core.Tests.OnceOnly
             container.AddSingleton(_inbox);
             container.AddTransient<UseInboxHandler<MyCommand>>();
             container.AddTransient<UseInboxHandler<MyCommandToFail>>();
+            container.AddSingleton<IBrighterOptions>(new BrighterOptions {HandlerLifetime = ServiceLifetime.Transient});
 
             var handlerFactory = new ServiceProviderHandlerFactory(container.BuildServiceProvider());
 
             _command = new MyCommand {Value = "My Test String"};
 
             _contextKey = typeof(MyStoredCommandHandler).FullName;
-            _commandProcessor = new CommandProcessor(registry, (IAmAHandlerFactory)handlerFactory, new InMemoryRequestContextFactory(), new PolicyRegistry());
+            _commandProcessor = new CommandProcessor(registry, handlerFactory, new InMemoryRequestContextFactory(), 
+                new PolicyRegistry(), new ResiliencePipelineRegistry<string>(),new InMemorySchedulerFactory());
 
         }
 
@@ -71,17 +73,17 @@ namespace Paramore.Brighter.Core.Tests.OnceOnly
             _commandProcessor.Send(_command);
 
             //should_store_the_command_to_the_inbox
-            _inbox.Get<MyCommand>(_command.Id, _contextKey).Value.Should().Be(_command.Value);
+            Assert.Equal(_command.Value, _inbox.Get<MyCommand>(_command.Id, _contextKey, null).Value);
         }
 
         [Fact]
-        public void Command_Is_Not_Stored_If_The_Handler_Is_Not_Succesful()
+        public void Command_Is_Not_Stored_If_The_Handler_Is_Not_Successful()
         {
-            Guid id = Guid.NewGuid();
+            string id = Guid.NewGuid().ToString();
 
-            Assert.Throws<NotImplementedException>(() => _commandProcessor.Send(new MyCommandToFail() { Id = id}));
+            Assert.Throws<NotImplementedException>(() => _commandProcessor.Send(new MyCommandToFail { Id = id}));
 
-            _inbox.Exists<MyCommandToFail>(id, typeof(MyStoredCommandToFailHandler).FullName).Should().BeFalse();
+            Assert.False(_inbox.Exists<MyCommandToFail>(id, typeof(MyStoredCommandToFailHandler).FullName, null));
         }
     }
 }

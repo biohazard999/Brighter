@@ -1,0 +1,232 @@
+#region Licence
+/* The MIT License (MIT)
+Copyright © 2026 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+#endregion
+
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Microsoft.Data.SqlClient;
+using Paramore.Brighter.BoxProvisioning;
+using Paramore.Brighter.BoxProvisioning.MsSql;
+using Xunit;
+
+namespace Paramore.Brighter.MSSQL.Tests.BoxProvisioning;
+
+/// <summary>
+/// Detection returns -1 for a table without the box's discriminator column and 0 for one that has it
+/// but matches no version, and the provisioner refuses both; otherwise detection returns the highest
+/// version whose columns are all present (ADR 0057 §2).
+/// </summary>
+public class MsSqlBoxDiscriminatorDetectionTests : IAsyncLifetime
+{
+    private readonly string _connectionString = Configuration.DefaultConnectingString;
+    private readonly List<string> _tablesToCleanup = [];
+
+    [Fact]
+    public async Task When_mssql_outbox_detects_table_missing_headerbag_discriminator_it_should_return_negative_one()
+    {
+        //Arrange
+        Configuration.EnsureDatabaseExists(_connectionString);
+        var tableName = TrackTable($"foreign_{Guid.NewGuid():N}");
+        Configuration.CreateTable(_connectionString,
+            $"CREATE TABLE [{tableName}] ([CommandId] NVARCHAR(255) NOT NULL, [Timestamp] DATETIME NULL);");
+
+        var config = new RelationalDatabaseConfiguration(_connectionString, outBoxTableName: tableName);
+        var migrations = new MsSqlOutboxMigrationCatalog().All(config);
+
+        //Act
+        int detected;
+        await using (var connection = new SqlConnection(_connectionString))
+        {
+            await connection.OpenAsync();
+            detected = await new MsSqlBoxDetectionHelper().DetectCurrentVersionAsync(
+                connection, tableName, "dbo", BoxType.Outbox, migrations, default);
+        }
+
+        //Assert
+        Assert.Equal(-1, detected);
+
+        //Act
+        var runner = new MsSqlBoxMigrationRunner(new MsSqlOutboxMigrationCatalog(), config, TimeSpan.FromSeconds(30));
+        var provisioner = new MsSqlOutboxProvisioner(
+            new MsSqlBoxDetectionHelper(),
+            new MsSqlOutboxMigrationCatalog(),
+            new MsSqlPayloadModeValidator(),
+            config,
+            runner);
+        var ex = await Assert.ThrowsAsync<ConfigurationException>(() => provisioner.ProvisionAsync());
+
+        //Assert
+        Assert.Contains("not a Brighter outbox", ex.Message);
+        Assert.Contains("HeaderBag", ex.Message);
+    }
+
+    [Fact]
+    public async Task When_mssql_inbox_detects_table_missing_commandbody_discriminator_it_should_return_negative_one()
+    {
+        //Arrange
+        Configuration.EnsureDatabaseExists(_connectionString);
+        var tableName = TrackTable($"foreign_{Guid.NewGuid():N}");
+        Configuration.CreateTable(_connectionString,
+            $"CREATE TABLE [{tableName}] ([Topic] NVARCHAR(255) NULL, [Timestamp] DATETIME NULL);");
+
+        var config = new RelationalDatabaseConfiguration(_connectionString, inboxTableName: tableName);
+        var migrations = new MsSqlInboxMigrationCatalog().All(config);
+
+        //Act
+        int detected;
+        await using (var connection = new SqlConnection(_connectionString))
+        {
+            await connection.OpenAsync();
+            detected = await new MsSqlBoxDetectionHelper().DetectCurrentVersionAsync(
+                connection, tableName, "dbo", BoxType.Inbox, migrations, default);
+        }
+
+        //Assert
+        Assert.Equal(-1, detected);
+
+        //Act
+        var runner = new MsSqlBoxMigrationRunner(new MsSqlInboxMigrationCatalog(), config, TimeSpan.FromSeconds(30));
+        var provisioner = new MsSqlInboxProvisioner(
+            new MsSqlBoxDetectionHelper(),
+            new MsSqlInboxMigrationCatalog(),
+            new MsSqlPayloadModeValidator(),
+            config,
+            runner);
+        var ex = await Assert.ThrowsAsync<ConfigurationException>(() => provisioner.ProvisionAsync());
+
+        //Assert
+        Assert.Contains("not a Brighter inbox", ex.Message);
+        Assert.Contains("CommandBody", ex.Message);
+    }
+
+    [Fact]
+    public async Task When_mssql_outbox_detects_headerbag_present_but_no_v1_columns_it_should_return_zero()
+    {
+        //Arrange
+        Configuration.EnsureDatabaseExists(_connectionString);
+        var tableName = TrackTable($"unknown_{Guid.NewGuid():N}");
+        Configuration.CreateTable(_connectionString,
+            $"CREATE TABLE [{tableName}] ([Id] BIGINT NOT NULL IDENTITY, [HeaderBag] NVARCHAR(MAX) NULL, PRIMARY KEY ([Id]));");
+
+        var config = new RelationalDatabaseConfiguration(_connectionString, outBoxTableName: tableName);
+        var migrations = new MsSqlOutboxMigrationCatalog().All(config);
+
+        //Act
+        int detected;
+        await using (var connection = new SqlConnection(_connectionString))
+        {
+            await connection.OpenAsync();
+            detected = await new MsSqlBoxDetectionHelper().DetectCurrentVersionAsync(
+                connection, tableName, "dbo", BoxType.Outbox, migrations, default);
+        }
+
+        //Assert
+        Assert.Equal(0, detected);
+
+        //Act
+        var runner = new MsSqlBoxMigrationRunner(new MsSqlOutboxMigrationCatalog(), config, TimeSpan.FromSeconds(30));
+        var provisioner = new MsSqlOutboxProvisioner(
+            new MsSqlBoxDetectionHelper(),
+            new MsSqlOutboxMigrationCatalog(),
+            new MsSqlPayloadModeValidator(),
+            config,
+            runner);
+        var ex = await Assert.ThrowsAsync<ConfigurationException>(() => provisioner.ProvisionAsync());
+
+        //Assert
+        Assert.Contains("does not match any known schema version", ex.Message);
+    }
+
+    [Fact]
+    public async Task When_mssql_outbox_detects_v3_shaped_table_it_should_return_three()
+    {
+        //Arrange
+        Configuration.EnsureDatabaseExists(_connectionString);
+        var tableName = TrackTable($"v3_outbox_{Guid.NewGuid():N}");
+        Configuration.CreateTable(_connectionString,
+            $@"CREATE TABLE [{tableName}] (
+                [Id] BIGINT NOT NULL IDENTITY,
+                [MessageId] NVARCHAR(255) NOT NULL,
+                [Topic] NVARCHAR(255) NULL,
+                [MessageType] NVARCHAR(32) NULL,
+                [Timestamp] DATETIME NULL,
+                [HeaderBag] NVARCHAR(MAX) NULL,
+                [Body] NVARCHAR(MAX) NULL,
+                [Dispatched] DATETIME NULL,
+                [CorrelationId] NVARCHAR(255) NULL,
+                [ReplyTo] NVARCHAR(255) NULL,
+                [ContentType] NVARCHAR(128) NULL,
+                PRIMARY KEY ([Id])
+            );");
+
+        var config = new RelationalDatabaseConfiguration(_connectionString, outBoxTableName: tableName);
+        var migrations = new MsSqlOutboxMigrationCatalog().All(config);
+
+        //Act
+        int detected;
+        await using (var connection = new SqlConnection(_connectionString))
+        {
+            await connection.OpenAsync();
+            detected = await new MsSqlBoxDetectionHelper().DetectCurrentVersionAsync(
+                connection, tableName, "dbo", BoxType.Outbox, migrations, default);
+        }
+
+        //Assert
+        Assert.Equal(3, detected);
+    }
+
+    private string TrackTable(string tableName)
+    {
+        _tablesToCleanup.Add(tableName);
+        return tableName;
+    }
+
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    public async Task DisposeAsync()
+    {
+        try
+        {
+            using var connection = new SqlConnection(_connectionString);
+            connection.Open();
+
+            foreach (var tableName in _tablesToCleanup)
+            {
+                using var dropTable = connection.CreateCommand();
+                dropTable.CommandText = $"DROP TABLE IF EXISTS [{tableName}]";
+                dropTable.ExecuteNonQuery();
+            }
+
+            using var deleteHistory = connection.CreateCommand();
+            deleteHistory.CommandText = @"
+IF OBJECT_ID(N'[__BrighterMigrationHistory]', N'U') IS NOT NULL
+    DELETE FROM [__BrighterMigrationHistory] WHERE [BoxTableName] LIKE 'foreign_%' OR [BoxTableName] LIKE 'unknown_%' OR [BoxTableName] LIKE 'v3_outbox_%'";
+            deleteHistory.ExecuteNonQuery();
+        }
+        catch
+        {
+            // Best effort cleanup
+        }
+        await Task.CompletedTask;
+    }
+}

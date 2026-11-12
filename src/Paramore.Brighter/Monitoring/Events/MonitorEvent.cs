@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2015 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -23,8 +23,8 @@ THE SOFTWARE. */
 #endregion
 
 using System;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Converters;
+using System.Text.Json.Serialization;
+using Paramore.Brighter.JsonConverters;
 using Paramore.Brighter.Monitoring.Handlers;
 
 namespace Paramore.Brighter.Monitoring.Events
@@ -58,71 +58,63 @@ namespace Paramore.Brighter.Monitoring.Events
     /// events before executing the remainder of the chain, after exiting the remainder of the chain, or because an exception was thrown in the chain.
     /// We capture the information on timing and the request.
     /// </summary>
-    public class MonitorEvent : Event
+    public class MonitorEvent(
+        string? instanceName,
+        MonitorEventType eventType,
+        string? handlerName,
+        string? handlerFullAssemblyName,
+        string requestBody,
+        DateTime eventTime,
+        int timeElapsedMs,
+        Exception? exception = null)
+        : Event(Id.Random())
     {
         /// <summary>
         /// Any exception that was thrown when processing the handler pipeline
         /// </summary>
-        public Exception Exception { get; set; }
-        
+        /// <remarks>
+        /// JSON contains the exception type name, message, stack trace and inner exception details.
+        /// Reflection members, custom properties and <see cref="System.Exception.Data"/> are omitted.
+        /// Deserialization creates plain <see cref="System.Exception"/> instances with the messages
+        /// and inner exception chain; it does not restore the original CLR types or stack traces.
+        /// </remarks>
+        [JsonConverter(typeof(MonitorEventExceptionConverter))]
+        public Exception? Exception { get; set; } = exception;
+
         /// <summary>
         /// Why was this event raised?
         /// </summary>
-        [JsonConverter(typeof(StringEnumConverter))]
-        public MonitorEventType EventType { get; private set; }
+        [JsonConverter(typeof(JsonStringEnumConverter))]
+        public MonitorEventType EventType { get; private set; } = eventType;
 
         /// <summary>
         /// When was this event raised?
         /// </summary>
-        public DateTime EventTime { get; private set; }
-
+        public DateTime EventTime { get; private set; } = eventTime;
 
         /// <summary>
         /// When was the duration in milliseconds?
         /// </summary>
-        public int TimeElapsedMs { get; set; }
+        public int TimeElapsedMs { get; set; } = timeElapsedMs;
 
         /// <summary>
-        //What was the handler that we raised this event for? 
+        /// What was the handler that we raised this event for? 
         /// </summary>
-        public string HandlerName { get; private set; }
+        public string? HandlerName { get; private set; } = handlerName;
 
         /// <summary>
-        //What was the handler that we raised this event for, include full assembly path
+        /// What was the handler that we raised this event for, include full assembly path
         /// </summary>
-        public string HandlerFullAssemblyName { get; set; }
+        public string? HandlerFullAssemblyName { get; set; } = handlerFullAssemblyName;
 
         /// <summary>
         /// Which instance was this handler running on?
         /// </summary>
-        public string InstanceName { get; set; }
+        public string? InstanceName { get; set; } = instanceName;
 
         /// <summary>
-        /// The serialied request - what were the parameters to this command?
+        /// The serialised request - what were the parameters to this command?
         /// </summary>
-        public string RequestBody { get; private set; }
-
-        public MonitorEvent(
-            string instanceName,
-            MonitorEventType eventType, 
-            string handlerName,
-            string handlerFullName,
-            string requestBody,
-            DateTime eventTime,
-            int elapsedMilliseconds,
-            Exception exception = null
-            )
-            :base(Guid.NewGuid())
-        {
-            InstanceName = instanceName;
-            EventType = eventType;
-            HandlerName = handlerName;
-            HandlerFullAssemblyName = handlerFullName;
-            RequestBody = requestBody;
-            EventTime = eventTime;
-            TimeElapsedMs = elapsedMilliseconds;
-            Exception = exception;
-        }
-
+        public string RequestBody { get; private set; } = requestBody;
     }
 }

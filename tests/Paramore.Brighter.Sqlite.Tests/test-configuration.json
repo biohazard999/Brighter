@@ -1,0 +1,17 @@
+{
+  "Namespace": "Paramore.Brighter.Sqlite.Tests",
+  "Outboxes": {
+    "Text": {
+      "Transaction": "System.Data.Common.DbTransaction",
+      "OutboxProvider": "SqliteTextOutboxProvider",
+      "Category": "Sqlite",
+      "CollectionName": "SqliteTextOutbox"
+    },
+    "Binary": {
+      "Transaction": "System.Data.Common.DbTransaction",
+      "OutboxProvider": "SqliteBinaryOutboxProvider",
+      "Category": "Sqlite",
+      "CollectionName": "SqliteBinaryOutbox"
+    }
+  }
+}

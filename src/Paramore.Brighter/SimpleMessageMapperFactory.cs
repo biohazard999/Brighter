@@ -27,14 +27,12 @@ using System;
 namespace Paramore.Brighter
 {
     /// <summary>
-    /// Class SimpleMessageMapperFactory. This allows you to return a simple function that finds a given message mapper. Intended for lightweight messagage mapping,
+    /// Class SimpleMessageMapperFactory.
+    /// This allows you to return a simple function that finds a given message mapper. Intended for lightweight message mapping,
     /// such as with a ControlBusSender. We recommend you wrap your IoC container for heavyweight mapping.
     /// </summary>
     public class SimpleMessageMapperFactory : IAmAMessageMapperFactory
     {
-        /// <summary>
-        /// The _factory method{CC2D43FA-BBC4-448A-9D0B-7B57ADF2655C}
-        /// </summary>
         private readonly Func<Type, IAmAMessageMapper> _factoryMethod;
 
         /// <summary>
@@ -47,13 +45,30 @@ namespace Paramore.Brighter
         }
 
         /// <summary>
+        /// Offers no pipeline scope: the caller's factory method owns whatever it returns.
+        /// </summary>
+        public IAmAScope? CreatePipelineScope() => null;
+
+        /// <summary>
         /// Creates the specified message mapper type.
         /// </summary>
         /// <param name="messageMapperType">Type of the message mapper.</param>
+        /// <param name="scope">Ignored: this factory offers no pipeline scope.</param>
         /// <returns>IAmAMessageMapper.</returns>
-        public IAmAMessageMapper Create(Type messageMapperType)
+        public Lease<IAmAMessageMapper>? Create(Type messageMapperType, IAmAScope? scope = null)
         {
-            return _factoryMethod(messageMapperType);
+            var mapper = _factoryMethod(messageMapperType);
+            return mapper is null ? null : Lease<IAmAMessageMapper>.Untracked(mapper);
+        }
+
+        /// <summary>
+        /// Releases the specified message mapper lease. A no-op: the factory method supplied by the caller
+        /// owns whatever it returns — it may legitimately hand back a shared instance — so this factory
+        /// must not dispose it, and the lease carries no release token.
+        /// </summary>
+        /// <param name="lease">The mapper lease to release.</param>
+        public void Release(Lease<IAmAMessageMapper>? lease)
+        {
         }
     }
 }

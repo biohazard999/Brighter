@@ -27,7 +27,7 @@ using System.Threading.Tasks;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyValidationHandlerAsync<TRequest> : RequestHandlerAsync<TRequest> where TRequest : class, IRequest
+    internal sealed class MyValidationHandlerAsync<TRequest> : RequestHandlerAsync<TRequest> where TRequest : class, IRequest
     {
         private static TRequest s_command;
 
@@ -36,7 +36,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
             s_command = null;
         }
 
-        public override async Task<TRequest> HandleAsync(TRequest command, CancellationToken cancellationToken = default(CancellationToken))
+        public override async Task<TRequest> HandleAsync(TRequest command, CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
             {

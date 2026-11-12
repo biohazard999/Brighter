@@ -1,0 +1,118 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Data.Common;
+using System.Threading.Tasks;
+using Google.Api.Gax;
+using Google.Cloud.Spanner.Data;
+using Paramore.Brighter.Base.Test.Outbox;
+using Paramore.Brighter.Gcp.Tests.Outbox.SpannerText.Async;
+using Paramore.Brighter.Gcp.Tests.Outbox.SpannerText.OutstandingCount;
+using Paramore.Brighter.Gcp.Tests.Outbox.SpannerText.Sync;
+using Paramore.Brighter.Gcp.Tests.Spanner;
+using Paramore.Brighter.Outbox.Spanner;
+using Paramore.Brighter.Spanner;
+
+namespace Paramore.Brighter.Gcp.Tests.Outbox.SpannerText;
+
+public class SpannerTextOutboxProvider : IAmAnOutboxProviderSync, IAmAnOutboxProviderAsync, IAmAnOutstandingCountOutboxProvider
+{
+    private readonly RelationalDatabaseConfiguration _configuration = new(
+        new SpannerConnectionStringBuilder(Const.ConnectionString)
+        {
+            EmulatorDetection = EmulatorDetection.EmulatorOrProduction
+        }.ConnectionString,
+        databaseName: "brightertests",
+        outBoxTableName: $"test_{Uuid.New():N}",
+        binaryMessagePayload: false
+    );
+
+    public IAmAnOutboxSync<Message, DbTransaction> CreateOutbox()
+    {
+        return new SpannerOutbox(_configuration);
+    }
+
+    public IAmAnOutboxAsync<Message, DbTransaction> CreateOutboxAsync()
+    {
+        return new SpannerOutbox(_configuration);
+    }
+
+    public void CreateStore()
+    {
+        using var connection = new SpannerConnection(_configuration.ConnectionString);
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = SpannerOutboxBuilder.GetDDL(_configuration.OutBoxTableName);
+        command.ExecuteNonQuery();
+    }
+
+    public async Task CreateStoreAsync()
+    {
+        using var connection = new SpannerConnection(_configuration.ConnectionString);
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = SpannerOutboxBuilder.GetDDL(_configuration.OutBoxTableName);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    public IAmABoxTransactionProvider<DbTransaction> CreateTransactionProvider()
+    {
+        return new SpannerUnitOfWork(_configuration);
+    }
+
+    public void DeleteStore(IEnumerable<Message> messages)
+    {
+        using var connection = new SpannerConnection(_configuration.ConnectionString);
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = $"DROP TABLE {_configuration.OutBoxTableName}";
+        command.ExecuteNonQuery();
+    }
+
+    public async Task DeleteStoreAsync(IEnumerable<Message> messages)
+    {
+        await using var connection = new SpannerConnection(_configuration.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"DROP TABLE {_configuration.OutBoxTableName}";
+        await command.ExecuteNonQueryAsync();
+    }
+
+    public IEnumerable<Message> GetAllMessages()
+    {
+        var outbox = new SpannerOutbox(_configuration);
+        return outbox.Get(new RequestContext());
+    }
+
+    public async Task<IEnumerable<Message>> GetAllMessagesAsync()
+    {
+        var outbox = new SpannerOutbox(_configuration);
+        return await outbox.GetAsync(new RequestContext());
+    }
+
+    public void DeleteOutstandingCountStore()
+    {
+        try
+        {
+            DeleteStore(Array.Empty<Message>());
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    public IAmAnOutboxAsync<Message, DbTransaction> CreateOutstandingCountStore()
+    {
+        CreateStore();
+        return CreateOutboxAsync();
+    }
+
+    public async Task<OutstandingCountCancellationSetup<DbTransaction>> PrepareCancellationAsync(TimeSpan holdFor)
+    {
+        await CreateStoreAsync();
+        return new OutstandingCountCancellationSetup<DbTransaction>(
+            CreateOutboxAsync(),
+            storeHeld: false,
+            clientCancellationException: typeof(OperationCanceledException),
+            release: () => new ValueTask(DeleteStoreAsync(Array.Empty<Message>())));
+    }
+}

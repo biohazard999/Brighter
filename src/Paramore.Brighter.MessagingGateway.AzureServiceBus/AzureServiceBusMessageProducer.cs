@@ -1,6 +1,7 @@
 ﻿#region Licence
+
 /* The MIT License (MIT)
-Copyright © 2015 Yiannis Triantafyllopoulos <yiannis.triantafyllopoulos@gmail.com>
+Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the “Software”), to deal
@@ -19,65 +20,284 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE. */
+
 #endregion
 
 using System;
-using Newtonsoft.Json;
-using Paramore.Brighter.Logging;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Azure.Messaging;
+using Microsoft.Extensions.Logging;
+using OpenTelemetry;
+using Paramore.Brighter.MessagingGateway.AzureServiceBus.AzureServiceBusWrappers;
+using Paramore.Brighter.Observability;
+using Paramore.Brighter.Tasks;
+using Polly;
+using Polly.Retry;
 
-namespace Paramore.Brighter.MessagingGateway.AzureServiceBus
+namespace Paramore.Brighter.MessagingGateway.AzureServiceBus;
+
+/// <summary>
+/// A Sync and Async Message Producer for Azure Service Bus.
+/// </summary>
+public abstract partial class AzureServiceBusMessageProducer : IAmAMessageProducerSync, IAmAMessageProducerAsync, IAmABulkMessageProducerAsync
 {
-    public class AzureServiceBusMessageProducer : MessageGateway, IAmAMessageProducer
+    private readonly IServiceBusSenderProvider _serviceBusSenderProvider;
+    private readonly InstrumentationOptions _options;
+    private AzureServiceBusPublication _publication;
+    protected bool TopicCreated;
+        
+    private const int TopicConnectionSleepBetweenRetriesInMilliseconds = 100;
+    private const int TopicConnectionRetryCount = 5;
+    private readonly int _bulkSendBatchSize;
+        
+    protected abstract ILogger Logger { get; }
+
+    /// <summary>
+    /// The publication configuration for this producer
+    /// </summary>
+    public Publication Publication
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<AzureServiceBusMessageProducer>);
+        get { return _publication; }
+        set  {_publication = (AzureServiceBusPublication)value ?? throw new ConfigurationException("The publication must be an AzureServiceBusPublication"); }
+}
 
-        private readonly MessageSenderPool _pool;
+    /// <summary>
+    /// The OTel Span we are writing Producer events too
+    /// </summary>
+    public Activity? Span { get; set; }
 
-        public AzureServiceBusMessageProducer(AzureServiceBusMessagingGatewayConfiguration configuration)
-            : base(configuration)
+    /// <inheritdoc />
+    public IAmAMessageScheduler? Scheduler { get; set; }
+
+    /// <summary>
+    /// An Azure Service Bus Message producer <see cref="IAmAMessageProducer"/>
+    /// </summary>
+    /// <param name="serviceBusSenderProvider">The provider to use when producing messages.</param>
+    /// <param name="publication">Configuration of a producer</param>
+    /// <param name="bulkSendBatchSize">When sending more than one message using the MessageProducer, the max amount to send in a single transmission.</param>
+    /// <param name="options"></param>
+    protected AzureServiceBusMessageProducer(
+        IServiceBusSenderProvider serviceBusSenderProvider, 
+        AzureServiceBusPublication publication, 
+        int bulkSendBatchSize = 10,
+        InstrumentationOptions options = InstrumentationOptions.All
+    )
+    {
+        _serviceBusSenderProvider = serviceBusSenderProvider;
+        _publication = publication;
+        _bulkSendBatchSize = bulkSendBatchSize;
+        _options = options;
+    }
+        
+    /// <summary>
+    /// Dispose of the producer
+    /// </summary>
+    public void Dispose() { }
+        
+    /// <summary>
+    /// Dispose of the producer
+    /// </summary>
+    /// <returns></returns>
+    public ValueTask DisposeAsync()
+    {
+        return new ValueTask(Task.CompletedTask);
+    }
+
+    /// <summary>
+    /// Sends the specified message.
+    /// </summary>
+    /// <param name="message">The message.</param>
+    public void Send(Message message)
+    {
+        SendWithDelay(message);
+    }
+
+    /// <summary>
+    /// Sends the specified message.
+    /// </summary>
+    /// <param name="message">The message.</param>
+    /// <param name="cancellationToken">Cancel the in-flight send operation</param>
+    public async Task SendAsync(Message message, CancellationToken cancellationToken = default)
+    {
+        await SendWithDelayAsync(message, cancellationToken: cancellationToken);
+    }
+
+
+    /// <inheritdoc/>
+    public async ValueTask<IEnumerable<IAmAMessageBatch>> CreateBatchesAsync(
+        IEnumerable<Message> messages, CancellationToken cancellationToken)
+    {
+        var topics = messages.Select(m => m.Header.Topic).Distinct().ToArray();
+        
+        if (topics.Length != 1)
         {
-            _pool = new MessageSenderPool();
+            Log.CannotBulkSendForMultipleTopics(Logger, topics.Length);
+            throw new Exception($"Cannot Bulk send for Multiple Topics, {topics.Length} Topics Requested");
         }
 
-        /// <summary>
-        /// Sends the specified message.
-        /// </summary>
-        /// <param name="message">The message.</param>
-        /// <returns>Task.</returns>
-         public void Send(Message message)
+        var topic = topics.First()!;
+        var serviceBusSenderWrapper = await GetSenderAsync(topic.Value);
+        var azureServiceBusMessageBatches =
+            new AzureServiceBusMessageBatches(serviceBusSenderWrapper, topic);
+
+        try
         {
-            _logger.Value.DebugFormat("AzureServiceBusMessageProducer: Publishing message to topic {0}", message.Header.Topic);
-            var messageSender = _pool.GetMessageSender(message.Header.Topic);
-            EnsureTopicExists(message.Header.Topic);
-            messageSender.Send(new Amqp.Message(message.Body.Value));
-            _logger.Value.DebugFormat("AzureServiceBusMessageProducer: Published message with id {0} to topic '{1}' and content: {2}", message.Id, message.Header.Topic, JsonConvert.SerializeObject(message));
+            foreach (Message message in messages)
+                await azureServiceBusMessageBatches.AddMessageToBatchAsync(message, _publication.TimeToLive, cancellationToken);
+
+            Log.SendingMessagesInBatches(Logger, topic, azureServiceBusMessageBatches.Batches.Count(), _bulkSendBatchSize);
+
+            return azureServiceBusMessageBatches.Batches;
         }
-
-        /// <summary>
-        /// Sends the specified message.
-        /// </summary>
-        /// <param name="message">The message.</param>
-        /// <param name="delayMilliseconds">The sending delay</param>
-        /// <returns>Task.</returns>
-         public void SendWithDelay(Message message, int delayMilliseconds = 0)
+        finally
         {
-            Send(message);
+            await serviceBusSenderWrapper.CloseAsync();
         }
+    }
 
-        public bool DelaySupported => false;
+    /// <inheritdoc/>
+    /// <exception cref="NotImplementedException"></exception>
+    public async Task SendAsync(IAmAMessageBatch batch, CancellationToken cancellationToken)
+    {
+        var topic = batch.RoutingKey;
+        var messageCount = batch.Ids().Count();
+        var serviceBusSenderWrapper = await GetSenderAsync(topic.Value);
 
-        ~AzureServiceBusMessageProducer()
+        Log.SendingBatch(Logger, messageCount, topic);
+        
+        try
         {
-            Dispose(false);
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
+            var sendTask = batch switch
             {
-                _pool?.Dispose();
-            }
-            base.Dispose(disposing);
+                AzureServiceBusSingleMessageBatch singleMessageBatch => serviceBusSenderWrapper.SendAsync(
+                    singleMessageBatch.Content, cancellationToken),
+                AzureServiceBusMessageBatch serviceBusMessageBatch => serviceBusSenderWrapper.SendAsync(
+                    serviceBusMessageBatch.Content, cancellationToken),
+                _ => throw new NotImplementedException(
+                    $"{nameof(SendAsync)} only supports ${typeof(AzureServiceBusSingleMessageBatch)} or ${typeof(AzureServiceBusMessageBatch)}")
+            };
+            
+            await sendTask;
         }
+        finally
+        {
+            await serviceBusSenderWrapper.CloseAsync();
+        }
+    }
+
+    /// <summary>
+    /// Send the specified message with specified delay
+    /// Sync over Async
+    /// </summary>
+    /// <param name="message">The message.</param>
+    /// <param name="delay">Delay to delivery of the message.</param>
+    public void SendWithDelay(Message message, TimeSpan? delay = null) => BrighterAsyncContext.Run(() => SendWithDelayAsync(message, delay));
+       
+    /// <summary>
+    /// Send the specified message with specified delay
+    /// </summary>
+    /// <param name="message">The message.</param>
+    /// <param name="delay">Delay delivery of the message.</param>
+    /// <param name="cancellationToken">Cancel the in-flight send operation</param>
+    public async Task SendWithDelayAsync(Message message, TimeSpan? delay = null, CancellationToken cancellationToken = default)
+    {
+        Log.PreparingToSendMessage(Logger, message.Header.Topic);
+            
+        delay ??= TimeSpan.Zero;
+
+        if (message.Header.Topic is null) throw new ArgumentException("Topic not be null");
+
+        var destination = message.Header.Topic;
+        var serviceBusSenderWrapper = await GetSenderAsync(destination.Value);
+
+        try
+        {
+            Log.PublishingMessage(Logger, message.Header.Topic, delay, message.Body.Value, message.Id.Value);
+
+            BrighterTracer.WriteProducerEvent(Span, "azure_service_bus", message, _options);
+            var azureServiceBusMessage = AzureServiceBusMessagePublisher.ConvertToServiceBusMessage(message, _publication.TimeToLive);
+            if (delay == TimeSpan.Zero)
+            {
+                await serviceBusSenderWrapper.SendAsync(azureServiceBusMessage, cancellationToken);
+            }
+            else
+            {
+                var dateTimeOffset = new DateTimeOffset(DateTime.UtcNow.Add(delay.Value));
+                await serviceBusSenderWrapper.ScheduleMessageAsync(azureServiceBusMessage, dateTimeOffset, cancellationToken);
+            }
+
+            Log.PublishedMessage(Logger, message.Header.Topic, delay, message.Body.Value, message.Id.Value);
+        }
+        catch (Exception e)
+        {
+            Log.FailedToPublishMessage(Logger, e, message.Header.Topic, message.Id.Value);
+            throw new ChannelFailureException("Error talking to the broker, see inner exception for details", e);
+        }
+        finally
+        {
+            await serviceBusSenderWrapper.CloseAsync();
+        }
+    }
+
+    private async Task<IServiceBusSenderWrapper> GetSenderAsync(string topic)
+    {
+        await EnsureChannelExistsAsync(topic);
+
+        try
+        {
+            RetryPolicy policy = Policy
+                .Handle<Exception>()
+                .Retry(TopicConnectionRetryCount, (exception, retryNumber) =>
+                    {
+                        Log.FailedToConnectRetrying(Logger, exception, topic);
+
+                        Thread.Sleep(TimeSpan.FromMilliseconds(TopicConnectionSleepBetweenRetriesInMilliseconds));
+                    }
+                );
+
+            return policy.Execute(() => _serviceBusSenderProvider.Get(topic));
+        }
+        catch (Exception e)
+        {
+            Log.FailedToConnectAborting(Logger, e, topic);
+            throw;
+        }
+    }
+
+    protected abstract Task EnsureChannelExistsAsync(string channelName);
+
+    private static partial class Log
+    {
+        [LoggerMessage(LogLevel.Error, "Cannot Bulk send for Multiple Topics, {NumberOfTopics} Topics Requested")]
+        public static partial void CannotBulkSendForMultipleTopics(ILogger logger, int numberOfTopics);
+
+        [LoggerMessage(LogLevel.Information, "Sending Messages for {TopicName} split into {NumberOfBatches} Batches of {BatchSize}")]
+        public static partial void SendingMessagesInBatches(ILogger logger, RoutingKey topicName, int numberOfBatches, int batchSize);
+
+        [LoggerMessage(LogLevel.Information, "Sending Batch of size {BatchSize} of Messages for {TopicName}")]
+        public static partial void SendingBatch(ILogger logger, int batchSize, RoutingKey topicName);
+
+        [LoggerMessage(LogLevel.Debug, "Preparing to send message on topic {Topic}")]
+        public static partial void PreparingToSendMessage(ILogger logger, RoutingKey topic);
+
+        [LoggerMessage(LogLevel.Debug, "Publishing message to topic {Topic} with a delay of {Delay} and body {Request} and id {Id}")]
+        public static partial void PublishingMessage(ILogger logger, RoutingKey topic, TimeSpan? delay, string request, string id);
+
+        [LoggerMessage(LogLevel.Debug, "Published message to topic {Topic} with a delay of {Delay} and body {Request} and id {Id}")]
+        public static partial void PublishedMessage(ILogger logger, RoutingKey topic, TimeSpan? delay, string request, string id);
+
+        [LoggerMessage(LogLevel.Error, "Failed to publish message to topic {Topic} with id {Id}, message will not be retried")]
+        public static partial void FailedToPublishMessage(ILogger logger, Exception e, RoutingKey topic, string id);
+
+        [LoggerMessage(LogLevel.Error, "Failed to connect to topic {Topic}, retrying...")]
+        public static partial void FailedToConnectRetrying(ILogger logger, Exception e, string topic);
+
+        [LoggerMessage(LogLevel.Error, "Failed to connect to topic {Topic}, aborting.")]
+        public static partial void FailedToConnectAborting(ILogger logger, Exception e, string topic);
     }
 }

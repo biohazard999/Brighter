@@ -24,19 +24,19 @@ THE SOFTWARE. */
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyContextAwareCommandHandler : RequestHandler<MyCommand>
+    internal sealed class MyContextAwareCommandHandler : RequestHandler<MyCommand>
     {
-        public static string TestString { get; set; }
+        public static string? TestString { get; set; }
 
-        public override MyCommand Handle(MyCommand command)
+        public override MyCommand Handle(MyCommand myCommand)
         {
             LogContext();
-            return base.Handle(command);
+            return base.Handle(myCommand);
         }
 
         private void LogContext()
         {
-            TestString = (string)Context.Bag["TestString"];
+            TestString = (string)Context!.Bag["TestString"];
             Context.Bag["MyContextAwareCommandHandler"] = "I was called and set the context";
         }
     }

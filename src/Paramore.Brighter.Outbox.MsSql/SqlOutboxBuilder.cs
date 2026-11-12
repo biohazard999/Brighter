@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Francesco Pighi <francesco.pighi@gmail.com>
 
@@ -22,31 +22,137 @@ THE SOFTWARE. */
 
 #endregion
 
+using System;
+
 namespace Paramore.Brighter.Outbox.MsSql
 {
+    /// <summary>
+    /// Provide SQL statement helpers for creation of an Outbox
+    /// </summary>
     public class SqlOutboxBuilder
     {
-        const string OutboxDdl = @"
-        CREATE TABLE {0}
+        private const string TextOutboxDdl =
+            """
+            CREATE TABLE {0}
             (
-              [Id] [BIGINT] NOT NULL IDENTITY ,
-              [MessageId] UNIQUEIDENTIFIER NOT NULL ,
-              [Topic] NVARCHAR(255) NULL ,
-              [MessageType] NVARCHAR(32) NULL ,
-              [Timestamp] DATETIME NULL ,
-              [CorrelationId] UNIQUEIDENTIFIER NULL,
-              [ReplyTo] NVARCHAR(255) NULL,
-              [ContentType] NVARCHAR(128) NULL,  
-              [Dispatched] DATETIME NULL,
-              [HeaderBag] NTEXT NULL ,
-              [Body] NTEXT NULL ,
-              PRIMARY KEY ( [Id] )
+                [Id] [BIGINT] NOT NULL IDENTITY ,
+                [MessageId] NVARCHAR(255) NOT NULL,
+                [Topic] NVARCHAR(255) NULL,
+                [MessageType] NVARCHAR(32) NULL,
+                [Timestamp] DATETIME NULL,
+                [CorrelationId] NVARCHAR(255) NULL,
+                [ReplyTo] NVARCHAR(255) NULL,
+                [ContentType] NVARCHAR(128) NULL,  
+                [PartitionKey] NVARCHAR(255) NULL, 
+                [WorkflowId] NVARCHAR(255) NULL,
+                [JobId] NVARCHAR(255) NULL,
+                [Dispatched] DATETIME NULL,
+                [HeaderBag] NVARCHAR(MAX) NULL,
+                [Body] NVARCHAR(MAX) NULL,
+                [Source] NVARCHAR(255) NULL,
+                [Type] NVARCHAR(255) NULL,
+                [DataSchema] NVARCHAR(255) NULL,
+                [Subject] NVARCHAR(255) NULL,
+                [TraceParent] NVARCHAR(255) NULL,
+                [TraceState] NVARCHAR(255) NULL,
+                [Baggage] NVARCHAR(MAX) NULL,
+                [DataRef] NVARCHAR(255) NULL,
+                [CausationId] NVARCHAR(255) NULL,
+                [SpecVersion] NVARCHAR(255) NULL
+                PRIMARY KEY ( [Id] )
             );
-        ";
+            """;
 
-        public static string GetDDL(string tableName)
+        private const string BinaryOutboxDdl =
+            """
+            CREATE TABLE {0}
+            (
+                [Id] [BIGINT] NOT NULL IDENTITY,
+                [MessageId] NVARCHAR(255) NOT NULL,
+                [Topic] NVARCHAR(255) NULL,
+                [MessageType] NVARCHAR(32) NULL,
+                [Timestamp] DATETIME NULL,
+                [CorrelationId] NVARCHAR(255) NULL,
+                [ReplyTo] NVARCHAR(255) NULL,
+                [ContentType] NVARCHAR(128) NULL,  
+                [PartitionKey] NVARCHAR(255) NULL,
+                [WorkflowId] NVARCHAR(255) NULL,
+                [JobId] NVARCHAR(255) NULL,
+                [Dispatched] DATETIME NULL,
+                [HeaderBag] NVARCHAR(MAX) NULL,
+                [Body] VARBINARY(MAX) NULL,
+                [Source] NVARCHAR(255) NULL,
+                [Type] NVARCHAR(255) NULL,
+                [DataSchema] NVARCHAR(255) NULL,
+                [Subject] NVARCHAR(255) NULL,
+                [TraceParent] NVARCHAR(255) NULL,
+                [TraceState] NVARCHAR(255) NULL,
+                [Baggage] NVARCHAR(MAX) NULL,
+                [DataRef] NVARCHAR(255) NULL,
+                [CausationId] NVARCHAR(255) NULL,
+                [SpecVersion] NVARCHAR(255) NULL
+                PRIMARY KEY ( [Id] )
+            );
+            """;
+
+
+        private const string OUTBOX_EXISTS_SQL = @"
+        IF EXISTS (
+            SELECT 1
+            FROM sys.tables t
+            INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE t.name = '{0}' AND s.name = '{1}'
+        )
+            SELECT 1 AS TableExists;
+        ELSE
+            SELECT 0 AS TableExists;";
+        /// <summary>
+        /// Gets the DDL statements required to create an Outbox in MSSQL
+        /// </summary>
+        /// <param name="outboxTableName">The name of the Outbox table</param>
+        /// <param name="hasBinaryMessagePayload">Should the message body be stored as binary? Conversion of binary data to/from UTF-8 is lossy</param>
+        /// <param name="schemaName">
+        /// Optional MSSQL schema name. When non-null, the emitted DDL schema-qualifies the
+        /// table as <c>[schemaName].[outboxTableName]</c>; otherwise the table is emitted
+        /// unqualified and lands in the connection's default schema. Callers configuring
+        /// <see cref="IAmARelationalDatabaseConfiguration.SchemaName"/>
+        /// rely on the table actually landing in that schema, which the unqualified form
+        /// cannot guarantee.
+        /// </param>
+        /// <returns>The required DDL</returns>
+        /// <remarks>
+        /// MessageId is unique. Duplicate IDs are ignored on insert, including within a bulk insert,
+        /// while distinct messages in the same batch are stored. Existing messages are not overwritten.
+        /// </remarks>
+        public static string GetDDL(string outboxTableName, bool hasBinaryMessagePayload = false, string? schemaName = null)
         {
-            return string.Format(OutboxDdl, tableName);
+            if (string.IsNullOrEmpty(outboxTableName))
+                throw new ArgumentNullException(outboxTableName, $"You must provide a tablename for the OutBox table");
+
+            var qualifiedTable = schemaName is null
+                ? outboxTableName
+                : $"[{schemaName}].[{outboxTableName}]";
+            var ddl = string.Format(hasBinaryMessagePayload ? BinaryOutboxDdl : TextOutboxDdl, qualifiedTable);
+            var indexObjectId = schemaName is null
+                ? $"OBJECT_ID(N'[{outboxTableName}]')"
+                : $"OBJECT_ID(N'[{schemaName}].[{outboxTableName}]')";
+            return ddl + Environment.NewLine +
+                $"CREATE UNIQUE INDEX [UX_BrighterOutbox_MessageId] ON {qualifiedTable} ([MessageId]) " +
+                $"WITH (IGNORE_DUP_KEY = ON);{Environment.NewLine}" +
+                $"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name] = N'idx_{outboxTableName}_CausationId' " +
+                $"AND [object_id] = {indexObjectId}){Environment.NewLine}" +
+                $"    EXEC('CREATE INDEX [idx_{outboxTableName}_CausationId] ON {qualifiedTable} ([CausationId]);');";
+        }
+
+        /// <summary>
+        /// Get the SQL statements required to test for the existence of an Inbox in MSSQL, checking both schema and table name.
+        /// </summary>
+        /// <param name="inboxTableName">The name that was used for the Inbox table.</param>
+        /// <param name="schemaName">The schema that was used for the Inbox table.</param>
+        /// <returns>The required SQL.</returns>
+        public static string GetExistsQuery(string inboxTableName, string schemaName)
+        {
+            return string.Format(OUTBOX_EXISTS_SQL, inboxTableName, schemaName);
         }
     }
 }

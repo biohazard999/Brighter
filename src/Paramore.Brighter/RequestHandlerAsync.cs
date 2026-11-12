@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -27,7 +27,9 @@ using System.Linq;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
+using Paramore.Brighter.Observability;
 using Paramore.Brighter.Policies.Attributes;
 using Paramore.Brighter.Policies.Handlers;
 using Polly.CircuitBreaker;
@@ -48,22 +50,23 @@ namespace Paramore.Brighter
     /// within your derived class handler to forward the call to the next handler in the chain.
     /// </summary>
     /// <typeparam name="TRequest">The type of the t request.</typeparam>
-    public abstract class RequestHandlerAsync<TRequest> : IHandleRequestsAsync<TRequest> where TRequest : class, IRequest
+    /// <param name="instrumentationOptions">The <see cref="InstrumentationOptions"/> for how deep should the instrumentation go?</param>
+    public abstract partial class RequestHandlerAsync<TRequest>(InstrumentationOptions instrumentationOptions = InstrumentationOptions.All) : IHandleRequestsAsync<TRequest> where TRequest : class, IRequest
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<RequestHandlerAsync<TRequest>>);
+        private static readonly ILogger s_logger= ApplicationLogging.CreateLogger<RequestHandlerAsync<TRequest>>();
 
-        private IHandleRequestsAsync<TRequest> _successor;
+        private IHandleRequestsAsync<TRequest>? _successor;
 
         /// <summary>
         /// Gets or sets the context.
         /// </summary>
         /// <value>The context.</value>
-        public IRequestContext Context { get; set; }
+        public IRequestContext? Context { get; set; }
 
         /// <summary>
         /// If false we use a thread from the thread pool to run any continuation, if true we use the originating thread.
         /// Default to false unless you know that you need true, as you risk deadlocks with the originating thread if you Wait 
-        /// or access the Result or otherwise block. You may need the orginating thread if you need to access thread specific storage
+        /// or access the Result or otherwise block. You may need the originating thread if you need to access thread specific storage
         /// such as HTTPContext 
         /// </summary>
         /// 
@@ -81,6 +84,9 @@ namespace Paramore.Brighter
         /// <param name="successor">The successor.</param>
         public void SetSuccessor(IHandleRequestsAsync<TRequest> successor)
         {
+            if (this == successor)
+                return;
+
             _successor = successor;
         }
 
@@ -110,11 +116,16 @@ namespace Paramore.Brighter
         /// <param name="command">The command.</param>
         /// <param name="cancellationToken">A cancellation token (optional). Can be used to signal that the pipeline should end by the caller</param>
         /// <returns>Awaitable <see cref="Task{TRequest}"/>.</returns>
-        public virtual async Task<TRequest> HandleAsync(TRequest command, CancellationToken cancellationToken = default(CancellationToken))
+        public virtual async Task<TRequest> HandleAsync(TRequest command, CancellationToken cancellationToken = default)
         {
+            if (Context?.Span != null)
+            {
+                BrighterTracer.WriteHandlerEvent(Context.Span, this.GetType().Name, isAsync:true, instrumentationOptions, isSink:_successor == null);
+            }   
+            
             if (_successor != null)
             {
-                _logger.Value.DebugFormat("Passing request from {0} to {1}", Name, _successor.Name);
+                Log.PassingRequest(s_logger, Name, _successor.Name);
                 return await _successor.HandleAsync(command, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
             }
 
@@ -131,7 +142,7 @@ namespace Paramore.Brighter
         /// Steps that don't know how to handle should pass through.
         /// Useful alternatives for Fallback are to try via the cache.
         /// Note that a Fallback handler implementation should not catch exceptions in the <see cref="FallbackAsync"/> chain to avoid an infinite loop.
-        /// Call <see cref="Successor"/>.<see cref="HandleAsync"/> if having provided a Fallback you want the chain to return to the 'happy' path. Excerise caution here though
+        /// Call <see cref="Successor"/>.<see cref="HandleAsync"/> if having provided a Fallback you want the chain to return to the 'happy' path. Excercise caution here though
         /// as you do not know who generated the exception that caused the fallback chain.
         /// For this reason, the <see cref="FallbackPolicyHandler"/> puts the exception in the request context.
         /// When the <see cref="FallbackPolicyAttribute"/> is set on the <see cref="HandleAsync"/> method of a derived class
@@ -141,11 +152,16 @@ namespace Paramore.Brighter
         /// <param name="command">The command.</param>
         /// <param name="cancellationToken">A cancellation token (optional). Can be used to signal that the pipeline should end by the caller</param>
         /// <returns>Awaitable <see cref="Task{TRequest}"/>.</returns>
-        public virtual async Task<TRequest> FallbackAsync(TRequest command, CancellationToken cancellationToken = default(CancellationToken))
+        public virtual async Task<TRequest> FallbackAsync(TRequest command, CancellationToken cancellationToken = default)
         {
+            if (Context?.Span != null)
+            {
+                BrighterTracer.WriteHandlerEvent(Context.Span, $"{this.GetType().Name} Fallback", isAsync:true, instrumentationOptions, isSink:_successor == null);
+            }   
+            
             if (_successor != null)
             {
-                _logger.Value.DebugFormat("Falling back from {0} to {1}", Name, _successor.Name);
+                Log.FallingBack(s_logger, Name, _successor.Name);
                 return await _successor.FallbackAsync(command, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
             }
 
@@ -157,17 +173,19 @@ namespace Paramore.Brighter
         /// Initializes from attribute parameters.
         /// </summary>
         /// <param name="initializerList">The initializer list.</param>
-        public virtual void InitializeFromAttributeParams(params object[] initializerList) { }
+        public virtual void InitializeFromAttributeParams(params object?[] initializerList) { }
 
         internal MethodInfo FindHandlerMethod()
-        {
-            var methods = GetType().GetTypeInfo().GetMethods();
-            return methods
-                .Where(method => method.Name == nameof(HandleAsync))
-                .SingleOrDefault(method => method.GetParameters().Length == 2 
-                    && method.GetParameters()[0].ParameterType == typeof(TRequest)
-                    && method.GetParameters()[1].ParameterType == typeof(CancellationToken));
-        }
+            => HandlerMethodDiscovery.FindHandlerMethod(GetType(), typeof(TRequest));
 
+        private static partial class Log
+        {
+            [LoggerMessage(LogLevel.Debug, "Passing request from {HandlerName} to {NextHandler}")]
+            public static partial void PassingRequest(ILogger logger, HandlerName handlerName, HandlerName nextHandler);
+
+            [LoggerMessage(LogLevel.Debug, "Falling back from {HandlerName} to {NextHandler}")]
+            public static partial void FallingBack(ILogger logger, HandlerName handlerName, HandlerName nextHandler);
+        }
     }
 }
+

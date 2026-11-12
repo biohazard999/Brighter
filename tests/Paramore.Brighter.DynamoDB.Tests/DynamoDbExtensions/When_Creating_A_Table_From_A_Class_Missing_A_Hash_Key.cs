@@ -1,12 +1,12 @@
 using System;
 using Amazon.DynamoDBv2.DataModel;
-using Paramore.Brighter.DynamoDb.Extensions;
+using Paramore.Brighter.DynamoDb;
 using Paramore.Brighter.Outbox.DynamoDB;
 using Xunit;
 
 namespace Paramore.Brighter.DynamoDB.Tests.DynamoDbExtensions
 {
-    public class DynanmoDbMissingHashKeyTests 
+    public class DynanmoDbMissingHashKeyTests
     {
         [Fact]
         public void When_Creating_A_Table_From_A_Class_Missing_A_Hash_Key()
@@ -15,14 +15,11 @@ namespace Paramore.Brighter.DynamoDB.Tests.DynamoDbExtensions
             Assert.Throws<InvalidOperationException>(() =>
             {
                 var tableRequestFactory = new DynamoDbTableFactory();
-                tableRequestFactory.GenerateCreateTableMapper<DynamoDbEntity>(new DynamoDbCreateProvisionedThroughput());
+                tableRequestFactory.GenerateCreateTableRequest<DynamoDbEntity>(new DynamoDbCreateProvisionedThroughput());
             });
-            
         }
-        
-        
+
         [DynamoDBTable("DnyamoDbEntity")]
-        private class DynamoDbEntity{}
- 
+        private sealed class DynamoDbEntity;
     }
 }

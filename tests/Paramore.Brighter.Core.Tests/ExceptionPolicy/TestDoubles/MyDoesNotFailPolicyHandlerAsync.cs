@@ -29,7 +29,7 @@ using Paramore.Brighter.Policies.Attributes;
 
 namespace Paramore.Brighter.Core.Tests.ExceptionPolicy.TestDoubles
 {
-    internal class MyDoesNotFailPolicyHandlerAsync : RequestHandlerAsync<MyCommand>
+    internal sealed class MyDoesNotFailPolicyHandlerAsync : RequestHandlerAsync<MyCommand>
     {
         public static bool ReceivedCommand { get; set; }
 
@@ -39,7 +39,7 @@ namespace Paramore.Brighter.Core.Tests.ExceptionPolicy.TestDoubles
         }
 
         [UsePolicyAsync("MyDivideByZeroPolicy", 1)]
-        public override async Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default(CancellationToken))
+        public override async Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default)
         {
             ReceivedCommand = true;
             return await base.HandleAsync(command, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);

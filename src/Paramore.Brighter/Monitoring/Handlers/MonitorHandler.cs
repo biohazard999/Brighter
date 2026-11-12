@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2015 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -23,7 +23,9 @@ THE SOFTWARE. */
 #endregion
 
 using System;
-using Newtonsoft.Json;
+using System.Text.Json;
+using System.Transactions;
+using Paramore.Brighter.JsonConverters;
 using Paramore.Brighter.Monitoring.Configuration;
 using Paramore.Brighter.Monitoring.Events;
 
@@ -31,16 +33,17 @@ namespace Paramore.Brighter.Monitoring.Handlers
 {
     /// <summary>
     /// Class MonitorHandler.
-    /// The MonitorHandler raises an event via the Control Bus when we enter, exit, and if any exceptions are thrown, provided that monitoring has been enabled in the configuration.
+    /// The MonitorHandler raises an event via the Control Bus when we enter, exit, and if any exceptions are thrown,
+    /// provided that monitoring has been enabled in the configuration.
     /// </summary>
-    /// <typeparam name="T"></typeparam>
-    public class MonitorHandler<T> : RequestHandler<T> where T: class, IRequest
+    /// <typeparam name="TRequest"></typeparam>
+    public class MonitorHandler<TRequest> : RequestHandler<TRequest> where TRequest: class, IRequest
     {
         readonly IAmAControlBusSender _controlBusSender;
         private readonly bool _isMonitoringEnabled;
-        private string _handlerName;
-        private readonly string _instanceName;
-        private string _handlerFullAssemblyName;
+        private string? _handlerName;
+        private readonly string? _instanceName;
+        private string? _handlerFullAssemblyName;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="RequestHandler{TRequest}"/> class.
@@ -58,18 +61,18 @@ namespace Paramore.Brighter.Monitoring.Handlers
         /// Initializes from attribute parameters.
         /// </summary>
         /// <param name="initializerList">The initializer list.</param>
-        public override void InitializeFromAttributeParams(params object[] initializerList)
+        public override void InitializeFromAttributeParams(params object?[] initializerList)
         {
-            _handlerName = (string) initializerList[0];
-            _handlerFullAssemblyName = (string)initializerList[1];
+            _handlerName = (string?) initializerList[0];
+            _handlerFullAssemblyName = (string?)initializerList[1];
         }
 
         /// <summary>
         /// Handles the specified command.
         /// </summary>
-        /// <param name="command">The command.</param>
+        /// <param name="request">The command.</param>
         /// <returns>TRequest.</returns>
-        public override T Handle(T command)
+        public override TRequest Handle(TRequest request)
         {
             if (_isMonitoringEnabled)
             {
@@ -82,11 +85,12 @@ namespace Paramore.Brighter.Monitoring.Handlers
                             MonitorEventType.EnterHandler, 
                             _handlerName, 
                             _handlerFullAssemblyName,
-                            JsonConvert.SerializeObject(command), 
+                            JsonSerializer.Serialize(request, JsonSerialisationOptions.Options), 
                             timeBeforeHandle,
-                            0));
+                            0)
+                        );
 
-                    base.Handle(command);
+                    base.Handle(request);
 
                     var timeAfterHandle = DateTime.UtcNow;
                     _controlBusSender.Post(
@@ -95,11 +99,11 @@ namespace Paramore.Brighter.Monitoring.Handlers
                             MonitorEventType.ExitHandler, 
                             _handlerName,
                             _handlerFullAssemblyName,
-                            JsonConvert.SerializeObject(command), 
+                            JsonSerializer.Serialize(request, JsonSerialisationOptions.Options), 
                             timeAfterHandle,
-                            (timeAfterHandle-timeBeforeHandle).Milliseconds));
+                            Convert.ToInt32((timeAfterHandle-timeBeforeHandle).TotalMilliseconds)));
                         
-                    return command;
+                    return request;
                 }
                 catch (Exception e)
                 {
@@ -110,16 +114,16 @@ namespace Paramore.Brighter.Monitoring.Handlers
                             MonitorEventType.ExceptionThrown, 
                             _handlerName,
                             _handlerFullAssemblyName,
-                            JsonConvert.SerializeObject(command), 
+                            JsonSerializer.Serialize(request, JsonSerialisationOptions.Options), 
                             timeOnException,
-                            (timeOnException - timeBeforeHandle).Milliseconds,
+                            Convert.ToInt32((timeOnException - timeBeforeHandle).TotalMilliseconds),
                             e));
                     throw;
                 }
 
             }
 
-            return base.Handle(command);
+            return base.Handle(request);
         }
 
     }

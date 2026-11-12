@@ -3,7 +3,7 @@ using System.Threading.Tasks;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    class MyEventHandlerAsyncWithContinuation : RequestHandlerAsync<MyEvent>
+    sealed class MyEventHandlerAsyncWithContinuation : RequestHandlerAsync<MyEvent>
     {
         private static MyEvent s_receivedEvent;
 
@@ -16,7 +16,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
             s_receivedEvent = null;
         }
 
-        public override async Task<MyEvent> HandleAsync(MyEvent command, CancellationToken cancellationToken = default(CancellationToken))
+        public override async Task<MyEvent> HandleAsync(MyEvent command, CancellationToken cancellationToken = default)
         {
             MonitorValue = 0;
             WorkThreadId = 0;
@@ -31,13 +31,14 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
             WorkThreadId = Thread.CurrentThread.ManagedThreadId;
 
             LogEvent(command);
-            await Task.Delay(30, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
+            await Task.Delay(500, cancellationToken).ContinueWith(
+                (task =>
+                {
+                    MonitorValue = 2;
+                    ContinuationThreadId = Thread.CurrentThread.ManagedThreadId; 
+                }), cancellationToken);
 
-            //this will run on the continuation
-            MonitorValue = 2;
-            ContinuationThreadId = Thread.CurrentThread.ManagedThreadId;
-
-            return await base.HandleAsync(command, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
+            return await base.HandleAsync(command, cancellationToken);
         }
 
         private static void LogEvent(MyEvent @event)

@@ -2,22 +2,22 @@ using System.Collections.Generic;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.DataModel;
 using Amazon.DynamoDBv2.Model;
-using Paramore.Brighter.DynamoDb.Extensions;
+using Paramore.Brighter.DynamoDb;
 using Paramore.Brighter.Outbox.DynamoDB;
 using Xunit;
 
 namespace Paramore.Brighter.DynamoDB.Tests.DynamoDbExtensions
 {
-    public class DynamoDbFactoryOtherTableAttributesTests 
+    public class DynamoDbFactoryOtherTableAttributesTests
     {
         [Fact]
         public void When_Creating_A_Table_With_Admin_Attributes()
         {
             //arrange
             var tableRequestFactory = new DynamoDbTableFactory();
-            
+
             //act
-            CreateTableRequest tableRequest = tableRequestFactory.GenerateCreateTableMapper<DynamoDbEntity>(
+            CreateTableRequest tableRequest = tableRequestFactory.GenerateCreateTableRequest<DynamoDbEntity>(
                 new DynamoDbCreateProvisionedThroughput(),
                 billingMode: new BillingMode(BillingMode.PAY_PER_REQUEST),
                 sseSpecification: new SSESpecification {Enabled = false},
@@ -31,12 +31,12 @@ namespace Paramore.Brighter.DynamoDB.Tests.DynamoDbExtensions
             Assert.Contains(tableRequest.Tags, tag => tag.Key == "beta" && tag.Value == "True");
             Assert.Contains(tableRequest.Tags, tag => tag.Key == "paramore" && tag.Value == "Brighter");
         }
-    
+
         [DynamoDBTable("MyEntity")]
-        private class DynamoDbEntity
+        private sealed class DynamoDbEntity
         {
             [DynamoDBHashKey]
             public string Id { get; set; }
         }
- }
+    }
 }

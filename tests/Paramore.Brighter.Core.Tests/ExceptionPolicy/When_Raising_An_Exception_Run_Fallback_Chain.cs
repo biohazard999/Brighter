@@ -22,6 +22,7 @@ THE SOFTWARE. */
 
 #endregion
 
+using System;
 using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
 using Paramore.Brighter.Core.Tests.ExceptionPolicy.TestDoubles;
 using Xunit;
@@ -48,12 +49,14 @@ namespace Paramore.Brighter.Core.Tests.ExceptionPolicy
             container.AddSingleton<MyFailsWithFallbackMultipleHandlers>();
             container.AddSingleton<FallbackPolicyHandler<MyCommand>>();
             container.AddSingleton<RequestLoggingHandler<MyCommand>>();
+            container.AddSingleton<IBrighterOptions>(new BrighterOptions {HandlerLifetime = ServiceLifetime.Transient});
+             
 
             var handlerFactory = new ServiceProviderHandlerFactory(container.BuildServiceProvider());
             
             MyFailsWithFallbackMultipleHandlers.ReceivedCommand = false;
 
-            _commandProcessor = new CommandProcessor(registry, (IAmAHandlerFactory)handlerFactory, new InMemoryRequestContextFactory(), policyRegistry);
+            _commandProcessor = new CommandProcessor(registry, handlerFactory, new InMemoryRequestContextFactory(), policyRegistry, new ResiliencePipelineRegistry<string>(), new InMemorySchedulerFactory());
         }
 
         [Fact]
@@ -65,7 +68,7 @@ namespace Paramore.Brighter.Core.Tests.ExceptionPolicy
             MyFailsWithFallbackMultipleHandlers.ShouldReceive(_myCommand);
             //_should_call_the_fallback_chain
             MyFailsWithFallbackMultipleHandlers.ShouldFallback(_myCommand);
-            //_should_set_the_exeception_into_context
+            //_should_set_the_exception_into_context
             MyFailsWithFallbackMultipleHandlers.ShouldSetException(_myCommand);
         }
     }

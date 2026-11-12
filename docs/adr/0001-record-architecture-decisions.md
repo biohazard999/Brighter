@@ -1,0 +1,31 @@
+---
+id: 0001-record-architecture-decisions
+title: "Record architecture decisions"
+status: Accepted
+author:
+  - "Brighter Team"
+created: 2019-08-01
+summary: "Brighter will use Architecture Decision Records (as described by Michael Nygard) to record the architectural decisions made on the project, enabling lightweight, version-controlled documentation of significant design choices."
+tags:
+  - "meta"
+---
+
+# 1. Record architecture decisions
+
+Date: 2019-08-01
+
+## Status
+
+Accepted
+
+## Context
+
+We need to record the architectural decisions made on this project.
+
+## Decision
+
+We will use Architecture Decision Records, as [described by Michael Nygard](http://thinkrelevance.com/blog/2011/11/15/documenting-architecture-decisions).
+
+## Consequences
+
+See Michael Nygard's article, linked above. For a lightweight ADR toolset, see Nat Pryce's [adr-tools](https://github.com/npryce/adr-tools).

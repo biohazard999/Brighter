@@ -1,4 +1,5 @@
-﻿#region Licence
+#region Licence
+
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -22,8 +23,10 @@ THE SOFTWARE. */
 
 #endregion
 
+using System.Collections.Generic;
+using Paramore.Brighter.Extensions;
 using Paramore.Brighter.FeatureSwitch;
-using Polly.Fallback;
+using Paramore.Brighter.Observability;
 using Polly.Registry;
 
 namespace Paramore.Brighter
@@ -41,22 +44,30 @@ namespace Paramore.Brighter
     ///     </item>
     ///     <item>
     ///         <description>
-    ///             A <see cref="IPolicyRegistry{TKey}"/> containing a list of policies that you want to be accessible to the <see cref="CommandProcessor"/>. You can use
-    ///             <see cref="PolicyRegistry"/> to provide the <see cref="IPolicyRegistry{TKey}"/>. Policies are expected to be Polly <see cref="!:https://github.com/michael-wolfenden/Polly"/> 
-    ///             <see cref="Paramore.Brighter.Policies"/> references.
-    ///             If you do not need any policies around quality of service (QoS) concerns - you do not have Work Queues and/or do not intend to use Polly Policies for 
-    ///             QoS concerns - you can use <see cref="DefaultPolicy"/> to indicate you do not need them or just want a simple retry.
+    ///             Resilience for quality of service (QoS) concerns, supplied through <see cref="INeedResilience.Resilience"/> with a Polly
+    ///             <see cref="ResiliencePipelineRegistry{TKey}"/> — and optionally an <see cref="IPolicyRegistry{TKey}"/>. The registry must contain
+    ///             <see cref="CommandProcessor.OutboxProducer"/>; <see cref="ResiliencePipelineRegistryExtensions.AddBrighterDefault"/> supplies it, along with
+    ///             <see cref="CommandProcessor.RequestReply"/> which <see cref="CommandProcessor.Call{T,TResponse}"/> needs.
+    ///             If you do not need to configure any of this, use <see cref="INeedResilience.DefaultResilience"/>, which applies Brighter's defaults
+    ///             including <see cref="DefaultPolicy"/>.
     ///         </description>
     ///      </item>
     ///     <item>
     ///         <description>
-    ///             A <see cref="MessagingConfiguration"/> describing how you want to configure Task Queues for the <see cref="CommandProcessor"/>. We store messages in a <see cref="IAmAnOutbox{T}"/>
+    ///             A <see cref="ProducersConfiguration"/> describing how you want to configure Task Queues for the <see cref="CommandProcessor"/>. We store messages in a <see cref="IAmAnOutbox"/>
     ///             for later replay (in case we need to compensate by trying a message again). We send messages to a Task Queue via a <see cref="IAmAMessageProducer"/> and we  want to know how
     ///             to map the <see cref="IRequest"/> (<see cref="Command"/> or <see cref="Event"/>) to a <see cref="Message"/> using a <see cref="IAmAMessageMapper"/> using 
     ///             an <see cref="IAmAMessageMapperRegistry"/>. You can use the default <see cref="MessageMapperRegistry"/> to register the association. You need to 
     ///             provide a <see cref="IAmAMessageMapperFactory"/> so that we can create instances of your  <see cref="IAmAMessageMapper"/>. You need to provide a <see cref="IAmAMessageMapperFactory"/>
     ///             when using <see cref="MessageMapperRegistry"/> so that we can create instances of your mapper. 
-    ///             If you don't want to use Task Queues i.e. you are just using a synchronous Command Dispatcher approach, then use the <see cref="NoTaskQueues"/> method to indicate your intent
+    ///             If you don't want to use Task Queues i.e. you are just using a synchronous Command Dispatcher approach, then use the <see cref="NoExternalBus"/> method to indicate your intent
+    ///         </description>
+    ///     </item>
+    ///     <item>
+    ///         <description>
+    ///             A <see cref="INeedInstrumentation"/> describing how we want to instrument the command processor for Open Telemetry support. We need to provide a <see cref="IAmABrighterTracer"/> to
+    ///             provide telemetry and a <see cref="InstrumentationOptions"/> to describe how noisy we want the telemetry to be. If you do not want to use Open Telemetry, use the <see cref="NoInstrumentation"/>
+    ///             method to indicate your intent.
     ///         </description>
     ///     </item>
     ///     <item>
@@ -68,140 +79,196 @@ namespace Paramore.Brighter
     ///     </item>
     /// </list> 
     /// </summary>
-    public class CommandProcessorBuilder : INeedAHandlers, INeedPolicy, INeedMessaging, INeedARequestContext, IAmACommandProcessorBuilder
+    public class CommandProcessorBuilder : INeedAHandlers,
+        INeedResilience,
+        INeedMessaging,
+        INeedInstrumentation,
+        INeedARequestContext,
+        INeedARequestSchedulerFactory,
+        IAmACommandProcessorBuilder
     {
-        private IAmAnOutbox<Message> _outbox;
-        private IAmAnOutboxAsync<Message> _asyncOutbox;
-        private IAmAMessageProducer _messagingGateway;
-        private IAmAMessageProducerAsync _asyncMessagingGateway;
-        private IAmAMessageMapperRegistry _messageMapperRegistry;
-        private IAmARequestContextFactory _requestContextFactory;
-        private IAmASubscriberRegistry _registry;
-        private IAmAHandlerFactory _handlerFactory;
-        private IAmAHandlerFactoryAsync _asyncHandlerFactory;
-        private IPolicyRegistry<string> _policyRegistry;
-        private IAmAFeatureSwitchRegistry _featureSwitchRegistry;
-        private IAmAChannelFactory _responseChannelFactory;
-        private int _outboxWriteTimeout;
-        private int _messagingGatewaySendTimeout;
-        private bool _useTaskQueues = false;
-        private bool _useRequestReplyQueues = false;
+        private IAmARequestContextFactory? _requestContextFactory;
+        private IAmASubscriberRegistry? _registry;
+        private IAmAHandlerFactory? _handlerFactory;
+        private IPolicyRegistry<string>? _policyRegistry;
+        private ResiliencePipelineRegistry<string>? _resiliencePipelineRegistry;
+
+        private IAmAFeatureSwitchRegistry? _featureSwitchRegistry;
+        private IAmAnOutboxProducerMediator? _bus;
+        private System.Type? _transactionType = null;
+        private bool _useRequestReplyQueues;
+        private IAmAChannelFactory? _responseChannelFactory;
+        private IEnumerable<Subscription>? _replySubscriptions;
+        private InboxConfiguration? _inboxConfiguration;
+        private InstrumentationOptions? _instrumetationOptions;
+        private IAmABrighterTracer? _tracer;
+        private IAmARequestSchedulerFactory _requestSchedulerFactory = null!;
 
         private CommandProcessorBuilder()
         {
-            DefaultPolicy();
+            DefaultResilience();
         }
 
         /// <summary>
         /// Begins the Fluent Interface
         /// </summary>
         /// <returns>INeedAHandlers.</returns>
-        public static INeedAHandlers With()
+        public static INeedAHandlers StartNew()
         {
             return new CommandProcessorBuilder();
+        }
+
+        /// <summary>
+        /// Begins the fluent interface with a global inbox configuration.
+        /// </summary>
+        /// <remarks>
+        /// Used with <see cref="NoExternalBus"/>. Calling <see cref="ExternalBus"/> replaces this configuration
+        /// with that method's inbox configuration, including when its argument is omitted or null.
+        /// </remarks>
+        /// <param name="inboxConfiguration">The global inbox configuration, or <see langword="null"/> for no global inbox.</param>
+        /// <returns>An <see cref="INeedAHandlers"/> to configure the handlers.</returns>
+        public static INeedAHandlers StartNew(InboxConfiguration? inboxConfiguration)
+        {
+            return new CommandProcessorBuilder { _inboxConfiguration = inboxConfiguration };
         }
 
         /// <summary>
         /// Supplies the specified handler configuration, so that we can register subscribers and the handler factory used to create instances of them
         /// </summary>
         /// <param name="handlerConfiguration">The handler configuration.</param>
-        /// <returns>INeedPolicy.</returns>
-        public INeedPolicy Handlers(HandlerConfiguration handlerConfiguration)
+        /// <returns>INeedResilience.</returns>
+        public INeedResilience Handlers(HandlerConfiguration handlerConfiguration)
         {
             _registry = handlerConfiguration.SubscriberRegistry;
             _handlerFactory = handlerConfiguration.HandlerFactory;
-            _asyncHandlerFactory = handlerConfiguration.AsyncHandlerFactory;
             return this;
         }
 
-        /// <summary>
-        /// Supplies the specified the policy registry, so we can use policies for Task Queues or in user-defined request handlers such as ExceptionHandler
-        /// that provide quality of service concerns
-        /// </summary>
-        /// <param name="thePolicyRegistry">The policy registry.</param>
-        /// <returns>INeedLogging.</returns>
-        /// <exception cref="ConfigurationException">The policy registry is missing the CommandProcessor.RETRYPOLICY policy which is required</exception>
-        /// <exception cref="ConfigurationException">The policy registry is missing the CommandProcessor.CIRCUITBREAKER policy which is required</exception>
-        public INeedMessaging Policies(IPolicyRegistry<string> thePolicyRegistry)
-        {
-            if (!thePolicyRegistry.ContainsKey(CommandProcessor.RETRYPOLICY))
-                throw new ConfigurationException("The policy registry is missing the CommandProcessor.RETRYPOLICY policy which is required");
-                
-            if (!thePolicyRegistry.ContainsKey(CommandProcessor.CIRCUITBREAKER))
-                throw new ConfigurationException("The policy registry is missing the CommandProcessor.CIRCUITBREAKER policy which is required");
-            
-            _policyRegistry = thePolicyRegistry;
-            return this;
-        }
-
-        /// <summary>
-        /// Use this if you do not require a policy and only want to retry once(i.e. No Tasks Queues or QoS needs).
-        /// </summary>
-        /// <returns>INeedLogging.</returns>
-        public INeedMessaging DefaultPolicy()
-        {
-            _policyRegistry = new DefaultPolicy();
-            return this;
-        }
-
-        /// <summary>
-        /// The <see cref="CommandProcessor"/> wants to support <see cref="CommandProcessor.Post{T}(T)"/> or <see cref="CommandProcessor.Repost"/> using Task Queues.
-        /// You need to provide a policy to specify how QoS issues, specifically <see cref="CommandProcessor.RETRYPOLICY "/> or <see cref="CommandProcessor.CIRCUITBREAKER "/> 
-        /// are handled by adding appropriate <see cref="Policies"/> when choosing this option.
-        /// 
-        /// </summary>
-        /// <param name="configuration">The Task Queues configuration.</param>
-        /// <returns>INeedARequestContext.</returns>
-        public INeedARequestContext TaskQueues(MessagingConfiguration configuration)
-        {
-            _useTaskQueues = true;
-            _outbox = configuration.OutBox;
-            _asyncOutbox = configuration.OutboxAsync;
-            _messagingGateway = configuration.MessageProducer;
-            _asyncMessagingGateway = configuration.MessageProducerAsync;
-            _messageMapperRegistry = configuration.MessageMapperRegistry;
-            _outboxWriteTimeout = configuration.OutboxWriteTimeout;
-            _messagingGatewaySendTimeout = configuration.MessagingGatewaySendTimeout;
-            return this;
-        }
-
-        /// <summary>
-        /// Use to indicate that you are not using Task Queues.
-        /// </summary>
-        /// <returns>INeedARequestContext.</returns>
-        public INeedARequestContext NoTaskQueues()
-        {
-            return this;
-        }
-
-        /// <summary>
-        /// The <see cref="CommandProcessor"/> wants to support <see cref="CommandProcessor.Call{T}(T)"/> using RPC between client and server 
-        /// </summary>
-        /// <param name="messagingConfiguration"></param>
-        /// <returns></returns>
-        public INeedARequestContext RequestReplyQueues(MessagingConfiguration configuration)
-        {
-            _useRequestReplyQueues = true;
-            _outbox = configuration.OutBox;
-            _asyncOutbox = configuration.OutboxAsync;
-            _messagingGateway = configuration.MessageProducer;
-            _asyncMessagingGateway = configuration.MessageProducerAsync;
-            _messageMapperRegistry = configuration.MessageMapperRegistry;
-            _outboxWriteTimeout = configuration.OutboxWriteTimeout;
-            _messagingGatewaySendTimeout = configuration.MessagingGatewaySendTimeout;
-            _responseChannelFactory = configuration.ResponseChannelFactory;
-             
-            return this;
-        }
-        
         /// <summary>
         /// Supplies the specified feature switching configuration, so we can use feature switches on user-defined request handlers
         /// </summary>
         /// <param name="featureSwitchRegistry">The feature switch config provider</param>
-        /// <returns>INeedARequestContext</returns>
-        public INeedARequestContext ConfigureFeatureSwitches(IAmAFeatureSwitchRegistry featureSwitchRegistry)
+        /// <returns>INeedAHandlers.</returns>
+        public INeedAHandlers ConfigureFeatureSwitches(IAmAFeatureSwitchRegistry featureSwitchRegistry)
         {
             _featureSwitchRegistry = featureSwitchRegistry;
+            return this;
+        }
+
+        /// <inheritdoc />
+        public INeedMessaging Resilience(ResiliencePipelineRegistry<string> resiliencePipelineRegistry, IPolicyRegistry<string>? policyRegistry = null)
+        {
+            if (!resiliencePipelineRegistry.TryGetPipeline(CommandProcessor.OutboxProducer, out _))
+            {
+                throw new ConfigurationException("The resilience pipeline registry is missing the CommandProcessor.OutboxProducer resilience pipeline which is required");
+            }
+            
+            policyRegistry ??= new DefaultPolicy();
+#pragma warning disable CS0618 // Type or member is obsolete
+            if (!policyRegistry.ContainsKey(CommandProcessor.RETRYPOLICY))
+            {
+                throw new ConfigurationException("The policy registry is missing the CommandProcessor.RETRYPOLICY policy which is required");
+            }
+
+            if (!policyRegistry.ContainsKey(CommandProcessor.CIRCUITBREAKER))
+            {
+                throw new ConfigurationException("The policy registry is missing the CommandProcessor.CIRCUITBREAKER policy which is required");
+            }
+#pragma warning restore CS0618 // Type or member is obsolete
+
+            _resiliencePipelineRegistry = resiliencePipelineRegistry;
+            _policyRegistry = policyRegistry;
+            return this;
+        }
+
+        
+        /// <inheritdoc />
+        public INeedMessaging DefaultResilience()
+        {
+            _policyRegistry = new DefaultPolicy();
+            _resiliencePipelineRegistry = new ResiliencePipelineRegistry<string>().AddBrighterDefault();
+            return this;
+        }
+
+        /// <summary>
+        /// The <see cref="CommandProcessor"/> wants to support <see cref="CommandProcessor.Post{TRequest}"/> or <see cref="CommandProcessor.ClearOutbox"/> using an external bus.
+        /// You need to provide a resilience pipeline registered under <see cref="CommandProcessor.OutboxProducer"/>, which is what
+        /// <see cref="Resilience"/> validates and <see cref="DefaultResilience"/> supplies, to specify how QoS issues are handled when choosing this option.
+        /// </summary>
+        /// <param name="busType">The type of Bus: In-memory, Db, or RPC</param>
+        /// <param name="bus">The service bus that we need to use to send messages externally</param>
+        /// <param name="transactionType">The transaction type for the provider that provides access to transactions when writing to the outbox. Null if no outbox is configured.</param>
+        /// <param name="responseChannelFactory">A factory for channels used to handle RPC responses</param>
+        /// <param name="subscriptions">If we use a request reply queue how do we subscribe to replies</param>
+        /// <param name="inboxConfiguration">What inbox do we use for request-reply</param>
+        /// <returns></returns>
+        public INeedInstrumentation ExternalBus(
+            ExternalBusType busType,
+            IAmAnOutboxProducerMediator bus,
+            System.Type? transactionType = null,
+            IAmAChannelFactory? responseChannelFactory = null,
+            IEnumerable<Subscription>? subscriptions = null,
+            InboxConfiguration? inboxConfiguration = null)
+        {
+            _inboxConfiguration = inboxConfiguration;
+
+            switch (busType)
+            {
+                case ExternalBusType.None:
+                    break;
+                case ExternalBusType.FireAndForget:
+                    _bus = bus;
+                    _transactionType = transactionType;   
+                    break;
+                case ExternalBusType.RPC:
+                    _bus = bus;
+                    _transactionType = transactionType;
+                    _useRequestReplyQueues = true;
+                    _replySubscriptions = subscriptions;
+                    _responseChannelFactory = responseChannelFactory;
+                    break;
+                default:
+                    throw new ConfigurationException("Bus type not supported");
+            }
+
+            return this;
+        }
+
+        /// <summary>
+        /// Use to indicate that this Command Processor does not send messages out of process.
+        /// </summary>
+        /// <returns>INeedInstrumentation.</returns>
+        public INeedInstrumentation NoExternalBus()
+        {
+            return this;
+        }
+
+        /// <summary>
+        /// Sets the InstrumentationOptions for the CommandProcessor
+        /// InstrumentationOptions.None - no telemetry
+        /// InstrumentationOptions.RequestInformation - id  and type of request
+        /// InstrumentationOptions.RequestBody -  body of the request
+        /// InstrumentationOptions.RequestContext - what is the context of the request
+        /// InstrumentationOptions.All - all of the above
+        /// </summary>
+        /// <param name="tracer">What is the <see cref="BrighterTracer"/> that we will use to instrument the Command Processor</param>
+        /// <param name="instrumentationOptions">A <see cref="InstrumentationOptions"/> that tells us how detailed the instrumentation should be</param>
+        /// <returns></returns>
+        public INeedARequestContext ConfigureInstrumentation(IAmABrighterTracer? tracer,
+            InstrumentationOptions instrumentationOptions)
+        {
+            _tracer = tracer;
+            _instrumetationOptions = instrumentationOptions;
+            return this;
+        }
+
+        /// <summary>
+        /// We do not intend to instrument the CommandProcessor
+        /// </summary>
+        /// <returns></returns>
+        public INeedARequestContext NoInstrumentation()
+        {
+            _instrumetationOptions = InstrumentationOptions.None;
             return this;
         }
 
@@ -210,10 +277,17 @@ namespace Paramore.Brighter
         /// provide <see cref="InMemoryRequestContextFactory"/>.
         /// </summary>
         /// <param name="requestContextFactory">The request context factory.</param>
-        /// <returns>IAmACommandProcessorBuilder.</returns>
-        public IAmACommandProcessorBuilder RequestContextFactory(IAmARequestContextFactory requestContextFactory)
+        /// <returns>INeedARequestSchedulerFactory.</returns>
+        public INeedARequestSchedulerFactory RequestContextFactory(IAmARequestContextFactory requestContextFactory)
         {
             _requestContextFactory = requestContextFactory;
+            return this;
+        }
+
+        /// <inheritdoc />
+        public IAmACommandProcessorBuilder RequestSchedulerFactory(IAmARequestSchedulerFactory messageSchedulerFactory)
+        {
+            _requestSchedulerFactory = messageSchedulerFactory;
             return this;
         }
 
@@ -223,54 +297,80 @@ namespace Paramore.Brighter
         /// <returns>CommandProcessor.</returns>
         public CommandProcessor Build()
         {
-            if (!(_useTaskQueues || _useRequestReplyQueues))
+            if (_registry == null)
+                throw new ConfigurationException(
+                    "A SubscriberRegistry must be provided to construct a command processor");
+            if (_handlerFactory == null)
+                throw new ConfigurationException(
+                    "A HandlerFactory must be provided to construct a command processor");
+            if (_requestContextFactory == null)
+                throw new ConfigurationException(
+                    "A RequestContextFactory must be provided to construct a command processor");
+            if (_policyRegistry == null)
+                throw new ConfigurationException(
+                    "A PolicyRegistry must be provided to construct a command processor");
+            if (_resiliencePipelineRegistry == null)
+                throw new ConfigurationException(
+                    "A ResiliencePipelineRegistry must be provided to construct a command processor");
+            if (_instrumetationOptions == null)
+                throw new ConfigurationException(
+                    "InstrumentationOptions must be provided to construct a command processor");
+
+            if (_bus == null)
             {
-                return new CommandProcessor(
-                    
-                    subscriberRegistry: _registry,
+                return new CommandProcessor(subscriberRegistry: _registry, 
                     handlerFactory: _handlerFactory,
-                    asyncHandlerFactory: _asyncHandlerFactory,
-                    requestContextFactory: _requestContextFactory,
+                    requestContextFactory: _requestContextFactory, 
                     policyRegistry: _policyRegistry,
-                    featureSwitchRegistry: _featureSwitchRegistry);
+                    resilienceResiliencePipelineRegistry: _resiliencePipelineRegistry,
+                    featureSwitchRegistry: _featureSwitchRegistry,
+                    inboxConfiguration: _inboxConfiguration,
+                    tracer: _tracer,
+                    instrumentationOptions: _instrumetationOptions.Value,
+                    requestSchedulerFactory: _requestSchedulerFactory);
             }
-            else if (_useTaskQueues)
-            {
+
+            if (!_useRequestReplyQueues)
                 return new CommandProcessor(
                     subscriberRegistry: _registry,
                     handlerFactory: _handlerFactory,
-                    asyncHandlerFactory: _asyncHandlerFactory,
                     requestContextFactory: _requestContextFactory,
                     policyRegistry: _policyRegistry,
-                    mapperRegistry: _messageMapperRegistry,
-                    outBox: _outbox,
-                    asyncOutbox: _asyncOutbox,
-                    messageProducer: _messagingGateway,
-                    asyncMessageProducer: _asyncMessagingGateway,
-                    outboxTimeout: _outboxWriteTimeout,
-                    featureSwitchRegistry: _featureSwitchRegistry
+                    resilienceResiliencePipelineRegistry: _resiliencePipelineRegistry,
+                    bus: _bus,
+                    transactionType: _transactionType,
+                    featureSwitchRegistry: _featureSwitchRegistry, 
+                    inboxConfiguration: _inboxConfiguration,
+                    tracer: _tracer,
+                    instrumentationOptions: _instrumetationOptions.Value,
+                    requestSchedulerFactory: _requestSchedulerFactory
                 );
-            }
-            else if (_useRequestReplyQueues)
-            {
-                 return new CommandProcessor(
+
+            if (_useRequestReplyQueues)
+                return new CommandProcessor(
                     subscriberRegistry: _registry,
                     handlerFactory: _handlerFactory,
                     requestContextFactory: _requestContextFactory,
                     policyRegistry: _policyRegistry,
-                    mapperRegistry: _messageMapperRegistry,
-                    messageProducer: _messagingGateway,
-                    responseChannelFactory: _responseChannelFactory 
-                    );
-            }
-            else
-            {
-                throw new ConfigurationException("Unknown Command Processor Type");
-            }
+                    resilienceResiliencePipelineRegistry: _resiliencePipelineRegistry,
+                    bus: _bus,
+                    transactionType: _transactionType,
+                    featureSwitchRegistry: _featureSwitchRegistry, 
+                    inboxConfiguration: _inboxConfiguration,
+                    replySubscriptions: _replySubscriptions,
+                    responseChannelFactory: _responseChannelFactory,
+                    tracer: _tracer,
+                    instrumentationOptions: _instrumetationOptions.Value,
+                    requestSchedulerFactory: _requestSchedulerFactory
+                );
+
+            throw new ConfigurationException(
+                "The configuration options chosen cannot be used to construct a command processor");
         }
     }
 
     #region Progressive interfaces
+
     /// <summary>
     /// Interface INeedAHandlers
     /// </summary>
@@ -280,29 +380,37 @@ namespace Paramore.Brighter
         /// Handlers the specified the registry.
         /// </summary>
         /// <param name="theRegistry">The registry.</param>
-        /// <returns>INeedPolicy.</returns>
-        INeedPolicy Handlers(HandlerConfiguration theRegistry);
-    }
+        /// <returns>INeedResilience.</returns>
+        INeedResilience Handlers(HandlerConfiguration theRegistry);
 
+        /// <summary>
+        /// Configure Feature Switches for the Handlers
+        /// </summary>
+        /// <param name="featureSwitchRegistry"></param>
+        /// <returns></returns>
+        INeedAHandlers ConfigureFeatureSwitches(IAmAFeatureSwitchRegistry featureSwitchRegistry);
+    }
     /// <summary>
-    /// Interface INeedPolicy
+    /// Defines an interface for configuring Polly resilience pipelines within Brighter.
     /// </summary>
-    public interface INeedPolicy
+    public interface INeedResilience
     {
         /// <summary>
-        /// Policies the specified policy registry.
+        /// Configures the Brighter messaging pipeline with a custom Polly <see cref="ResiliencePipelineRegistry{TKey}"/>.
         /// </summary>
-        /// <param name="policyRegistry">The policy registry.</param>
-        /// <returns>INeedLogging.</returns>
-        INeedMessaging Policies(IPolicyRegistry<string> policyRegistry);
-        /// <summary>
-        /// Knows the policy.
-        /// </summary>
-        /// <returns>INeedMessaging.</returns>
-        INeedMessaging DefaultPolicy();
-    }
+        /// <param name="resiliencePipelineRegistry">The Polly resilience pipeline registry to use for resilience policies.</param>
+        /// <param name="policyRegistry">An optional legacy Polly <see cref="IPolicyRegistry{TKey}"/> for backward compatibility. If not provided, only the new <see cref="ResiliencePipelineRegistry{TKey}"/> will be used.</param>
+        /// <returns>An <see cref="INeedMessaging"/> interface to continue configuring the messaging pipeline.</returns>
+        INeedMessaging Resilience(ResiliencePipelineRegistry<string> resiliencePipelineRegistry, IPolicyRegistry<string>? policyRegistry = null);
 
-  
+        /// <summary>
+        /// Configures the Brighter messaging pipeline with default Polly resilience policies.
+        /// This method typically sets up a basic retry and circuit breaker policy.
+        /// </summary>
+        /// <returns>An <see cref="INeedMessaging"/> interface to continue configuring the messaging pipeline.</returns>
+        INeedMessaging DefaultResilience();
+    }
+    
     /// <summary>
     /// Interface INeedMessaging
     /// Note that a single command builder does not support both task queues and rpc, using the builder
@@ -310,22 +418,56 @@ namespace Paramore.Brighter
     public interface INeedMessaging
     {
         /// <summary>
-        /// Configure a task queue to send messags out of process
+        /// The <see cref="CommandProcessor"/> wants to support <see cref="CommandProcessor.Post{TRequest}"/> or <see cref="CommandProcessor.ClearOutbox"/> using an external bus.
+        /// You need to provide a resilience pipeline registered under <see cref="CommandProcessor.OutboxProducer"/>, which is what
+        /// <see cref="INeedResilience.Resilience"/> validates and <see cref="INeedResilience.DefaultResilience"/> supplies, to specify how QoS issues are handled when choosing this option.
         /// </summary>
-        /// <param name="configuration">The configuration.</param>
-        /// <returns>INeedARequestContext.</returns>
-        INeedARequestContext TaskQueues(MessagingConfiguration configuration);
+        /// <param name="busType">The type of Bus: In-memory, Db, or RPC</param>
+        /// <param name="bus">The bus that we wish to use</param>
+        /// <param name="transactionType">The type of the transaction provider</param>
+        /// <param name="responseChannelFactory">If using RPC the factory for reply channels</param>
+        /// <param name="subscriptions">If using RPC, any reply subscriptions</param>
+        /// <param name="inboxConfiguration">What is the inbox configuration</param>
+        /// <returns></returns>
+        INeedInstrumentation ExternalBus(
+            ExternalBusType busType,
+            IAmAnOutboxProducerMediator bus,
+            System.Type? transactionType = null,
+            IAmAChannelFactory? responseChannelFactory = null,
+            IEnumerable<Subscription>? subscriptions = null,
+            InboxConfiguration? inboxConfiguration = null);
+
         /// <summary>
         /// We don't send messages out of process
         /// </summary>
-        /// <returns>INeedARequestContext.</returns>
-        INeedARequestContext NoTaskQueues();
-        /// <summary>
-        ///  We want to use RPC to send messages to another processs
-        /// </summary>
-        /// <param name="messagingConfiguration"></param>
-        INeedARequestContext RequestReplyQueues(MessagingConfiguration messagingConfiguration);
+        /// <returns>INeedInstrumentation.</returns>
+        INeedInstrumentation NoExternalBus();
     }
+
+    public interface INeedInstrumentation
+    {
+        /// <summary>
+        /// Sets the InstrumentationOptions for the CommandProcessor
+        /// </summary>
+        /// <param name="tracer">The tracer that we should use to create telemetry</param>
+        /// <param name="instrumentationOptions">What depth of instrumentation do we want.
+        /// InstrumentationOptions.None - no telemetry
+        /// InstrumentationOptions.RequestInformation - id  and type of request
+        /// InstrumentationOptions.RequestBody -  body of the request
+        /// InstrumentationOptions.RequestContext - what is the context of the request
+        /// InstrumentationOptions.All - all of the above
+        /// </param>
+        /// <returns>INeedARequestContext</returns>
+        INeedARequestContext ConfigureInstrumentation(IAmABrighterTracer? tracer,
+            InstrumentationOptions instrumentationOptions);
+
+        /// <summary>
+        /// We don't need instrumentation of the CommandProcessor
+        /// </summary>
+        /// <returns>INeedARequestContext</returns>
+        INeedARequestContext NoInstrumentation();
+    }
+
 
     /// <summary>
     /// Interface INeedARequestContext
@@ -333,20 +475,24 @@ namespace Paramore.Brighter
     public interface INeedARequestContext
     {
         /// <summary>
-        /// Requests the context factory.
+        /// Sets the context factory, which is used to create context for the pipeline.
         /// </summary>
         /// <param name="requestContextFactory">The request context factory.</param>
-        /// <returns>IAmACommandProcessorBuilder.</returns>
-        IAmACommandProcessorBuilder RequestContextFactory(IAmARequestContextFactory requestContextFactory);
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="featureSwitchRegistry"></param>
-        /// <returns></returns>
-        INeedARequestContext ConfigureFeatureSwitches(IAmAFeatureSwitchRegistry featureSwitchRegistry);
+        /// <returns>INeedARequestSchedulerFactory.</returns>
+        INeedARequestSchedulerFactory RequestContextFactory(IAmARequestContextFactory requestContextFactory);
     }
-    
+
+    public interface INeedARequestSchedulerFactory
+    {
+        /// <summary>
+        /// The <see cref="INeedARequestSchedulerFactory"/>.
+        /// </summary>
+        /// <param name="messageSchedulerFactory"></param>
+        /// <returns></returns>
+        IAmACommandProcessorBuilder RequestSchedulerFactory(IAmARequestSchedulerFactory messageSchedulerFactory);
+    }
+
+
     /// <summary>
     /// Interface IAmACommandProcessorBuilder
     /// </summary>
@@ -358,5 +504,6 @@ namespace Paramore.Brighter
         /// <returns>CommandProcessor.</returns>
         CommandProcessor Build();
     }
+
     #endregion
 }

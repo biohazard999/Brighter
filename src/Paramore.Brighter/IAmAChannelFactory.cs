@@ -22,13 +22,14 @@ THE SOFTWARE. */
 
 #endregion
 
-using System.Data;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Paramore.Brighter
 {
     /// <summary>
     /// Interface IAmAChannelFactory
-    /// Creates instances of <see cref="IAmAChannel"/>channels. We provide support for some Application Layer channels, and provide factories for those:
+    /// Creates instances of <see cref="IAmAChannelSync"/>channels. We provide support for some Application Layer channels, and provide factories for those:
     /// <list type="bullet">
     /// <item>AMQP</item>
     /// <item>RestML</item>
@@ -40,8 +41,24 @@ namespace Paramore.Brighter
         /// <summary>
         /// Creates the input channel.
         /// </summary>
-        /// <param name="connection">The parameters with which to create the channel for the transport</param>
-        /// <returns>IAmAnInputChannel.</returns>
-        IAmAChannel CreateChannel(Connection connection);
+        /// <param name="subscription">The parameters with which to create the channel for the transport</param>
+        /// <returns>An instance of <see cref="IAmAChannelSync"/>.</returns>
+        IAmAChannelSync CreateSyncChannel(Subscription subscription);
+        
+        /// <summary>
+        /// Creates the input channel.
+        /// </summary>
+        /// <param name="subscription">The parameters with which to create the channel for the transport</param>
+        /// <returns>An instance of <see cref="IAmAChannelAsync"/>.</returns>
+        IAmAChannelAsync CreateAsyncChannel(Subscription subscription);
+
+        /// <summary>
+        /// Creates the input channel.
+        /// </summary>
+        /// <param name="subscription">An SqsSubscription, the subscription parameter to create the channel with.</param>
+        /// <param name="ct">Cancel the ongoing operation</param>
+        /// <returns>An instance of <see cref="IAmAChannelAsync"/>.</returns>
+        /// <exception cref="ConfigurationException">Thrown when the subscription is incorrect</exception>
+        Task<IAmAChannelAsync> CreateAsyncChannelAsync(Subscription subscription, CancellationToken ct = default);
     }
 }

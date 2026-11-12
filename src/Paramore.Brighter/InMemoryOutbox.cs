@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 
 /* The MIT License (MIT)
 Copyright © 2015 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
@@ -29,48 +29,41 @@ THE SOFTWARE. */
 #endregion
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Transactions;
+using Paramore.Brighter.Extensions;
+using Paramore.Brighter.Observability;
 
 namespace Paramore.Brighter
 {
-   /// <summary>
+    /// <summary>
     /// An outbox entry - a message that we want to send
     /// </summary>
-    public class OutboxEntry : IHaveABoxWriteTime
+    public class OutboxEntry(Message message) : IHaveABoxWriteTime
     {
         /// <summary>
         /// When was the message added to the outbox
         /// </summary>
-        public DateTime WriteTime { get; set; }
-        
+        public DateTimeOffset WriteTime { get; set; }
+
         /// <summary>
         /// When was the message sent to the middleware
         /// </summary>
-        public DateTime TimeFlushed { get; set; }
-        
+        public DateTimeOffset TimeFlushed { get; set; }
+
         /// <summary>
         /// The message to be dispatched
         /// </summary>
-        public Message Message { get; set; }
+        public Message Message { get; } = message;
 
         /// <summary>
-        /// The Id of the message as a string key
+        /// The causation id linking this outbox entry to the inbox entry whose handling produced it. Null when
+        /// no causation id was supplied. Used to replay the messages of a causation on inbox duplicate detection.
         /// </summary>
-        public string Key => Message.Id.ToString();
-
-        /// <summary>
-        /// Turn a Guid into an inbox key - convenience wrapper
-        /// </summary>
-        /// <param name="id"></param>
-        /// <returns></returns>
-        public static string ConvertKey(Guid id)
-        {
-            return $"{id}";
-        }
+        public string? CausationId { get; set; }
     }
 
 
@@ -78,49 +71,137 @@ namespace Paramore.Brighter
     /// In order to provide reliability for messages sent over a <a href="http://parlab.eecs.berkeley.edu/wiki/_media/patterns/taskqueue.pdf">Task Queue</a> we
     /// store the message into a Outbox to allow later replay of those messages in the event of failure. We automatically copy any posted message into the store
     /// This class is intended to be thread-safe, so you can use one InMemoryOutbox across multiple performers. However, the state is not global i.e. static
-    /// so you can use multiple instances safely as well
+    /// so you can use multiple instances safely as well.
+    /// <para>
+    /// Note: <see cref="InMemoryBox{T}.EntryLimit"/> and expiry only govern <b>dispatched</b> messages
+    /// (those whose <see cref="OutboxEntry.TimeFlushed"/> has been set). Undispatched messages are never
+    /// removed by compaction or expiry, so a stalled or slow broker combined with a high write rate will
+    /// continue to grow memory until <see cref="IAmProducersConfiguration.MaxOutStandingMessages"/> trips.
+    /// </para>
     /// </summary>
-    public class InMemoryOutbox : InMemoryBox<OutboxEntry>, IAmAnOutbox<Message>, IAmAnOutboxAsync<Message>, IAmAnOutboxViewer<Message>
+#pragma warning disable CS0618
+    public class InMemoryOutbox : InMemoryBox<OutboxEntry>, IAmAnOutboxSync<Message, CommittableTransaction>, IAmAnOutboxAsync<Message, CommittableTransaction>, IAmACausationTrackingOutbox, IAmATopicCountingOutbox
+#pragma warning restore CS0618
     {
+        private const int MAX_TOPIC_AGE_DAYS = 365;
+
+        private readonly TimeProvider _timeProvider;
+        private readonly InstrumentationOptions _instrumentationOptions;
+
+        /// <summary>
+        /// In order to provide reliability for messages sent over a <a href="http://parlab.eecs.berkeley.edu/wiki/_media/patterns/taskqueue.pdf">Task Queue</a> we
+        /// store the message into a Outbox to allow later replay of those messages in the event of failure. We automatically copy any posted message into the store
+        /// This class is intended to be thread-safe, so you can use one InMemoryOutbox across multiple performers. However, the state is not global i.e. static
+        /// so you can use multiple instances safely as well
+        /// </summary>
+        /// <param name="timeProvider">Provides the time on demand</param>
+        /// <param name="instrumentationOptions">The verbosity with which we provide telemetry</param>
+        public InMemoryOutbox(TimeProvider timeProvider, InstrumentationOptions instrumentationOptions = InstrumentationOptions.All) 
+            : base(timeProvider)
+        {
+            _timeProvider = timeProvider;
+            _instrumentationOptions = instrumentationOptions;
+        }
+
         /// <summary>
         /// If false we the default thread synchronization context to run any continuation, if true we re-use the original synchronization context.
         /// Default to false unless you know that you need true, as you risk deadlocks with the originating thread if you Wait
-        /// or access the Result or otherwise block. You may need the orginating synchronization context if you need to access thread specific storage
+        /// or access the Result or otherwise block. You may need the originating synchronization context if you need to access thread specific storage
         /// such as HTTPContext
         /// </summary>
         /// <value><c>true</c> if [continue on captured context]; otherwise, <c>false</c>.</value>
         public bool ContinueOnCapturedContext { get; set; }
 
-       /// <summary>
+        /// <summary>
+        /// The Tracer that we want to use to capture telemetry
+        /// We inject this so that we can use the same tracer as the calling application
+        /// You do not need to set this property as we will set it when setting up the External Service Bus
+        /// </summary>
+        public IAmABrighterTracer? Tracer { private get; set; }
+
+        /// <summary>
         /// Adds the specified message
         /// </summary>
-        /// <param name="message"></param>
-        /// <param name="outBoxTimeout"></param>
-        public void Add(Message message, int outBoxTimeout = -1)
+        /// <param name="message">The message to add to the Outbox</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>
+        /// <param name="outBoxTimeout">How long in ms to wait; -1 forever (default -1)</param>
+        /// <param name="transactionProvider">This is not used for the In Memory Outbox.</param>
+        public void Add(
+            Message message,
+            RequestContext? requestContext,
+            int outBoxTimeout = -1,
+            IAmABoxTransactionProvider<CommittableTransaction>? transactionProvider = null
+        )
         {
-            ClearExpiredMessages();
-            EnforceCapacityLimit();
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.OutboxDbName, BoxDbOperation.Add, InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions
+            );
 
-            var key = OutboxEntry.ConvertKey(message.Id);
-            if (!_requests.ContainsKey(key))
+            try
             {
-                if (!_requests.TryAdd(key, new OutboxEntry {Message = message, WriteTime = DateTime.UtcNow}))
+                ClearExpiredMessages();
+                EnforceCapacityLimit();
+
+                if (!Requests.ContainsKey(message.Id.Value))
                 {
-                    throw new Exception($"Could not add message with Id: {message.Id} to outbox");
+                    if (!Requests.TryAdd(message.Id.Value,
+                            new OutboxEntry(message)
+                            {
+                                WriteTime = _timeProvider.GetUtcNow(),
+                                CausationId = ReadCausationId(requestContext)
+                            }))
+                    {
+                        throw new Exception($"Could not add message with Id: {message.Id} to outbox");
+                    }
                 }
+            }
+            finally
+            {
+                Tracer?.EndSpan(span);
+            }
+        }
+
+        /// <summary>
+        /// Adds the specified messages
+        /// </summary>
+        /// <param name="messages">The messages to add to the Outbox</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>
+        /// <param name="outBoxTimeout">How long to wait in ms; -1 = forever (default -1)</param>
+        /// <param name="transactionProvider">This is not used for the In Memory Outbox.</param>
+        public void Add(
+            IEnumerable<Message> messages,
+            RequestContext? requestContext,
+            int outBoxTimeout = -1,
+            IAmABoxTransactionProvider<CommittableTransaction>? transactionProvider = null
+        )
+        {
+            foreach (Message message in messages)
+            {
+                Add(message, requestContext, outBoxTimeout, transactionProvider);
             }
         }
 
         /// <summary>
         /// Adds the specified message
         /// </summary>
-        /// <param name="message"></param>
-        /// <param name="outBoxTimeout"></param>
+        /// <param name="message">The messages to add to the Outbox</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>
+        /// <param name="outBoxTimeout">How long to wait in ms; -1 = forever (default -1)</param>
+        /// <param name="transactionProvider">This is not used for the In Memory Outbox.</param>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
-        public Task AddAsync(Message message, int outBoxTimeout = -1, CancellationToken cancellationToken = default(CancellationToken))
+        public Task AddAsync(
+            Message message,
+            RequestContext? requestContext,
+            int outBoxTimeout = -1,
+            IAmABoxTransactionProvider<CommittableTransaction>? transactionProvider = null,
+            CancellationToken cancellationToken = default)
         {
-            var tcs = new TaskCompletionSource<object>();
+            //NOTE: As we call Add, don't create telemetry here
+
+            var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (cancellationToken.IsCancellationRequested)
             {
@@ -128,81 +209,219 @@ namespace Paramore.Brighter
                 return tcs.Task;
             }
 
-            Add(message, outBoxTimeout);
+            Add(message, requestContext);
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Adds the specified messages
+        /// </summary>
+        /// <param name="messages">The messages to add to the Outbox</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>       
+        /// <param name="outBoxTimeout">How long to wait in ms; -1 = forever (default -1)</param>
+        /// <param name="transactionProvider">This is not used for the In Memory Outbox.</param>
+        /// <param name="cancellationToken"></param>
+        /// <returns></returns>
+        public Task AddAsync(
+            IEnumerable<Message> messages,
+            RequestContext? requestContext,
+            int outBoxTimeout = -1,
+            IAmABoxTransactionProvider<CommittableTransaction>? transactionProvider = null,
+            CancellationToken cancellationToken = default)
+        {
+            //NOTE: As we call Add, don't create telemetry here
             
+            var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                tcs.SetCanceled();
+                return tcs.Task;
+            }
+
+            foreach (Message message in messages)
+            {
+                Add(message, requestContext, outBoxTimeout);
+            }
+
             tcs.SetResult(new object());
             return tcs.Task;
+        }
+
+        /// <summary>
+        /// Delete the specified messages from the Outbox
+        /// </summary>
+        /// <param name="messageIds">The messages to delete</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>           
+        /// <param name="args"></param>
+        public void Delete(Id[] messageIds, RequestContext? requestContext, Dictionary<string, object>? args = null)
+        {
+            foreach (var messageId in messageIds)
+            {
+                Delete(messageId);
+            }
+        }
+
+       /// <summary>
+        /// Deletes the messages from the Outbox
+        /// </summary>
+        /// <param name="messageIds">The ids of the messages to delete</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>           
+        /// <param name="args">Additional arguments needed to find a message, if any</param>
+        /// <param name="cancellationToken">A cancellation token for the ongoing asynchronous operation</param>
+        /// <returns></returns>
+        public Task DeleteAsync(
+            Id[] messageIds,
+            RequestContext requestContext,
+            Dictionary<string, object>? args,
+            CancellationToken cancellationToken = default)
+        {
+            Delete(messageIds, requestContext, args);
+            return Task.CompletedTask;
         }
 
         /// <summary>
         /// Get the messages that have been marked as flushed in the store
         /// </summary>
-        /// <param name="millisecondsDispatchedSince">How long ago would the message have been dispatched in milliseconds</param>
+        /// <param name="dispatchedSince">How long ago would the message have been dispatched</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>       
+        /// <param name="pageSize">How many messages in a page</param>
+        /// <param name="pageNumber">Which page of messages to get</param>
+        /// <param name="outBoxTimeout"></param>
+        /// <param name="args">Additional parameters required for search, if any</param>
+        /// <returns>A list of dispatched messages</returns>
+        public IEnumerable<Message> DispatchedMessages(
+            TimeSpan dispatchedSince,
+            RequestContext requestContext,
+            int pageSize = 100,
+            int pageNumber = 1,
+            int outBoxTimeout = -1,
+            Dictionary<string, object>? args = null)
+        {
+            ClearExpiredMessages();
+            
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.OutboxDbName, BoxDbOperation.DispatchedMessages, InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions
+            );
+
+            try
+            {
+                var now = _timeProvider.GetUtcNow();
+                var age = now - dispatchedSince;
+                return Requests.Values
+                    .Where(oe => (oe.TimeFlushed != DateTimeOffset.MinValue) && (oe.TimeFlushed <= age))
+                    .OrderBy(oe => oe.Message.Header.TimeStamp)
+                    .ThenBy(oe => oe.Message.Id.Value, StringComparer.Ordinal)
+                    .Skip((int)Math.Min(((long)pageNumber - 1) * pageSize, int.MaxValue))
+                    .Take(pageSize)
+                    .Select(oe => oe.Message).ToArray();
+            }
+            finally
+            {
+                Tracer?.EndSpan(span);
+            }        
+        }
+
+        /// <summary>
+        /// Get the messages that have been marked as flushed in the store
+        /// </summary>
+        /// <param name="dispatchedSince">How long ago would the message have been dispatched</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>       
         /// <param name="pageSize">How many messages in a page</param>
         /// <param name="pageNumber">Which page of messages to get</param>
         /// <param name="outboxTimeout"></param>
         /// <param name="args">Additional parameters required for search, if any</param>
-        /// <returns>A list of dispatched messages</returns>
-        public IEnumerable<Message> DispatchedMessages(
-            double millisecondsDispatchedSince, 
-            int pageSize = 100, 
+        /// <param name="cancellationToken">A cancellation token for the async operation</param>
+        public Task<IEnumerable<Message>> DispatchedMessagesAsync(TimeSpan dispatchedSince,
+            RequestContext requestContext,
+            int pageSize = 100,
             int pageNumber = 1,
-            int outboxTimeout = -1, 
-            Dictionary<string, object> args = null)
+            int outboxTimeout = -1,
+            Dictionary<string, object>? args = null,
+            CancellationToken cancellationToken = default)
         {
-            ClearExpiredMessages();
+            //NOTE: As we call DispatchedMessages, don't create telemetry here
             
-            DateTime dispatchedSince = DateTime.UtcNow.AddMilliseconds( -1 * millisecondsDispatchedSince);
-            return _requests.Values.Where(oe =>  (oe.TimeFlushed != DateTime.MinValue) && (oe.TimeFlushed >= dispatchedSince))
-                .Take(pageSize)
-                .Select(oe => oe.Message).ToArray();
+            return Task.FromResult(DispatchedMessages(dispatchedSince, requestContext, pageSize, pageNumber,
+                outboxTimeout,
+                args));
         }
-         
+
         /// <summary>
         /// Gets the specified message
         /// </summary>
         /// <param name="messageId">The id of the message to get</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>       
         /// <param name="outBoxTimeout">How long to wait for the message before timing out</param>
+        /// <param name="args">For outboxes that require additional parameters such as topic, provide an optional arg</param>
         /// <returns>The message</returns>
-        public Message Get(Guid messageId, int outBoxTimeout = -1)
+        public Message Get(Id messageId, RequestContext requestContext, int outBoxTimeout = -1,
+            Dictionary<string, object>? args = null)
         {
             ClearExpiredMessages();
             
-            return _requests.TryGetValue(OutboxEntry.ConvertKey(messageId), out OutboxEntry entry) ? entry.Message : null;
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.OutboxDbName, BoxDbOperation.Get, InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions
+            );
+
+            try
+            {
+                return Requests.TryGetValue(messageId.Value, out OutboxEntry? entry) ? entry.Message : new Message();
+            }
+            finally
+            {
+               Tracer?.EndSpan(span); 
+            }
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="pageSize"></param>
-        /// <param name="pageNumber"></param>
-        /// <param name="args">Additional parameters required for search, if any</param>
-        /// <returns></returns>
-        public IList<Message> Get(int pageSize = 100, int pageNumber = 1, Dictionary<string, object> args = null)
+        /// <inheritdoc />
+        public IEnumerable<Message> Get(IEnumerable<Id> messageIds, RequestContext requestContext, int outBoxTimeout = -1,
+            Dictionary<string, object>? args = null)
         {
             ClearExpiredMessages();
 
-            if (pageNumber == 1)
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.OutboxDbName, BoxDbOperation.Get, InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions
+            );
+
+            try
             {
-                return _requests.Values.Select(oe => oe.Message).Take(pageSize).ToList();
+                return messageIds
+                    .Select(id => Requests.TryGetValue(id.Value, out OutboxEntry? entry) ? entry.Message : null)
+                    .Where(msg => msg != null)
+                    .Select(msg => msg!);
             }
-            else
+            finally
             {
-                var skipMessageCount = (pageNumber-1) * pageSize;
-                return _requests.Values.Select(oe => oe.Message).Skip(skipMessageCount).Take(pageSize).ToList();
+                Tracer?.EndSpan(span);
             }
         }
-         
-       /// <summary>
+
+        /// <summary>
         /// Gets the specified message
         /// </summary>
         /// <param name="messageId"></param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>       
         /// <param name="outBoxTimeout"></param>
-        /// <param name="cancellationToken"></param>
+        /// <param name="args">For outboxes that require additional parameters such as topic, provide an optional arg</param>
+        /// <param name="cancellationToken">A cancellation token for the async operation</param>
         /// <returns></returns>
-        public Task<Message> GetAsync(Guid messageId, int outBoxTimeout = -1, CancellationToken cancellationToken = default(CancellationToken))
+        public Task<Message> GetAsync(
+            Id messageId,
+            RequestContext requestContext,
+            int outBoxTimeout = -1,
+            Dictionary<string, object>? args = null,
+            CancellationToken cancellationToken = default)
         {
-            var tcs = new TaskCompletionSource<Message>();
+            //NOTE: We don't create a span here as we just call the sync method
+            
+            var tcs = new TaskCompletionSource<Message>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (cancellationToken.IsCancellationRequested)
             {
@@ -210,9 +429,30 @@ namespace Paramore.Brighter
                 return tcs.Task;
             }
 
-            var command = Get(messageId, outBoxTimeout);
+            var command = Get(messageId, requestContext, outBoxTimeout);
 
             tcs.SetResult(command);
+            return tcs.Task;
+        }
+
+        /// <inheritdoc />
+        public Task<IEnumerable<Message>> GetAsync(
+            IEnumerable<Id> messageIds,
+            RequestContext requestContext,
+            int outBoxTimeout = -1,
+            Dictionary<string, object>? args = null,
+            CancellationToken cancellationToken = default)
+        {
+            //NOTE: We don't create a span here as we just call the sync method
+            
+            var tcs = new TaskCompletionSource<IEnumerable<Message>>(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (cancellationToken.IsCancellationRequested)
+            {
+                tcs.SetCanceled();
+                return tcs.Task;
+            }
+            var messages = Get(messageIds, requestContext, outBoxTimeout);
+            tcs.SetResult(messages);
             return tcs.Task;
         }
 
@@ -220,47 +460,386 @@ namespace Paramore.Brighter
         /// Mark the message as dispatched
         /// </summary>
         /// <param name="id">The message to mark as dispatched</param>
-        public Task MarkDispatchedAsync(Guid id, DateTime? dispatchedAt = null, Dictionary<string, object> args = null, CancellationToken cancellationToken = default(CancellationToken))
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>       
+        /// <param name="dispatchedAt">The time to mark as the dispatch time</param>
+        /// <param name="args">For outboxes that require additional parameters such as topic, provide an optional arg</param>
+        /// <param name="cancellationToken">A cancellation token for the async operation</param>
+        public Task MarkDispatchedAsync(
+            Id id,
+            RequestContext requestContext,
+            DateTimeOffset? dispatchedAt = null,
+            Dictionary<string, object>? args = null,
+            CancellationToken cancellationToken = default)
         {
-            var tcs = new TaskCompletionSource<object>();
+            //NOTE: We don't create a span here as we just call the sync method
             
-            MarkDispatched(id, dispatchedAt);
-            
+            var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            MarkDispatched(id, requestContext, dispatchedAt);
+
             tcs.SetResult(new object());
 
             return tcs.Task;
         }
 
         /// <summary>
+        /// Mark the messages as dispatched
+        /// </summary>
+        /// <param name="ids">The messages to mark as dispatched</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>       
+        /// <param name="dispatchedAt">The time to mark as the dispatch time</param>
+        /// <param name="args">For outboxes that require additional parameters such as topic, provide an optional arg</param>
+        /// <param name="cancellationToken">A cancellation token for the async operation</param>
+        public Task MarkDispatchedAsync(
+            IEnumerable<Id> ids,
+            RequestContext requestContext,
+            DateTimeOffset? dispatchedAt = null,
+            Dictionary<string, object>? args = null,
+            CancellationToken cancellationToken = default)
+        {
+            //NOTE: We don't create a span here as we just call the sync method
+            
+            var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            ids.Each((id) => MarkDispatched(id, requestContext, dispatchedAt));
+
+            tcs.SetResult(new object());
+
+            return tcs.Task;
+        }
+
+
+        /// <summary>
         /// Mark the message as dispatched
         /// </summary>
         /// <param name="id">The message to mark as dispatched</param>
-         public void MarkDispatched(Guid id, DateTime? dispatchedAt = null, Dictionary<string, object> args = null)
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>       
+        /// <param name="dispatchedAt">The time that the message was dispatched</param>
+        /// <param name="args">Allows passing arbitrary arguments for searching for a message - not used</param>
+        public void MarkDispatched(Id id, RequestContext requestContext, DateTimeOffset? dispatchedAt = null,
+            Dictionary<string, object>? args = null)
         {
             ClearExpiredMessages();
             
-            if (_requests.TryGetValue(OutboxEntry.ConvertKey(id), out OutboxEntry entry))
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.OutboxDbName, BoxDbOperation.MarkDispatched, InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions
+            );
+
+            try
             {
-                entry.TimeFlushed = dispatchedAt ?? DateTime.UtcNow;
+                if (Requests.TryGetValue(id.Value, out OutboxEntry? entry))
+                {
+                    entry.TimeFlushed = dispatchedAt ?? _timeProvider.GetUtcNow();
+                }
+            }
+            finally
+            {
+                Tracer?.EndSpan(span);
             }
         }
 
         /// <summary>
         /// Messages still outstanding in the Outbox because their timestamp
         /// </summary>
-        /// <param name="millSecondsSinceSent">How many seconds since the message was sent do we wait to declare it outstanding</param>
+        /// <param name="dispatchedSince">How many seconds since the message was sent do we wait to declare it outstanding</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>       
+        /// <param name="pageSize">The number of messages to return on a page</param>
+        /// <param name="pageNumber">The page number to return</param>
+        /// <param name="trippedTopics">Collection of tripped topics to filter out</param>
         /// <param name="args">Additional parameters required for search, if any</param>
-         /// <returns>Outstanding Messages</returns>
-       public IEnumerable<Message> OutstandingMessages(double millSecondsSinceSent, int pageSize = 100, int pageNumber = 1,
-            Dictionary<string, object> args = null)
+        /// <returns>Outstanding Messages</returns>
+        public IEnumerable<Message> OutstandingMessages(
+            TimeSpan dispatchedSince,
+            RequestContext? requestContext,
+            int pageSize = 100,
+            int pageNumber = 1,
+            IEnumerable<RoutingKey>? trippedTopics = null,
+            Dictionary<string, object>? args = null
+        )
         {
+            trippedTopics ??= [];
+
             ClearExpiredMessages();
-            
-            DateTime sentBefore = DateTime.UtcNow.AddMilliseconds( -1 * millSecondsSinceSent);
-            return _requests.Values.Where(oe =>  (oe.TimeFlushed == DateTime.MinValue) && (oe.WriteTime <= sentBefore))
-                .Take(pageSize)
-                .Select(oe => oe.Message).ToArray();
+
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.OutboxDbName, BoxDbOperation.OutStandingMessages,
+                    InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions);
+
+            try
+            {
+                var now = _timeProvider.GetUtcNow();
+                var sentBefore = now - dispatchedSince;
+                var outstandingMessages = Requests.Values
+                    .OrderBy(oe => oe.Message.Header.TimeStamp)
+                    .ThenBy(oe => oe.Message.Id.Value, StringComparer.Ordinal)
+                    .Where(oe => 
+                        oe.TimeFlushed == DateTimeOffset.MinValue 
+                        && oe.WriteTime <= sentBefore
+                        && !trippedTopics.Contains(oe.Message.Header.Topic))
+                    .Skip((int)Math.Min(((long)pageNumber - 1) * pageSize, int.MaxValue))
+                    .Take(pageSize)
+                    .Select(oe => oe.Message).ToArray();
+                return outstandingMessages;
+            }
+            finally
+            {
+                Tracer?.EndSpan(span);
+            }
         }
 
- }
+        /// <summary>
+        /// A list of outstanding messages
+        /// </summary>
+        /// <param name="dispatchedSince">The age of the message in milliseconds</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>       
+        /// <param name="pageSize">The number of messages to return on a page</param>
+        /// <param name="pageNumber">The page to return</param>
+        /// <param name="trippedTopics">Collection of tripped topics to filter out</param>
+        /// <param name="args">Additional arguments needed to find a message, if any</param>
+        /// <param name="cancellationToken">A cancellation token for the ongoing asynchronous operation</param>
+        /// <returns></returns>
+        public Task<IEnumerable<Message>> OutstandingMessagesAsync(
+            TimeSpan dispatchedSince,
+            RequestContext requestContext,
+            int pageSize = 100,
+            int pageNumber = 1,
+            IEnumerable<RoutingKey>? trippedTopics = null,
+            Dictionary<string, object>? args = null,
+            CancellationToken cancellationToken = default)
+        {
+            //NOTE: We don't create a span here as we just call the sync method
+            
+            var tcs = new TaskCompletionSource<IEnumerable<Message>>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            tcs.SetResult(OutstandingMessages(dispatchedSince, requestContext, pageSize, pageNumber, trippedTopics, args));
+
+            return tcs.Task;
+        }
+
+        /// <inheritdoc/>
+        public int GetOutstandingMessageCount(TimeSpan dispatchedSince, RequestContext? requestContext, int maxCount = 100, Dictionary<string, object>? args = null)
+        {
+            ClearExpiredMessages();
+
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.OutboxDbName, BoxDbOperation.OutStandingMessageCount,
+                    InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions);
+
+            try
+            {
+                var now = _timeProvider.GetUtcNow();
+                var sentBefore = now - dispatchedSince;
+                var outstandingMessageCount = Requests
+                    .Where(entry =>
+                        entry.Value.TimeFlushed == DateTimeOffset.MinValue
+                        && entry.Value.WriteTime <= sentBefore)
+                    .Take(maxCount)
+                    .Count();
+                return outstandingMessageCount;
+            }
+            finally
+            {
+                Tracer?.EndSpan(span);
+            }
+        }
+
+        /// <inheritdoc/>
+        public Task<int> GetOutstandingMessageCountAsync(TimeSpan dispatchedSince, RequestContext? requestContext, int maxCount = 100, Dictionary<string, object>? args = null, CancellationToken cancellationToken = default)
+        {
+            //NOTE: We don't create a span here as we just call the sync method
+
+            var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            tcs.SetResult(GetOutstandingMessageCount(dispatchedSince, requestContext, maxCount, args));
+
+            return tcs.Task;
+        }
+
+        /// <inheritdoc/>
+        public Task<IReadOnlyDictionary<RoutingKey, int>> GetOutstandingMessageCountsByTopicAsync(
+            IReadOnlyDictionary<RoutingKey, TimeSpan> dispatchedSinceByTopic,
+            RequestContext? requestContext,
+            int maxCountPerTopic,
+            Dictionary<string, object>? args = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (dispatchedSinceByTopic is null) throw new ArgumentNullException(nameof(dispatchedSinceByTopic));
+            if (maxCountPerTopic < 1)
+                throw new ArgumentOutOfRangeException(nameof(maxCountPerTopic), maxCountPerTopic, "The ceiling per topic must be at least 1.");
+            CheckRequestedTopics(dispatchedSinceByTopic);
+
+            var tcs = new TaskCompletionSource<IReadOnlyDictionary<RoutingKey, int>>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            tcs.SetResult(GetOutstandingMessageCountsByTopic(dispatchedSinceByTopic, requestContext, maxCountPerTopic));
+
+            return tcs.Task;
+        }
+
+        private static void CheckRequestedTopics(IReadOnlyDictionary<RoutingKey, TimeSpan> dispatchedSinceByTopic)
+        {
+            foreach (var request in dispatchedSinceByTopic)
+            {
+                if (RoutingKey.IsNullOrEmpty(request.Key))
+                    throw new ArgumentException("A requested topic is null or empty.", nameof(dispatchedSinceByTopic));
+                if (request.Value <= TimeSpan.Zero || request.Value > TimeSpan.FromDays(MAX_TOPIC_AGE_DAYS))
+                    throw new ArgumentException(
+                        $"The age requested for topic {request.Key} must be greater than zero and no greater than {MAX_TOPIC_AGE_DAYS} days.",
+                        nameof(dispatchedSinceByTopic));
+            }
+        }
+
+        private Dictionary<RoutingKey, int> GetOutstandingMessageCountsByTopic(
+            IReadOnlyDictionary<RoutingKey, TimeSpan> dispatchedSinceByTopic,
+            RequestContext? requestContext,
+            int maxCountPerTopic)
+        {
+            ClearExpiredMessages();
+
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.OutboxDbName, BoxDbOperation.OutStandingMessageCount,
+                    InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions);
+
+            try
+            {
+                var counts = dispatchedSinceByTopic.Keys.ToDictionary(topic => topic, _ => 0);
+                foreach (var topic in StaleMessageTopics(dispatchedSinceByTopic, _timeProvider.GetUtcNow()))
+                {
+                    if (counts[topic] < maxCountPerTopic)
+                        counts[topic]++;
+                }
+
+                return counts;
+            }
+            finally
+            {
+                Tracer?.EndSpan(span);
+            }
+        }
+
+        private IEnumerable<RoutingKey> StaleMessageTopics(IReadOnlyDictionary<RoutingKey, TimeSpan> dispatchedSinceByTopic, DateTimeOffset now)
+        {
+            return Requests
+                .Where(entry =>
+                    entry.Value.TimeFlushed == DateTimeOffset.MinValue
+                    && dispatchedSinceByTopic.TryGetValue(entry.Value.Message.Header.Topic, out var dispatchedSince)
+                    && entry.Value.WriteTime <= now - dispatchedSince)
+                .Select(entry => entry.Value.Message.Header.Topic);
+        }
+
+        protected override void RemoveExpiredMessages(DateTimeOffset now)
+        {
+            var expiredEntries =
+                Requests
+                    .Where(entry =>
+                        entry.Value.TimeFlushed != DateTimeOffset.MinValue
+                        && (now - entry.Value.TimeFlushed) >= EntryTimeToLive)
+                    .Select(entry => entry.Key);
+
+            foreach (var key in expiredEntries)
+            {
+                //if this fails ignore, killed by something else like compaction
+                Requests.TryRemove(key, out _);
+            }
+        }
+
+        protected override void Compact(int entriesToRemove)
+        {
+            var removalList =
+                Requests
+                    .Where(entry => entry.Value.TimeFlushed != DateTimeOffset.MinValue)
+                    .OrderBy(entry => entry.Value.TimeFlushed)
+                    .Take(entriesToRemove)
+                    .Select(entry => entry.Key);
+
+            foreach (var key in removalList)
+            {
+                //ignore errors, likely just something else has cleared it such as TTL eviction
+                Requests.TryRemove(key, out _);
+            }
+        }
+
+        private void Delete(Id messageId, RequestContext? requestContext = null)
+        {
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.OutboxDbName, BoxDbOperation.Delete, InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions
+            );
+
+            try
+            {
+                Requests.TryRemove(messageId.Value, out _);
+            }
+            finally
+            {
+                Tracer?.EndSpan(span);
+            }
+        }
+
+        /// <inheritdoc />
+        public bool SupportsCausationTracking() => true;
+
+        /// <inheritdoc />
+        public Task<bool> SupportsCausationTrackingAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult(true);
+
+        /// <inheritdoc />
+        public bool ReplayCausation(string causationId, RequestContext? requestContext,
+            Dictionary<string, object>? args = null)
+        {
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.OutboxDbName, BoxDbOperation.Replay, InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions
+            );
+
+            try
+            {
+                foreach (var entry in Requests.Values.Where(entry => entry.CausationId == causationId))
+                {
+                    entry.TimeFlushed = DateTimeOffset.MinValue;
+                }
+
+                // The in-memory store always supports causation tracking, so the replay is always performed.
+                return true;
+            }
+            finally
+            {
+                Tracer?.EndSpan(span);
+            }
+        }
+
+        /// <inheritdoc />
+        public Task<bool> ReplayCausationAsync(string causationId, RequestContext? requestContext,
+            Dictionary<string, object>? args = null, CancellationToken cancellationToken = default)
+        {
+            // Note: Don't create a span here - we call the sync method behind the scenes
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                tcs.SetCanceled();
+                return tcs.Task;
+            }
+
+            var replayed = ReplayCausation(causationId, requestContext, args);
+
+            tcs.SetResult(replayed);
+            return tcs.Task;
+        }
+
+        // Reads the causation id from the request context bag, if present
+        private static string? ReadCausationId(RequestContext? requestContext)
+            => requestContext?.Bag.TryGetValue(RequestContextBagNames.CausationId, out var value) == true
+                ? value as string
+                : null;
+    }
 }

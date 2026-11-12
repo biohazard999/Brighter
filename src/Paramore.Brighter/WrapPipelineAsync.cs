@@ -1,0 +1,136 @@
+﻿#region Licence
+/* The MIT License (MIT)
+Copyright © 2022 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the “Software”), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+#endregion
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Paramore.Brighter.Extensions;
+using Paramore.Brighter.Logging;
+using Paramore.Brighter.Observability;
+
+namespace Paramore.Brighter
+{
+    /// <summary>
+    /// class WrapPipeline
+    /// A pipeline with a source of a <see cref="MessageMapper"/> that:
+    /// Takes a request and maps it to a message
+    /// Runs transforms on that message
+    /// </summary>
+    public partial class WrapPipelineAsync<TRequest> : TransformPipelineAsync<TRequest> where TRequest: class, IRequest
+    {
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<WrapPipelineAsync<TRequest>>();
+        
+        private readonly InstrumentationOptions _instrumentationOptions;
+
+        /// <summary>
+        /// Constructs an instance of a wrap pipeline
+        /// </summary>
+        /// <param name="messageMapperLease">The lease over the message mapper that forms the pipeline source</param>
+        /// <param name="messageTransformerFactoryAsync">Factory for transforms, required to release</param>
+        /// <param name="transformLeases">The leases over the transforms applied after the message mapper</param>
+        /// <param name="instrumentationOptions">The <see cref="InstrumentationOptions"/> for how deep should the instrumentation go?</param>
+        /// <param name="mapperRegistry">The registry the message mapper came from, required to release it when the pipeline is disposed</param>
+        /// <param name="scope">The pipeline's own DI scope, if one was offered when the pipeline was built</param>
+        public WrapPipelineAsync(
+            Lease<IAmAMessageMapperAsync<TRequest>> messageMapperLease,
+            IAmAMessageTransformerFactoryAsync? messageTransformerFactoryAsync,
+            IEnumerable<Lease<IAmAMessageTransformAsync>> transformLeases,
+            InstrumentationOptions instrumentationOptions,
+            IAmAMessageMapperRegistryAsync? mapperRegistry = null,
+            IAmAScope? scope = null
+            ) : base(messageMapperLease, transformLeases, mapperRegistry, scope)
+        {
+            _instrumentationOptions = instrumentationOptions;
+            if (messageTransformerFactoryAsync != null)
+            {
+                InstanceScope = new TransformLifetimeScopeAsync(messageTransformerFactoryAsync);
+                TransformLeases.Each(lease => InstanceScope.Add(lease));
+            }
+        }
+
+        /// <summary>        
+        /// Lists the wrap pipeline: message mapper and filter transforms that will be executed
+        /// Used for pipeline verification
+        /// </summary>
+        /// <param name="pipelineTracer"></param>
+        public void DescribePath(TransformPipelineTracer pipelineTracer)
+        {
+            pipelineTracer.AddTransform(MessageMapper.GetType().Name);
+            Transforms.Each(t => pipelineTracer.AddTransform(t.GetType().Name));
+        }
+
+        /// <summary>
+        /// Transforms a <see cref="IRequest"/> into a <see cref="Message"/>
+        /// Applies any required <see cref="IAmAMessageTransformAsync"/> to that <see cref="Message"/> 
+        /// </summary>
+        /// <param name="request">The request to wrap</param>
+        /// <param name="publication">The publication for this channel, provides metadata such as topic or Cloud Events attributes</param>
+        /// <param name="requestContext">The context of the request in this pipeline</param>
+        /// <param name="cancellationToken">The cancellation token</param>
+        /// <returns></returns>
+        public async Task<Message> WrapAsync(TRequest request, RequestContext requestContext, Publication publication, CancellationToken cancellationToken = default)
+        {
+            requestContext.Span ??= Activity.Current;
+
+            MessageMapper.Context = requestContext;
+            
+            MessageMapper.Context = requestContext; 
+            var message = await MessageMapper.MapToMessageAsync(request, publication, cancellationToken); 
+            
+            if (message.Header.Topic != publication.Topic)
+            {
+                Log.DifferentPublicationAndMessageTopic(s_logger, publication.Topic?.Value ?? string.Empty, message.Header.Topic.Value);
+                if (publication.Topic is not null)
+                {
+                    message.Header.Bag[Message.ProducerTopicHeaderName] = publication.Topic.Value;
+                }
+            }
+            
+            BrighterTracer.WriteMapperEvent(message, publication, requestContext.Span, MessageMapper.GetType().Name, true, _instrumentationOptions, true);
+            
+            await Transforms.EachAsync(async transform =>
+            {
+                transform.Context = requestContext;
+                message = await transform.WrapAsync(message, publication, cancellationToken);
+                BrighterTracer.WriteMapperEvent(message, publication, requestContext.Span, transform.GetType().Name, true, _instrumentationOptions);
+            }); 
+            
+            if (!string.IsNullOrEmpty(publication.ReplyTo))
+            {
+                message.Header.ReplyTo = publication.ReplyTo!;
+            } 
+            
+            return message;
+        }
+        
+        private static partial class Log
+        {
+            [LoggerMessage(LogLevel.Warning, "Topic mismatch detected: The found topic ({FindPublicationTopic}) differs from the message topic ({MessageTopic}). This discrepancy could lead to invalid data in the pipeline")]
+            public static partial void DifferentPublicationAndMessageTopic(ILogger logger, string findPublicationTopic, string messageTopic);
+        }
+    }
+}

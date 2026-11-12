@@ -24,7 +24,7 @@ THE SOFTWARE. */
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyStepsValidationHandler<TRequest> : RequestHandler<TRequest> where TRequest : class, IRequest
+    internal sealed class MyStepsValidationHandler<TRequest> : RequestHandler<TRequest> where TRequest : class, IRequest
     {
         private static TRequest s_command;
 
@@ -33,10 +33,10 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
             s_command = null;
         }
 
-        public override TRequest Handle(TRequest command)
+        public override TRequest Handle(TRequest request)
         {
-            LogCommand(command);
-            return base.Handle(command);
+            LogCommand(request);
+            return base.Handle(request);
         }
 
         public static bool ShouldReceive(TRequest expectedCommand)

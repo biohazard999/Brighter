@@ -1,0 +1,189 @@
+#region Licence
+/* The MIT License (MIT)
+Copyright © 2026 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+
+#endregion
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Paramore.Brighter.RequestValidation.Handlers;
+using Paramore.Brighter.Validation;
+
+namespace Paramore.Brighter.Extensions.DependencyInjection;
+
+/// <summary>
+/// Extension methods on <see cref="IBrighterBuilder"/> for opting into pipeline validation
+/// and diagnostic description at startup.
+/// </summary>
+public static class BrighterPipelineValidationExtensions
+{
+    /// <summary>
+    /// Registers pipeline validation services. At startup, registered handler pipelines
+    /// are evaluated against validation rules and errors prevent the host from starting.
+    /// </summary>
+    /// <remarks>
+    /// Call this last in the Brighter builder chain. The validation-provider registrations and the
+    /// transformer-resolvability probe are snapshotted from the service collection at this point, so anything
+    /// registered after this call (e.g. a later <c>UseFluentValidation()</c> or <c>AutoFromAssemblies(...)</c>)
+    /// would not be seen and could produce a spurious warning.
+    /// Inbox middleware is checked by resolving its required inbox service in a temporary scope
+    /// using the configured handler lifetime. Inbox factories may run during validation; handlers
+    /// are not instantiated and no inbox reads or writes are performed.
+    /// </remarks>
+    /// <param name="builder">The Brighter builder.</param>
+    /// <param name="enabled">When false, the method is a no-op — no services are registered. Defaults to true.</param>
+    /// <param name="throwOnError">When true (the default), Error-severity findings throw and prevent the host
+    /// from starting; Warning-severity findings never block, regardless of this flag.</param>
+    /// <returns>The builder, for fluent chaining.</returns>
+    public static IBrighterBuilder ValidatePipelines(this IBrighterBuilder builder, bool enabled = true, bool throwOnError = true)
+    {
+        if (!enabled) return builder;
+
+        builder.Services.Configure<BrighterPipelineValidationOptions>(o => o.ThrowOnError = throwOnError);
+
+        var providerRegistrations = new ValidationProviderRegistrations(
+            Sync: builder.Services.Any(d => d.ServiceType == typeof(ValidateRequestHandler<>)),
+            Async: builder.Services.Any(d => d.ServiceType == typeof(ValidateRequestHandlerAsync<>)));
+
+        builder.Services.TryAddSingleton<IAmATransformerResolvabilityProbe>(
+            new ServiceCollectionTransformerResolvabilityProbe(builder.Services));
+
+        builder.Services.TryAddSingleton(sp =>
+        {
+            var mapperRegistryBuilder = sp.GetService<ServiceCollectionMessageMapperRegistryBuilder>();
+            return new ValidationMapperRegistry(mapperRegistryBuilder != null
+                ? () => ServiceCollectionExtensions.MessageMapperRegistry(sp)
+                : null);
+        });
+
+        builder.Services.TryAddSingleton<IAmAPipelineValidator>(sp =>
+        {
+            var subscriberRegistry = sp.GetService<IAmASubscriberRegistryInspector>()
+                ?? (IAmASubscriberRegistryInspector)sp.GetRequiredService<ServiceCollectionSubscriberRegistry>();
+            var pipelineBuilder = new PipelineBuilder<IRequest>(subscriberRegistry, ResolveInboxConfiguration(sp));
+
+            var publications = ResolvePublications(sp);
+            var subscriptions = ResolveSubscriptions(sp);
+            var consumerSpecs = sp.GetServices<ISpecification<Subscription>>();
+            var consumerSpecList = consumerSpecs.Any() ? consumerSpecs : null;
+
+            var inbox = ResolveInboxConfiguration(sp)?.Inbox;
+            var outbox = sp.GetService<IAmAnOutboxProducerMediator>()?.Outbox;
+
+            var mapperRegistry = sp.GetRequiredService<ValidationMapperRegistry>();
+            var transformerProbe = sp.GetService<IAmATransformerResolvabilityProbe>();
+
+            return new PipelineValidator(
+                pipelineBuilder, publications, subscriptions, consumerSpecList, inbox, outbox,
+                providerRegistrations, mapperRegistry.Factory, transformerProbe);
+        });
+
+        builder.Services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IAmAPipelineValidator, InboxConfigurationValidator>());
+
+        // ADR 0074's validator, registered beside the core one — AddSingleton, not TryAdd, because TryAdd
+        // tests the service type and would never add a second implementation of it. The snapshot is
+        // captured here, above the delegate, matching ValidationProviderRegistrations' and
+        // ServiceCollectionTransformerResolvabilityProbe's own ValidatePipelines()-call-time capture point.
+        var registrationSnapshot = new ContainerRegistrationSnapshot(builder.Services);
+        builder.Services.AddSingleton<IAmAPipelineValidator>(sp =>
+        {
+            var subscriberRegistry = sp.GetService<IAmASubscriberRegistryInspector>()
+                ?? (IAmASubscriberRegistryInspector)sp.GetRequiredService<ServiceCollectionSubscriberRegistry>();
+            var pipelineBuilder = new PipelineBuilder<IRequest>(subscriberRegistry, ResolveInboxConfiguration(sp));
+
+            return new ScopeConfigurationValidator(
+                sp.GetService<IBrighterOptions>(),
+                registrationSnapshot,
+                pipelineBuilder,
+                ResolvePublications(sp),
+                ResolveSubscriptions(sp),
+                sp.GetRequiredService<ValidationMapperRegistry>());
+        });
+
+        builder.Services.AddSingleton<IHostedService, BrighterValidationHostedService>();
+        builder.Services.AddOptions<BrighterPipelineValidationOptions>();
+
+        return builder;
+    }
+
+    /// <summary>
+    /// Registers pipeline diagnostic services. At startup, a human-readable description
+    /// of all configured pipelines is logged at Information and Debug levels.
+    /// </summary>
+    /// <param name="builder">The Brighter builder.</param>
+    /// <param name="enabled">When false, the method is a no-op — no services are registered. Defaults to true.</param>
+    /// <returns>The builder, for fluent chaining.</returns>
+    public static IBrighterBuilder DescribePipelines(this IBrighterBuilder builder, bool enabled = true)
+    {
+        if (!enabled) return builder;
+        builder.Services.TryAddSingleton<IAmAPipelineDiagnosticWriter>(sp =>
+        {
+            var subscriberRegistry = sp.GetService<IAmASubscriberRegistryInspector>()
+                ?? (IAmASubscriberRegistryInspector)sp.GetRequiredService<ServiceCollectionSubscriberRegistry>();
+            var pipelineBuilder = new PipelineBuilder<IRequest>(subscriberRegistry, ResolveInboxConfiguration(sp));
+            var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger<PipelineDiagnosticWriter>();
+
+            var publications = ResolvePublications(sp);
+            var subscriptions = ResolveSubscriptions(sp);
+            var mapperRegistryBuilder = sp.GetService<ServiceCollectionMessageMapperRegistryBuilder>();
+            Func<MessageMapperRegistry>? mapperRegistryFactory = mapperRegistryBuilder != null
+                ? () => ServiceCollectionExtensions.MessageMapperRegistry(sp)
+                : null;
+
+            return new PipelineDiagnosticWriter(logger, pipelineBuilder, mapperRegistryFactory, publications, subscriptions);
+        });
+
+        builder.Services.AddSingleton<IHostedService, BrighterDiagnosticHostedService>();
+        builder.Services.AddOptions<BrighterPipelineValidationOptions>();
+
+        return builder;
+    }
+
+    private static IEnumerable<Publication>? ResolvePublications(IServiceProvider sp)
+    {
+        var producerRegistry = sp.GetService<IAmAProducerRegistry>();
+        var publications = producerRegistry?.Producers
+            .Select(p => p.Publication)
+            .ToList();
+        return publications is { Count: > 0 } ? publications : null;
+    }
+
+    private static IEnumerable<Subscription>? ResolveSubscriptions(IServiceProvider sp)
+    {
+        var consumerOptions = sp.GetService<IAmConsumerOptions>();
+        var subscriptions = consumerOptions?.Subscriptions?.ToList();
+        return subscriptions is { Count: > 0 } ? subscriptions : null;
+    }
+
+    /// <summary>
+    /// Resolves the global <see cref="InboxConfiguration"/> the runtime pipeline would use, so the
+    /// describe/validate paths inject the same global inbox attribute as <c>Build()</c> and do not drift.
+    /// Returns null when no consumer options are registered (matching the runtime, which receives null too).
+    /// </summary>
+    private static InboxConfiguration? ResolveInboxConfiguration(IServiceProvider sp)
+        => sp.GetService<IAmConsumerOptions>()?.InboxConfiguration;
+}

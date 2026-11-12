@@ -24,18 +24,18 @@ THE SOFTWARE. */
 
 using System;
 using System.Linq;
-using FluentAssertions;
 using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
 using Paramore.Brighter.Core.Tests.Timeout.Test_Doubles;
 using Xunit;
 using Polly.Registry;
 using Microsoft.Extensions.DependencyInjection;
+using Paramore.Brighter.Core.Tests.TestHelpers;
 using Paramore.Brighter.Extensions.DependencyInjection;
 using Paramore.Brighter.Policies.Handlers;
 
 namespace Paramore.Brighter.Core.Tests.Timeout
 {
-    public class TimeoutHandlerFailsCheckTests : IDisposable
+    public class TimeoutHandlerFailsCheckTests
     {
         private readonly CommandProcessor _commandProcessor;
         private readonly MyCommand _myCommand = new MyCommand();
@@ -52,11 +52,12 @@ namespace Paramore.Brighter.Core.Tests.Timeout
 
             var handlerFactory = new ServiceProviderHandlerFactory(container.BuildServiceProvider());
             
-           _commandProcessor = new CommandProcessor(registry, (IAmAHandlerFactory)handlerFactory, new InMemoryRequestContextFactory(), new PolicyRegistry());
+           _commandProcessor = new CommandProcessor(registry, handlerFactory, new InMemoryRequestContextFactory(), 
+               new PolicyRegistry(), new ResiliencePipelineRegistry<string>(),new InMemorySchedulerFactory());
         }
 
         //We have to catch the final exception that bubbles out after retry
-        [Fact(Skip="Fragile. Replace with Polly Timeout")]
+        [Fact(Skip="Replace with Polly Timeout")]
         public void When_Sending_A_Command_To_The_Processor_Failing_A_Timeout_Policy_Check()
         {
             _thrownException = (AggregateException)Catch.Exception(() => _commandProcessor.Send(_myCommand));
@@ -67,11 +68,6 @@ namespace Paramore.Brighter.Core.Tests.Timeout
             Assert.True(_myCommand.WasCancelled);
             //_should_not_run_to_completion
             Assert.False(_myCommand.TaskCompleted);
-        }
-
-        public void Dispose()
-        {
-            _commandProcessor?.Dispose();
         }
     }
 }

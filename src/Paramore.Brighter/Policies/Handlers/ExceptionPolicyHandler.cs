@@ -22,6 +22,11 @@ THE SOFTWARE. */
 
 #endregion
 
+using System;
+using System.Collections.Generic;
+using System.Runtime.ExceptionServices;
+using Paramore.Brighter.Actions;
+using Paramore.Brighter.Extensions;
 using Paramore.Brighter.Policies.Attributes;
 using Polly;
 using Polly.Registry;
@@ -30,7 +35,7 @@ namespace Paramore.Brighter.Policies.Handlers
 {
     /// <summary>
     /// Class ExceptionPolicyHandler.
-    /// The <see cref="UsePolicyAttribute"/> supports the use of <a href="https://github.com/michael-wolfenden/Polly">Polly</a> to provide quality of service around exceptions
+    /// The <see cref="UsePolicyAttribute"/> supports the use of <a href="https://github.com/App-vNext/Polly">Polly</a> to provide quality of service around exceptions
     /// thrown from subsequent steps in the handler pipeline. A Polly Policy can be used to support a Retry or Circuit Breaker approach to exception handling
     /// Policies used by the attribute are identified by a string based key, which is used as a lookup into an <see cref="PolicyRegistry"/> and it is 
     /// assumed that you have registered required policies with a Policy Registry such as <see cref="PolicyRegistry"/> and configured that as a 
@@ -38,32 +43,65 @@ namespace Paramore.Brighter.Policies.Handlers
     /// The ExceptionPolicyHandler is instantiated by the pipeline when the <see cref="UsePolicyAttribute"/> is added to the <see cref="IHandleRequests{T}.Handle"/> method
     /// of the target handler implemented by the client.
     /// </summary>
+    /// <remarks>
+    /// Explicit reject, defer, don't-ack and invalid-message actions are propagated after the policy
+    /// completes, so retry and circuit-breaker policies do not treat them as failures.
+    /// </remarks>
     /// <typeparam name="TRequest">The type of the t request.</typeparam>
     public class ExceptionPolicyHandler<TRequest> : RequestHandler<TRequest> where TRequest : class, IRequest
     {
-        private Policy _policy;
+        private bool _initialized = false;
+        private readonly List<Policy> _policies = new();
 
         /// <summary>
         /// Initializes from attribute parameters. This will get the <see cref="PolicyRegistry"/> from the <see cref="IRequestContext"/> and query it for the
         /// policy identified in <see cref="UsePolicyAttribute"/>
+        /// Because we call InitializeFromAttributeParams for each request, we need to guard against multiple calls to this method
+        /// adding to the list of policies. Once we have the list of policies, then we do not need to re-initialize them.
         /// </summary>
         /// <param name="initializerList">The initializer list.</param>
         /// <exception cref="System.ArgumentException">Could not find the policy for this attribute, did you register it with the command processor's container;initializerList</exception>
-        public override void InitializeFromAttributeParams(params object[] initializerList)
+        public override void InitializeFromAttributeParams(params object?[] initializerList)
         {
+            if (_initialized)
+                return;
+
             //we expect the first and only parameter to be a string
-            var policyName = (string)initializerList[0];
-            _policy = Context.Policies.Get<Policy>(policyName);
+            var policies = (List<string>?)initializerList[0] ?? [];
+#pragma warning disable CS0618 // Type or member is obsolete
+            policies.Each(p => _policies.Add(Context!.Policies!.Get<Policy>(p)));
+#pragma warning restore CS0618 // Type or member is obsolete
+            _initialized = true;
         }
 
         /// <summary>
         /// Handles the specified command.
         /// </summary>
-        /// <param name="command">The command.</param>
+        /// <param name="request">The command.</param>
         /// <returns>TRequest.</returns>
-        public override TRequest Handle(TRequest command)
+        public override TRequest Handle(TRequest request)
         {
-            return _policy.Execute(() => base.Handle(command));
+            var policy = _policies[0];
+            for (var i = 1; i < _policies.Count; i++)
+                policy = policy.Wrap(_policies[i]);
+
+            ExceptionDispatchInfo? pumpAction = null;
+            var result = policy.Execute(HandleRequest);
+            pumpAction?.Throw();
+            return result;
+
+            TRequest HandleRequest()
+            {
+                try
+                {
+                    return base.Handle(request);
+                }
+                catch (Exception ex) when (ex is RejectMessageAction or DeferMessageAction or DontAckAction or InvalidMessageAction)
+                {
+                    pumpAction = ExceptionDispatchInfo.Capture(ex);
+                    return request;
+                }
+            }
         }
     }
 }

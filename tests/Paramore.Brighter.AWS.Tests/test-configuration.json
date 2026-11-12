@@ -1,0 +1,55 @@
+{
+  "Namespace": "Paramore.Brighter.AWS.Tests",
+  "MessageAssertion": "AwsMessageAssertion",
+  "MessagingGateways": {
+    "SnsStandard": {
+      "Publication": "Paramore.Brighter.MessagingGateway.AWSSQS.SnsPublication",
+      "Subscription": "Paramore.Brighter.MessagingGateway.AWSSQS.SqsSubscription",
+      "MessageGatewayProvider": "Paramore.Brighter.AWS.Tests.MessagingGateway.SnsStandardMessageGatewayProvider",
+      "Category": "Sns",
+      "CollectionName": "SnsStandard",
+      "LedgerKey": "AWS / SnsStandard",
+      "HasSupportToPublishConfirmation": false,
+      "HasSupportToValidateBrokerExistence": true,
+      "ReceiveMessageTimeoutInMilliseconds": 4000
+    },
+    "SnsFifo": {
+      "Publication": "Paramore.Brighter.MessagingGateway.AWSSQS.SnsPublication",
+      "Subscription": "Paramore.Brighter.MessagingGateway.AWSSQS.SqsSubscription",
+      "MessageGatewayProvider": "Paramore.Brighter.AWS.Tests.MessagingGateway.SnsFifoMessageGatewayProvider",
+      "MessageBuilder": "FifoMessageBuilder",
+      "Category": "Sns",
+      "CollectionName": "SnsFifo",
+      "LedgerKey": "AWS / SnsFifo",
+      "HasSupportToPublishConfirmation": false,
+      "HasSupportToValidateBrokerExistence": true,
+      "ReceiveMessageTimeoutInMilliseconds": 4000
+    },
+    "SqsStandard": {
+      "Publication": "Paramore.Brighter.MessagingGateway.AWSSQS.SqsPublication",
+      "Subscription": "Paramore.Brighter.MessagingGateway.AWSSQS.SqsSubscription",
+      "MessageGatewayProvider": "Paramore.Brighter.AWS.Tests.MessagingGateway.SqsStandardMessageGatewayProvider",
+      "Category": "Sqs",
+      "CollectionName": "SqsStandard",
+      "LedgerKey": "AWS / SqsStandard",
+      "HasSupportToPublishConfirmation": false,
+      "HasSupportToValidateBrokerExistence": true,
+      "ReceiveMessageTimeoutInMilliseconds": 4000
+    },
+    "SqsFifo": {
+      "Publication": "Paramore.Brighter.MessagingGateway.AWSSQS.SqsPublication",
+      "Subscription": "Paramore.Brighter.MessagingGateway.AWSSQS.SqsSubscription",
+      "MessageGatewayProvider": "Paramore.Brighter.AWS.Tests.MessagingGateway.SqsFifoMessageGatewayProvider",
+      "MessageBuilder": "FifoMessageBuilder",
+      "Category": "Sqs",
+      "CollectionName": "SqsFifo",
+      "LedgerKey": "AWS / SqsFifo",
+      "HasSupportToPublishConfirmation": false,
+      "HasSupportToValidateBrokerExistence": true,
+      "ReceiveMessageTimeoutInMilliseconds": 4000
+    }
+  },
+  "GatewayConformance": {
+    "SubscriptionType": "Paramore.Brighter.MessagingGateway.AWSSQS.SqsSubscription"
+  }
+}

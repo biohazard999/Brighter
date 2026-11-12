@@ -24,25 +24,103 @@ THE SOFTWARE. */
 
 namespace Paramore.Brighter.Outbox.Sqlite
 {
+    /// <summary>
+    /// Provide SQL statement helpers for creation of an Outbox
+    /// Note that due to a case-related bug in Microsoft.Data.Core when comparing GUIDs in Sqlite, we use COLLATE NOCASE for the MessageId
+    /// </summary>
     public class SqliteOutboxBuilder
     {
-        const string OutboxDdl = @"CREATE TABLE {0} (
-                                          [MessageId] uniqueidentifier NOT NULL
-                                        , [Topic] nvarchar(255) NULL
-                                        , [MessageType] nvarchar(32) NULL
-                                        , [Timestamp] datetime NULL
-                                        , [CorrelationId] UNIQUEIDENTIFIER NULL
-                                        , [ReplyTo] NVARCHAR(255) NULL
-                                        , [ContentType] NVARCHAR(128) NULL  
-                                        , [Dispatched] datetime NULL
-                                        , [HeaderBag] ntext NULL
-                                        , [Body] ntext NULL
-                                        , CONSTRAINT[PK_MessageId] PRIMARY KEY([MessageId])
-                                        );";
+        private const string TextOutboxDDL =
+            """
+            CREATE TABLE IF NOT EXISTS {0}
+            (
+                [MessageId] TEXT NOT NULL COLLATE NOCASE PRIMARY KEY,
+                [MessageType] TEXT NULL,
+                [Topic] TEXT NULL,
+                [Timestamp] TEXT NULL,
+                [CorrelationId] TEXT NULL,
+                [ReplyTo] TEXT NULL,
+                [ContentType] TEXT NULL,  
+                [PartitionKey] TEXT NULL,
+                [WorkflowId] TEXT NULL,
+                [JobId] TEXT NULL,
+                [Dispatched] TEXT NULL,
+                [HeaderBag] TEXT NULL,
+                [Body] TEXT NULL,
+                [Source] TEXT NULL,
+                [Type] TEXT NULL,
+                [DataSchema] TEXT NULL,
+                [Subject] TEXT NULL,
+                [TraceParent] TEXT NULL,
+                [TraceState] TEXT NULL,
+                [Baggage] TEXT NULL,
+                [DataRef] TEXT NULL,
+                [CausationId] TEXT NULL,
+                [SpecVersion] TEXT NULL
+            );
+            """;
 
-        public static string GetDDL(string tableName)
+        private const string BinaryOutboxDdl =
+            """
+            CREATE TABLE IF NOT EXISTS {0}
+            (
+                [MessageId] TEXT NOT NULL COLLATE NOCASE PRIMARY KEY,
+                [MessageType] TEXT NULL,
+                [Topic] TEXT NULL,
+                [Timestamp] TEXT NULL,
+                [CorrelationId] TEXT NULL,
+                [ReplyTo] TEXT NULL,
+                [ContentType] TEXT NULL,  
+                [PartitionKey] TEXT NULL,
+                [WorkflowId] TEXT NULL,
+                [JobId] TEXT NULL,
+                [Dispatched] TEXT NULL,
+                [HeaderBag] TEXT NULL,
+                [Body] BLOB NULL,
+                [Source] TEXT NULL,
+                [Type] TEXT NULL,
+                [DataSchema] TEXT NULL,
+                [Subject] TEXT NULL,
+                [TraceParent] TEXT NULL,
+                [TraceState] TEXT NULL,
+                [Baggage] TEXT NULL,
+                [DataRef] TEXT NULL,
+                [CausationId] TEXT NULL,
+                [SpecVersion] TEXT NULL
+            );
+            """;
+
+
+        private const string OutboxExistsQuery = "SELECT name FROM sqlite_master WHERE type='table' AND name='{0}';";
+
+        /// <summary>
+        /// Get the DDL statements to create an Outbox in Sqlite
+        /// </summary>
+        /// <param name="outboxTableName"></param>
+        /// <param name="hasBinaryMessagePayload">Is the payload for the message binary or UTF-8. Defaults to false, or UTF-8</param>
+        /// <returns>The required DDL</returns>
+        /// <remarks>
+        /// New tables enforce case-insensitive MessageId uniqueness. Existing tables are not
+        /// altered by this script; use the SQLite outbox provisioner to apply schema migrations.
+        /// </remarks>
+        public static string GetDDL(string outboxTableName, bool hasBinaryMessagePayload = false)
         {
-            return string.Format(OutboxDdl, tableName);
+            var ddl = hasBinaryMessagePayload ? string.Format(BinaryOutboxDdl, outboxTableName) : string.Format(TextOutboxDDL, outboxTableName);
+            // Replay index (Spec 0027, #2541) on CausationId — emitted as a separate idempotent
+            // statement after the CREATE TABLE IF NOT EXISTS. None of the outbox builders
+            // indexed any column before this.
+            return ddl + "\n" +
+                $"CREATE INDEX IF NOT EXISTS [idx_{outboxTableName}_CausationId] ON [{outboxTableName}] ([CausationId]);";
+        }
+
+        /// <summary>
+        /// Get the SQL statements required to test for the existence of an Outbox in Sqlite
+        /// </summary>
+        /// <param name="outboxTableName">The name that was used for the Outbox table</param>
+        /// <returns>The required SQL</returns>
+        public static string GetExistsQuery(string outboxTableName)
+        {
+            return string.Format(OutboxExistsQuery, outboxTableName);
         }
     }
 }

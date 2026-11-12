@@ -26,32 +26,58 @@ THE SOFTWARE. */
 using System;
 using System.Collections.Concurrent;
 using Paramore.Brighter.Extensions;
+using Paramore.Brighter.Observability;
 
 namespace Paramore.Brighter
 {
     /// <summary>
     ///   Class Channel.
-    ///   An <see cref="IAmAChannel" /> for reading messages from a
+    ///   An <see cref="IAmAChannelSync" /> for reading messages from a
     ///   <a href="http://parlab.eecs.berkeley.edu/wiki/_media/patterns/taskqueue.pdf">Task Queue</a>
     ///   and acknowledging receipt of those messages
     /// </summary>
-    public class Channel : IAmAChannel
+    public class Channel : IAmAChannelSync, IHaveAMessagingSystem
     {
-        private readonly string _channelName;
-        private readonly IAmAMessageConsumer _messageConsumer;
-        private ConcurrentQueue<Message> _queue = new ConcurrentQueue<Message>();
+        private readonly IAmAMessageConsumerSync _messageConsumer;
+        private readonly ConcurrentQueue<Message> _queue = new();
         private readonly int _maxQueueLength;
-        private static readonly Message s_NoneMessage = new Message();
+        private static readonly Message s_noneMessage = new();
+        private bool _disposed;
+
+        /// <summary>
+        /// The name of a channel is its identifier
+        /// See Topic for the broker routing key
+        /// May be used for the queue name, if known, on middleware that supports named queues
+        /// </summary>
+        /// <value>The channel identifier</value>
+        public ChannelName Name { get; }
+        
+        /// <summary>
+        /// The topic that this channel is for (how a broker routes to it)
+        /// </summary>
+        /// <value>The topic on the broker</value>
+        public RoutingKey RoutingKey { get; }
+
+        /// <inheritdoc />
+        public MessagingSystem MessagingSystem =>
+            (_messageConsumer as IHaveAMessagingSystem)?.MessagingSystem ?? MessagingSystem.InternalBus;
 
         /// <summary>
         ///     Initializes a new instance of the <see cref="Channel" /> class.
         /// </summary>
         /// <param name="channelName">Name of the queue.</param>
+        /// <param name="routingKey"></param>
         /// <param name="messageConsumer">The messageConsumer.</param>
-        /// <param name="maxQueueLength">What is the maximum buffer size we will accelt</param>
-        public Channel(string channelName, IAmAMessageConsumer messageConsumer, int maxQueueLength = 1)
+        /// <param name="maxQueueLength">What is the maximum buffer size we will accept</param>
+        public Channel(
+            ChannelName channelName, 
+            RoutingKey routingKey, 
+            IAmAMessageConsumerSync messageConsumer,
+            int maxQueueLength = 1
+            )
         {
-            _channelName = channelName;
+            Name = channelName;
+            RoutingKey = routingKey;
             _messageConsumer = messageConsumer;
 
             if (maxQueueLength < 1 || maxQueueLength > 10)
@@ -64,22 +90,34 @@ namespace Paramore.Brighter
         }
 
         /// <summary>
-        ///  Acknowledges the specified message.
+        /// Acknowledges the specified message.
         /// </summary>
-        /// <param name="message">The message.</param>
-        public void Acknowledge(Message message)
+        /// <remarks>
+        /// When a message is acknowledged, another consumer should not process it
+        /// </remarks>
+        /// <param name="message">The<see cref="Message"/> to reject</param>
+        public virtual void Acknowledge(Message message)
         {
             _messageConsumer.Acknowledge(message);
         }
 
         /// <summary>
+        /// Nacks the specified message, releasing it back to the transport for redelivery.
+        /// </summary>
+        /// <param name="message">The <see cref="Message"/> to nack</param>
+        public virtual void Nack(Message message)
+        {
+            _messageConsumer.Nack(message);
+        }
+
+        /// <summary>
         /// Inserts messages into the channel for consumption by the message pump.
-        /// Note that there is an upperbound to what we can enqueue, although we always allow enqueing a quit
+        /// Note that there is an upperbound to what we can enqueue, although we always allow enqueueing a quit
         /// message. We will always try to clear the channel, when closing, as the stop message will get inserted
         /// after the queue
         /// </summary>
         /// <param name="messages">The messages to insert into the channel</param>
-        public void Enqueue(params Message[] messages)
+        public virtual void Enqueue(params Message[] messages)
         {
             var currentLength = _queue.Count;
             var messagesToAdd = messages.Length;
@@ -92,35 +130,48 @@ namespace Paramore.Brighter
             
             messages.Each((message) => _queue.Enqueue(message));
         }
-
-       /// <summary>
-        ///   Gets the name.
+ 
+        /// <summary>
+        /// Acknowledges locally buffered messages and purges the transport queue.
         /// </summary>
-        /// <value>The name.</value>
-        public ChannelName Name => new ChannelName(_channelName);
-
-       /// <summary>
-        /// Purges the queue
-        /// </summary>
-        public void Purge()
+        public virtual void Purge()
         {
+            while (_queue.TryDequeue(out var message))
+            {
+#pragma warning disable CS0618 // Message type identifies local pump control signals.
+                if (message.Header.MessageType != MessageType.MT_NONE && message.Header.MessageType != MessageType.MT_QUIT)
+#pragma warning restore CS0618
+                {
+                    try
+                    {
+                        _messageConsumer.Acknowledge(message);
+                    }
+                    catch
+                    {
+                        _queue.Enqueue(message);
+                        throw;
+                    }
+                }
+            }
+
             _messageConsumer.Purge();
-            _queue = new ConcurrentQueue<Message>();
         }
 
         /// <summary>
-        ///  Receives the specified timeout in milliseconds.
+        ///  The timeout to recieve wihtin.
         /// </summary>
-        /// <param name="timeoutinMilliseconds">The timeout in milliseconds.</param>
+        /// <param name="timeout">The <see cref="TimeSpan"/>"> timeout. If null default to 1s</param>
         /// <returns>Message.</returns>
-        public Message Receive(int timeoutinMilliseconds)
+        public virtual Message Receive(TimeSpan? timeout = null)
         {
-            if (!_queue.TryDequeue(out Message message))
+            timeout ??= TimeSpan.FromSeconds(1);
+            
+            if (!_queue.TryDequeue(out Message? message))
             {
-                Enqueue(_messageConsumer.Receive(timeoutinMilliseconds));
+                Enqueue(_messageConsumer.Receive(timeout));
                 if (!_queue.TryDequeue(out message))
                 {
-                    message = s_NoneMessage; //Will be MT_NONE
+                    message = s_noneMessage; //Will be MT_NONE
                 }
             }
 
@@ -128,36 +179,38 @@ namespace Paramore.Brighter
         }
 
         /// <summary>
-        ///  Rejects the specified message.
+        /// Rejects the specified message.
         /// </summary>
-        /// <param name="message">The message.</param>
-        public void Reject(Message message)
-        {
-            _messageConsumer.Reject(message, true);
-        }
+        /// When a message is rejected, another consumer should not process it. If there is a dead letter, or invalid
+        /// message channel, the message should be forwardedn to it
+        /// <param name="message">The <see cref="Message"/> to reject</param>
+        /// <param name="reason">The <see cref="MessageRejectionReason"/> that explaines why we rejected the mes
+        public virtual bool Reject(Message message, MessageRejectionReason? reason)
+            => _messageConsumer.Reject(message, reason);
 
         /// <summary>
         /// Requeues the specified message.
         /// </summary>
         /// <param name="message"></param>
-        /// <param name="delayMilliseconds">How long should we delay before requeueing</param>
-        public void Requeue(Message message, int delayMilliseconds = 0)
+        /// <param name="timeOut">How long should we delay before requeueing</param>
+        /// <returns>True if the message was re-queued false otherwise </returns>
+        public virtual bool Requeue(Message message, TimeSpan? timeOut = null)
         {
-            _messageConsumer.Requeue(message, delayMilliseconds);
+            return _messageConsumer.Requeue(message, timeOut);
         }
 
         /// <summary>
         ///  Stops this instance.
         /// </summary>
-        public void Stop()
+        public virtual void Stop(RoutingKey topic)
         {
-            _queue.Enqueue(MessageFactory.CreateQuitMessage());
+            _queue.Enqueue(MessageFactory.CreateQuitMessage(topic));
         }
 
         /// <summary>
         /// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
         /// </summary>
-        public void Dispose()
+        public virtual void Dispose()
         {
             Dispose(true);
             GC.SuppressFinalize(this);
@@ -165,6 +218,9 @@ namespace Paramore.Brighter
 
         private void Dispose(bool disposing)
         {
+            if (_disposed) return;
+            _disposed = true;
+
             if (disposing)
             {
                 _messageConsumer.Dispose();

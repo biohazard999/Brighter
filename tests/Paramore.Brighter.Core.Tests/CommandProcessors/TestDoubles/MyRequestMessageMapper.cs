@@ -1,22 +1,23 @@
-﻿using System;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
+﻿using System.Text.Json;
+using Paramore.Brighter.Extensions;
+using Paramore.Brighter.JsonConverters;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
     public class MyRequestMessageMapper : IAmAMessageMapper<MyRequest>
     {
-        public Message MapToMessage(MyRequest request)
+        public IRequestContext Context { get; set; }
+
+        public Message MapToMessage(MyRequest request, Publication publication)
         {
             var header = new MessageHeader(
                 messageId: request.Id, 
-                topic: "MyRequest", 
-                messageType:MessageType.MT_COMMAND,
+                topic: publication.Topic, 
+                messageType:request.RequestToMessageType(),
                 correlationId: request.ReplyAddress.CorrelationId,
                 replyTo: request.ReplyAddress.Topic);
 
-            var json = new JObject(new JProperty("Id", request.Id), new JProperty("RequestValue", request.RequestValue));
-            var body = new MessageBody(json.ToString());
+            var body = new MessageBody(JsonSerializer.Serialize(request.RequestValue, JsonSerialisationOptions.Options));
             var message = new Message(header, body);
             return message;
   
@@ -26,9 +27,9 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
         {
             var replyAddress = new ReplyAddress(topic: message.Header.ReplyTo, correlationId: message.Header.CorrelationId);
             var command = new MyRequest(replyAddress);
-            var messageBody = JObject.Parse(message.Body.Value);
-            command.Id = Guid.Parse((string)messageBody["Id"]);
-            command.RequestValue = (string) messageBody["RequestValue"];
+            var myRequest = JsonSerializer.Deserialize<MyRequest>(message.Body.Value, JsonSerialisationOptions.Options);
+            command.Id = myRequest.Id;
+            command.RequestValue = myRequest.RequestValue;
             return command;
         }
     }

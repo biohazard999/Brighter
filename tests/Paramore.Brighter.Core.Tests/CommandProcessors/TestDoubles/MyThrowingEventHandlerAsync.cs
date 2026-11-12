@@ -23,14 +23,12 @@ THE SOFTWARE. */
 #endregion
 
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyThrowingEventHandlerAsync : RequestHandlerAsync<MyEvent>
+    internal sealed class MyThrowingEventHandlerAsync : RequestHandlerAsync<MyEvent>
     {
         private static MyEvent s_receivedEvent;
 
@@ -39,7 +37,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
             s_receivedEvent = null;
         }
 
-        public override async Task<MyEvent> HandleAsync(MyEvent command, CancellationToken cancellationToken = default(CancellationToken))
+        public override async Task<MyEvent> HandleAsync(MyEvent command, CancellationToken cancellationToken = default)
         {
             LogEvent(command);
 

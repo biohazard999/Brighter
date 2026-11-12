@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* 
 ------------------------------------------------------------------------------------------------  
 TimeoutAfter method derived from work by Joe Hoag http://blogs.msdn.com/b/pfxteam/archive/2011/11/10/10235834.aspx 
@@ -71,6 +71,7 @@ namespace Paramore.Brighter.Policies.Handlers
     /// The handler is injected into the pipeline if the <see cref="TimeoutPolicyAttribute"/>
     /// </summary>
     /// <typeparam name="TRequest">The type of the t request.</typeparam>
+    [Obsolete("Migrate to UsePolicyAttribute or UseResiliencePipelineAttribute instead")]
     public class TimeoutPolicyHandler<TRequest> : RequestHandler<TRequest> where TRequest : class, IRequest
     {
         /// <summary>
@@ -84,18 +85,18 @@ namespace Paramore.Brighter.Policies.Handlers
         /// Initializes from attribute parameters.
         /// </summary>
         /// <param name="initializerList">The initializer list.</param>
-        public override void InitializeFromAttributeParams(params object[] initializerList)
+        public override void InitializeFromAttributeParams(params object?[] initializerList)
         {
-            _milliseconds = (int)initializerList[0];
+            _milliseconds = (int?)initializerList[0] ?? 0;
         }
 
         /// <summary>
-        /// Runs the remainder of the pipeline within a task that will timeout if it does not complete within the
-        /// configured numbere of milliseconds
+        /// Runs the remainder of the pipeline within a parentTask that will timeout if it does not complete within the
+        /// configured number of milliseconds
         /// </summary>
-        /// <param name="command">The command.</param>
+        /// <param name="request">The command.</param>
         /// <returns>TRequest.</returns>
-        public override TRequest Handle(TRequest command)
+        public override TRequest Handle(TRequest request)
         {
             var cts = new CancellationTokenSource();
             var ct = cts.Token;
@@ -103,20 +104,20 @@ namespace Paramore.Brighter.Policies.Handlers
             var timeoutTask = Task<TRequest>.Factory.StartNew(
                 function: () =>
                 {
-                    //we already cancelled the task
+                    //we already cancelled the parentTask
                     ct.ThrowIfCancellationRequested();
                     //allow the handlers that can timeout to grab the cancellation token
-                    Context.Bag[CONTEXT_BAG_TIMEOUT_CANCELLATION_TOKEN] = ct;
-                    return base.Handle(command);
+                    Context?.Bag.AddOrUpdate(CONTEXT_BAG_TIMEOUT_CANCELLATION_TOKEN, ct, (s, o) => o = ct);
+                    return base.Handle(request);
                 },
                 cancellationToken: ct,
                 creationOptions: TaskCreationOptions.LongRunning,
-                scheduler: TaskScheduler.Current
+                scheduler: TaskScheduler.Default
                 );
 
             var task = TimeoutAfter(task: timeoutTask, millisecondsTimeout: _milliseconds, cancellationTokenSource: cts);
 
-            task.Wait();
+            task.Wait(ct);
 
             return task.Result;
         }
@@ -125,16 +126,16 @@ namespace Paramore.Brighter.Policies.Handlers
 
         private Task<TRequest> TimeoutAfter(Task<TRequest> task, int millisecondsTimeout, CancellationTokenSource cancellationTokenSource)
         {
-            // Short-circuit #1: infinite timeout or task already completed
+            // Short-circuit #1: infinite timeout or parentTask already completed
             if (task.IsCompleted || (millisecondsTimeout == Timeout.Infinite))
             {
-                // Either the task has already completed or timeout will never occur.
+                // Either the parentTask has already completed or timeout will never occur.
                 // No proxy necessary.
                 return task;
             }
 
             // tcs.Task will be returned as a proxy to the caller
-            var tcs = new TaskCompletionSource<TRequest>();
+            var tcs = new TaskCompletionSource<TRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             // Short-circuit #2: zero timeout
             if (millisecondsTimeout == 0)
@@ -151,27 +152,27 @@ namespace Paramore.Brighter.Policies.Handlers
             var timer = new Timer(state =>
                 {
                     // Recover your state information
-                    var myTcs = (TaskCompletionSource<TRequest>)state;
+                    var myTcs = (TaskCompletionSource<TRequest>?)state;
 
                     //signal cancellation to tasks that have run out of time - its up to them to try and abort
                     cancellationTokenSource.Cancel();
 
                     // Fault our proxy with a TimeoutException
-                    myTcs.TrySetException(new TimeoutException());
+                    myTcs!.TrySetException(new TimeoutException());
                 },
                 tcs,
                 millisecondsTimeout,
                 Timeout.Infinite
             );
 
-            // Wire up the logic for what happens when source task completes
+            // Wire up the logic for what happens when source parentTask completes
             task.ContinueWith((antecedent, state) =>
                 {
                     // Recover our state data
-                    var tuple = (Tuple<Timer, TaskCompletionSource<TRequest>>)state;
+                    var tuple = (Tuple<Timer, TaskCompletionSource<TRequest>>?)state;
 
                     // Cancel the Timer
-                    tuple.Item1.Dispose();
+                    tuple!.Item1.Dispose();
 
                     // Marshal results to proxy
                     MarshalTaskResults(antecedent, tuple.Item2);
@@ -190,7 +191,7 @@ namespace Paramore.Brighter.Policies.Handlers
             switch (source.Status)
             {
                 case TaskStatus.Faulted:
-                    proxy.TrySetException(source.Exception);
+                    proxy.TrySetException(source.Exception!);
                     break;
                 case TaskStatus.Canceled:
                     proxy.TrySetCanceled();

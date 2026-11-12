@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -23,7 +23,12 @@ THE SOFTWARE. */
 #endregion
 
 using System;
-using Newtonsoft.Json;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using Paramore.Brighter.JsonConverters;
+using Paramore.Brighter.Policies.Attributes;
+using Paramore.Brighter.Policies.Handlers;
+using Polly.CircuitBreaker;
 
 namespace Paramore.Brighter.Logging.Handlers
 {
@@ -33,9 +38,9 @@ namespace Paramore.Brighter.Logging.Handlers
     /// The log shows the original <see cref="IRequest"/> properties as well as the timer handling.
     /// </summary>
     /// <typeparam name="TRequest">The type of the t request.</typeparam>
-    public class RequestLoggingHandler<TRequest> : RequestHandler<TRequest> where TRequest : class, IRequest
+    public partial class RequestLoggingHandler<TRequest> : RequestHandler<TRequest> where TRequest : class, IRequest
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<RequestLoggingHandler<TRequest>>);
+        private static readonly ILogger s_logger= ApplicationLogging.CreateLogger<RequestLoggingHandler<TRequest>>();
 
         private HandlerTiming _timing;
 
@@ -43,20 +48,20 @@ namespace Paramore.Brighter.Logging.Handlers
         /// Initializes from attribute parameters.
         /// </summary>
         /// <param name="initializerList">The initializer list.</param>
-        public override void InitializeFromAttributeParams(params object[] initializerList)
+        public override void InitializeFromAttributeParams(params object?[] initializerList)
         {
-            _timing = (HandlerTiming)initializerList[0];
+            _timing = (HandlerTiming?)initializerList[0] ?? HandlerTiming.Before;
         }
 
         /// <summary>
         /// Handles the specified command.
         /// </summary>
-        /// <param name="command">The command.</param>
+        /// <param name="request">The command.</param>
         /// <returns>TRequest.</returns>
-        public override TRequest Handle(TRequest command)
+        public override TRequest Handle(TRequest request)
         {
-            LogCommand(command);
-            return base.Handle(command);
+            Log.LogCommand(s_logger, _timing.ToString(), typeof(TRequest), JsonSerializer.Serialize(request, JsonSerialisationOptions.Options), DateTime.UtcNow);
+            return base.Handle(request);
         }
 
         /// <summary>
@@ -69,7 +74,7 @@ namespace Paramore.Brighter.Logging.Handlers
         /// Steps that don't know how to handle should pass through.
         /// Useful alternatives for Fallback are to try via the cache.
         /// Note that a Fallback handler implementation should not catch exceptions in the <see cref="RequestHandler{TRequest}.Fallback"/> chain to avoid an infinite loop.
-        /// Call <see cref="RequestHandler{TRequest}.Successor"/>.<see cref="RequestHandler{TRequest}.Handle"/> if having provided a Fallback you want the chain to return to the 'happy' path. Excerise caution here though
+        /// Call <see cref="RequestHandler{TRequest}.SetSuccessor"/>.<see cref="RequestHandler{TRequest}.Handle"/> if having provided a Fallback you want the chain to return to the 'happy' path. Exercise caution here though
         /// as you do not know who generated the exception that caused the fallback chain.
         /// For this reason, the <see cref="FallbackPolicyHandler{TRequest}"/> puts the exception in the request context.
         /// When the <see cref="FallbackPolicyAttribute"/> is set on the <see cref="RequestHandler{TRequest}.Handle"/> method of a derived class
@@ -80,18 +85,18 @@ namespace Paramore.Brighter.Logging.Handlers
         /// <returns>TRequest.</returns>
         public override TRequest Fallback(TRequest command)
         {
-            LogFailure(command);
+            Log.LogFailure(s_logger, typeof(TRequest), JsonSerializer.Serialize(command, JsonSerialisationOptions.Options), DateTime.UtcNow);
             return base.Fallback(command);
         }
 
-        private void LogCommand(TRequest request)
+        private static partial class Log
         {
-            _logger.Value.InfoFormat("Logging handler pipeline call. Pipeline timing {0} target, for {1} with values of {2} at: {3}", _timing.ToString(), typeof(TRequest), JsonConvert.SerializeObject(request), DateTime.UtcNow);
-        }
+            [LoggerMessage(LogLevel.Information, "Logging handler pipeline call. Pipeline timing {HandlerTiming} target, for {RequestType} with values of {Request} at: {Time}")]
+            public static partial void LogCommand(ILogger logger, string handlerTiming, Type requestType, string request, DateTime time);
 
-        private void LogFailure(TRequest request)
-        {
-            _logger.Value.InfoFormat("Failure in pipeline call for {0} with values of {1} at: {2}", typeof(TRequest), JsonConvert.SerializeObject(request), DateTime.UtcNow);
+            [LoggerMessage(LogLevel.Information, "Failure in pipeline call for {RequestType} with values of {Request} at: {Time}")]
+            public static partial void LogFailure(ILogger logger, Type requestType, string request, DateTime time);
         }
     }
 }
+

@@ -24,23 +24,79 @@ THE SOFTWARE. */
 
 namespace Paramore.Brighter.Inbox.MsSql
 {
+    /// <summary>
+    /// Provide SQL statement helpers for creation of an Inbox
+    /// </summary>
     public class SqlInboxBuilder
     {
-        private const string _outboxDDL = @"
-                    CREATE TABLE {0}
-                        (
-                            [Id] [BIGINT] IDENTITY(1, 1) NOT NULL ,
-                            [CommandId] [UNIQUEIDENTIFIER] NOT NULL ,
-                            [CommandType] [NVARCHAR](256) NULL ,
-                            [CommandBody] [NTEXT] NULL ,
-                            [Timestamp] [DATETIME] NULL ,
-                            [ContextKey] [NVARCHAR](256) NULL,
-                            PRIMARY KEY ( [Id] )
-                        );";
+        private const string TextInboxDDL =
+            """
+            CREATE TABLE {0}
+            (
+                [Id] [BIGINT] IDENTITY(1, 1) NOT NULL ,
+                [CommandId] [NVARCHAR](256) NOT NULL ,
+                [CommandType] [NVARCHAR](256) NULL ,
+                [CommandBody] [NVARCHAR](MAX) NULL ,
+                [Timestamp] [DATETIME] NULL ,
+                [ContextKey] [NVARCHAR](256) NULL,
+                [CausationId] [NVARCHAR](256) NULL,
+                PRIMARY KEY ( [Id] )
+            );
+            """;
 
-        public static string GetDDL(string tableName)
+        private const string BinaryInboxDDL =
+            """
+            CREATE TABLE {0}
+            (
+                [Id] [BIGINT] IDENTITY(1, 1) NOT NULL ,
+                [CommandId] [NVARCHAR](256) NOT NULL ,
+                [CommandType] [NVARCHAR](256) NULL ,
+                [CommandBody] [VARBINARY](MAX) NULL ,
+                [Timestamp] [DATETIME] NULL ,
+                [ContextKey] [NVARCHAR](256) NULL,
+                [CausationId] [NVARCHAR](256) NULL,
+                PRIMARY KEY ( [Id] )
+            );
+            """;
+
+
+
+        private const string INBOX_EXISTS_SQL = @"IF EXISTS (
+            SELECT 1
+            FROM sys.tables t
+            INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE t.name = '{0}' AND s.name = '{1}'
+        ) SELECT 1 AS TableExists; ELSE SELECT 0 AS TableExists;";
+
+        /// <summary>
+        /// Get the DDL statements to create an Inbox in MSSQL
+        /// </summary>
+        /// <param name="inboxTableName">The name you want to use for the table</param>
+        /// <param name="binaryMessagePayload">Should the command body be stored as binary.</param>
+        /// <param name="schemaName">
+        /// Optional MSSQL schema name. When non-null, the emitted DDL schema-qualifies the
+        /// table as <c>[schemaName].[inboxTableName]</c>; otherwise the table is emitted
+        /// unqualified and lands in the connection's default schema. Callers configuring
+        /// <see cref="Paramore.Brighter.IAmARelationalDatabaseConfiguration.SchemaName"/>
+        /// rely on the table actually landing in that schema, which the unqualified form
+        /// cannot guarantee.
+        /// </param>
+        /// <returns>The required DDL</returns>
+        public static string GetDDL(string inboxTableName, bool binaryMessagePayload = false, string? schemaName = null)
         {
-            return string.Format(_outboxDDL, tableName);
+            var qualifiedTable = schemaName is null
+                ? inboxTableName
+                : $"[{schemaName}].[{inboxTableName}]";
+            return string.Format(binaryMessagePayload ? BinaryInboxDDL : TextInboxDDL, qualifiedTable);
         }
+
+        /// <summary>
+        /// Get the SQL statements required to test for the existence of an Inbox in MSSQL.
+        /// </summary>
+        /// <param name="inboxTableName">The name that was used for the Inbox table.</param>
+        /// <param name="schemaName">The schema name for the Inbox table. Defaults to 'dbo'.</param>
+        /// <returns>The required SQL.</returns>
+        public static string GetExistsQuery(string inboxTableName, string schemaName = "dbo") =>
+            string.Format(INBOX_EXISTS_SQL, inboxTableName, schemaName);
     }
 }

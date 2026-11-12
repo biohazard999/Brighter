@@ -1,5 +1,5 @@
 Brighter contributors (sorted alphabeticaly)
-============================================
+============================================l
 
 **[Vicenç García Altés](https://github.com/vgaltes)**
   * Various fixes 
@@ -17,13 +17,15 @@ Brighter contributors (sorted alphabeticaly)
 
 **[Ed Blackburn](https://github.com/edblackburn)** 
  * Documentation fixes
+
+**[F Bryant](https://github.com/FBryant87)**
+ * New ASB Transport
  
 **[Ian Cooper](https://github.com/iancooper)**
-  * Wrote first version of Command Processor, Policy, RavenDb Outbox, RMQ gateway, RestMS Core, RestMS Server, RestMS Gateway and ServiceActivator, Control Bus
+  * Wrote first version of Command Processor, Policy, RavenDb Outbox, Redis Messaging Gateway, RMQ gateway, RestMS Core, RestMS Server, RestMS Gateway and ServiceActivator, Control Bus
   * Various fixes
-  * Project Technical Lead
+  * Project Owner
   * Committer
-  * Redis Messaging Gateway
   
 **[Derek Comartin](https://github.com/dcomartin)**
  * MySQL outbox and inbox
@@ -31,7 +33,16 @@ Brighter contributors (sorted alphabeticaly)
 **[Jamie Clayton](https://github.com/mit-jamie-clayton)**
 * Documentation fixes
 
-**[ACraven](https://github.com/acraven)**
+**[A Craven](https://github.com/acraven)**
+  * Various fixes
+
+**[MikeFreeman](https://github.com/MikeFreeman-Flagstone)**
+ * Archiver Fixes
+
+**[Irakli Gabisonia](https://github.com/gabisonia)**
+ * Various fixes
+
+**[Abhishek Gajavilli](https://github.com/Abhishek84313)**
   * Various fixes
   
 **[Bob Gregory](https://github.com/BobFromHuddle)**
@@ -39,7 +50,7 @@ Brighter contributors (sorted alphabeticaly)
   * Work on Postel's Law (Tolerant Reader) messaging approach
   
 **[Scott Hanselman](https://github.com/shanselman)**
-  * Various fixes
+  * Various fixes 
 
 **[Toby Henderson](https://github.com/holytshirt)**
   * Various fixes
@@ -47,6 +58,10 @@ Brighter contributors (sorted alphabeticaly)
   * Build and Packaging
   * Committer
   * Servicer of pull requests
+
+**[Dominic Hickie](https://github.com/dhickie)**
+  * Various fixes
+  * Dynamo Db lock provider 
    
 **[Fred Hoogduin](https://github.com/Red-F)**
   * Various fixes
@@ -69,8 +84,20 @@ Brighter contributors (sorted alphabeticaly)
  * Various fixes
 
 **[Eddie Li](https://github.com/xiaodili)**
-  * Various fixes   
-  
+  * Various fixes
+
+**[Rafael Lillo](https://github.com/lillo42)
+  * Various fixes
+  * Scheduler
+  * Generated Conformance Tests
+
+**[Tom Longhurst](https://github.com/thomhurst)**
+ * DI improvements
+ * Open Telemetry additions
+
+**[Bálint Mórász](https://github.com/morbalint)**
+  * Various fixes
+
 **[James Morcom](https://github.com/mrmorcs)**
   * Documentation fixes
   
@@ -85,6 +112,10 @@ Brighter contributors (sorted alphabeticaly)
   
 **[Domenico Musto](https://github.com/domspektrix?)**
   * Fix issue with multiple performers having name clashes
+  * New ASB Transport
+
+**[Aboubakr Nasef](https://github.com/AboubakrNasef)**
+  * Added TickerQ as a scheduler
   
 **[Jonny Olliff-Lee](https://github.com/DevJonny)**
   * Documentation Fixes
@@ -114,27 +145,67 @@ Brighter contributors (sorted alphabeticaly)
   * SQL Outbox
   * Various fixes
 
+**[isakovich](https://github.com/isakovich)**
+  * Json Serializer Options fixes
+
 **[Tarun Pothulapati](https://github.com/Pothulapati)**
   * PostgreSQL Outbox
+
+**[Miguel Ramirez](https://github.com/xbizzybone)**
+  * Request validation handler with FluentValidation, DataAnnotations and Specification providers
+
+**[Ravriel](https://github.com/ravriel)**
+ * RabbitMQ Fixes
+
+**[Paul Reardon](https://github.com/preardon)**
+  * Improvements to ASB Transport 
+  * Replaced Newtonsoft.Json with System.Text.Json
+  * Created Social Media Card
+  * Added Token Based Authentication to MsSQL Inbox and OutBox
+  * Added Structured Logging
+  * Added Token Based Authentication to MsSQL Inbox and OutBox
 
 **[tmschlot](https://github.com/tmschlot)**
   * Various fixes
   
+**[Sagar Sahay](https://github.com/sagarSahay)**  
+ * New ASB Transport
+
+**[Tim Salva](https://github.com/jtsalva)**
+ * AWS fixes
+ * Metrics
+  
 **[Tim Seaward](https://github.com/Drawaes)**
  * Fix unecessary allocations
+
+**[Alessandro Signorett](https://github.com/alesgn)**
+ * New ASB Transport
+
+**[Damon Siusta](https://github.com/damonsiusta)**
+ * New ASB Transport
 
 **[Daniel Stockhammer](https://github.com/dstockhammer?tab=activity)** 
   * Various fixes
   * Clean up the ILog constructor
   * Clean up the CancellationToken
 
+**[Jakub Syty](https://github.com/jakoss)**
+  * Various Fixes
+  * MongoDb EF Integration 
+
 **[Richard Tappenden](https://github.com/tapmantwo)**
   * Various fixes
   * Command Sourcing Once-Only improvements
   * Inbox improvements
 
+**[Thijmen Stavenuiter](https://github.com/Thijmen)**
+  * Various fixes 
+
 **[Yiannis Triantafyllopoulos](https://github.com/yiannistri)**  
   * Various Fixes
+
+**[Avtandil Ushikishvili](https://github.com/AVTUNEY)**
+  * Various fixes
   
 **[Tim van Wijk](https://github.com/timvw74)**
   * Kafka transport fixes  
@@ -142,6 +213,8 @@ Brighter contributors (sorted alphabeticaly)
 **[Joseph Woodward](https://github.com/JosephWoodward)**  
   * Documentation fixes 
   
-**[Wilson](https://github.com/drewsuccess)
+**[Wilson](https://github.com/drewsuccess)**
   * Various fixes
-  
+
+**[Islam Mohamed Zakaria](https://github.com/IslamZakaria)**
+  * Set Kafka LibrdKafka error reporting levels

@@ -22,25 +22,45 @@ THE SOFTWARE. */
 
 #endregion
 
+using System.Threading;
+using System.Threading.Tasks;
 using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
 using Paramore.Brighter.FeatureSwitch;
 using Paramore.Brighter.FeatureSwitch.Attributes;
 
 namespace Paramore.Brighter.Core.Tests.FeatureSwitch.TestDoubles
 {
-    class MyFeatureSwitchedOffHandler : RequestHandler<MyCommand>
+    sealed class MyFeatureSwitchedOffHandler : RequestHandler<MyCommand>
     {
         public static bool CommandReceived { get; set; }
 
-        [FeatureSwitch(typeof(MyFeatureSwitchedOffHandler), FeatureSwitchStatus.Off, 1, HandlerTiming.Before)]
-        public override MyCommand Handle(MyCommand comand)
+        [FeatureSwitch(typeof(MyFeatureSwitchedOffHandler), FeatureSwitchStatus.Off, 1)]
+        public override MyCommand Handle(MyCommand myCommand)
         {
             CommandReceived = true;
 
-            return base.Handle(comand);
+            return base.Handle(myCommand);
         }
 
-        public static bool DidReceive(MyCommand command)
+        public static bool DidReceive()
+        {
+            return CommandReceived;
+        }
+    }
+    
+    sealed class MyFeatureSwitchedOffHandlerAsync : RequestHandlerAsync<MyCommandAsync>
+    {
+        public static bool CommandReceived { get; set; }
+
+        [FeatureSwitchAsync(typeof(MyFeatureSwitchedOffHandlerAsync), FeatureSwitchStatus.Off, 1)]
+        public override async Task<MyCommandAsync> HandleAsync(MyCommandAsync command, CancellationToken cancellationToken = default)
+        {
+            CommandReceived = true;
+
+            return await base.HandleAsync(command, cancellationToken);
+        }
+
+        public static bool DidReceive()
         {
             return CommandReceived;
         }

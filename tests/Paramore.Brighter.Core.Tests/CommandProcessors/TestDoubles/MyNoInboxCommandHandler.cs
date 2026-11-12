@@ -26,7 +26,7 @@ using Paramore.Brighter.Inbox.Attributes;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyNoInboxCommandHandler : RequestHandler<MyCommand>
+    internal sealed class MyNoInboxCommandHandler : RequestHandler<MyCommand>
     {
         private static MyCommand s_command;
 
@@ -35,10 +35,10 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
         }
 
         [NoGlobalInbox]
-        public override MyCommand Handle(MyCommand command)
+        public override MyCommand Handle(MyCommand myCommand)
         {
-            LogCommand(command);
-            return base.Handle(command);
+            LogCommand(myCommand);
+            return base.Handle(myCommand);
         }
 
         private void LogCommand(MyCommand request)

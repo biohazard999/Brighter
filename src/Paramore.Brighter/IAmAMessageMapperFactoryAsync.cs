@@ -1,0 +1,87 @@
+#region Licence
+/* The MIT License (MIT)
+Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the “Software”), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+
+#endregion
+
+using System;
+using System.Threading.Tasks;
+
+namespace Paramore.Brighter
+{
+    /// <summary>
+    /// Interface IAmAMessageMapperFactoryAsync
+    /// In order to use a <a href="http://parlab.eecs.berkeley.edu/wiki/_media/patterns/taskqueue.pdf">Task Queue</a> approach we require you to provide
+    /// a <see cref="IAmAMessageMapper"/> to map between <see cref="Command"/> or <see cref="Event"/> and a <see cref="Message"/> registered via <see cref="IAmAMessageMapperRegistry"/>
+    /// We then call the instance of the factory which the client provides to create instances of that <see cref="IAmAMessageMapper"/>. You will need to implement the
+    /// <see cref="IAmAMessageMapperFactory"/> to use the Task Queue approach, and provide the instance of your mapper on request. Typically you might use an IoC container
+    /// to implement this.
+    /// </summary>
+    public interface IAmAMessageMapperFactoryAsync
+    {
+        /// <summary>
+        /// Offers a DI scope for the transform pipeline being built to share across every mapper and
+        /// transform it creates. A factory with no container to scope returns <c>null</c>.
+        /// </summary>
+        /// <returns>A pipeline scope handle, or <c>null</c> if this factory offers none.</returns>
+        IAmAScope? CreatePipelineScope();
+
+        /// <summary>
+        /// Creates the specified message mapper type, returning a <see cref="Lease{T}"/> that identifies this
+        /// resolution so it can later be released back to this factory.
+        /// </summary>
+        /// <param name="messageMapperType">Type of the message mapper.</param>
+        /// <param name="scope">The pipeline scope to resolve from, if this factory offered one.</param>
+        /// <returns>A lease over the created mapper, or <c>null</c> if none could be created.</returns>
+        Lease<IAmAMessageMapperAsync>? Create(Type messageMapperType, IAmAScope? scope = null);
+
+        /// <summary>
+        /// Releases the mapper resolution identified by <paramref name="lease"/> once the pipeline that owns it
+        /// has finished with it.
+        /// </summary>
+        /// <remarks>
+        /// A factory that creates a mapper per message must release it, or any resource the mapper holds
+        /// — and, for an IoC container, the scope the mapper was resolved from — is retained until the
+        /// factory itself is disposed at shutdown. Releasing by lease reclaims exactly this resolution's scope.
+        /// A factory that hands out a shared instance, or whose instances it does not own, should make this a
+        /// no-op. This is synchronous, mirroring <see cref="IAmAMessageTransformerFactoryAsync.Release"/>. On a
+        /// thread owned by the Proactor's single-threaded synchronization context prefer
+        /// <see cref="ReleaseAsync"/>.
+        /// </remarks>
+        /// <param name="lease">The lease returned by <see cref="Create"/> for the mapper to release.</param>
+        void Release(Lease<IAmAMessageMapperAsync>? lease);
+
+        /// <summary>
+        /// Releases the mapper resolution identified by <paramref name="lease"/> asynchronously, awaiting its
+        /// disposal.
+        /// </summary>
+        /// <remarks>
+        /// The asynchronous counterpart of <see cref="Release"/>, called from the async pipeline's
+        /// <c>DisposeAsync</c>. Awaiting an <see cref="IAsyncDisposable"/> mapper's disposal rather than
+        /// blocking on it keeps the Proactor pump thread free to run any continuation the mapper's
+        /// <c>DisposeAsync</c> posts back to its single-threaded synchronization context. A factory that
+        /// hands out a shared instance, or holds no resources, should make this a no-op returning
+        /// <c>default</c>.
+        /// </remarks>
+        /// <param name="lease">The lease returned by <see cref="Create"/> for the mapper to release.</param>
+        ValueTask ReleaseAsync(Lease<IAmAMessageMapperAsync>? lease);
+    }
+}

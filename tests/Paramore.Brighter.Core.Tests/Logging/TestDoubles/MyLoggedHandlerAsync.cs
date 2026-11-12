@@ -5,10 +5,10 @@ using Paramore.Brighter.Logging.Attributes;
 
 namespace Paramore.Brighter.Core.Tests.Logging.TestDoubles
 {
-    internal class MyLoggedHandlerAsync : RequestHandlerAsync<MyCommand>
+    internal sealed class MyLoggedHandlerAsync : RequestHandlerAsync<MyCommand>
     {
         [RequestLoggingAsync(0, HandlerTiming.Before)]
-        public override Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default(CancellationToken))
+        public override Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default)
         {
             return base.HandleAsync(command, cancellationToken);
         }

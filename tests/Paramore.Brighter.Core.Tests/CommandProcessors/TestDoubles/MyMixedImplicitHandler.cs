@@ -24,12 +24,12 @@ THE SOFTWARE. */
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyMixedImplicitHandler : RequestHandler<MyCommand>
+    internal sealed class MyMixedImplicitHandler : RequestHandler<MyCommand>
     {
         [MyLoggingHandlerAsync(1)]
-        public override MyCommand Handle(MyCommand command)
+        public override MyCommand Handle(MyCommand myCommand)
         {
-            return base.Handle(command);
+            return base.Handle(myCommand);
         }
     }
 }

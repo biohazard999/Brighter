@@ -1,21 +1,25 @@
 ﻿using System;
+using System.Threading.Tasks;
 using Paramore.Brighter.MessagingGateway.Redis;
 
 namespace Paramore.Brighter.Redis.Tests.MessagingGateway
 {
-    public class RedisFixture : IDisposable
+    public class RedisFixture : IAsyncDisposable, IDisposable
     {
-        private const string QueueName = "test";
-        protected const string Topic = "test";
+        public readonly RoutingKey Topic;
         public readonly RedisMessageProducer MessageProducer;
         public readonly RedisMessageConsumer MessageConsumer;
 
         public RedisFixture()
         {
+            var uniqueId = Guid.NewGuid().ToString("N")[..8];
+            Topic = new RoutingKey($"test-{uniqueId}");
+            var queueName = new ChannelName($"test-{uniqueId}");
+
             RedisMessagingGatewayConfiguration configuration = RedisMessagingGatewayConfiguration();
 
-            MessageProducer = new RedisMessageProducer(configuration);
-            MessageConsumer = new RedisMessageConsumer(configuration, QueueName, Topic);
+            MessageProducer = new RedisMessageProducer(configuration, new RedisMessagePublication {Topic = Topic});
+            MessageConsumer = new RedisMessageConsumer(configuration, queueName, Topic);
         }
 
         public static RedisMessagingGatewayConfiguration RedisMessagingGatewayConfiguration()
@@ -35,6 +39,13 @@ namespace Paramore.Brighter.Redis.Tests.MessagingGateway
             MessageConsumer.Purge();
             MessageConsumer.Dispose();
             MessageProducer.Dispose();
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await MessageConsumer.PurgeAsync();
+            await MessageConsumer.DisposeAsync();
+            await MessageProducer.DisposeAsync();
         }
     }
 }

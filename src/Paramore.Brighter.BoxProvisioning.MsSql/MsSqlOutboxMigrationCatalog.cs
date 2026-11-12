@@ -1,0 +1,267 @@
+#region Licence
+/* The MIT License (MIT)
+Copyright © 2026 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+#endregion
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Paramore.Brighter.Outbox.MsSql;
+
+namespace Paramore.Brighter.BoxProvisioning.MsSql;
+
+/// <summary>
+/// Defines the migration history for MSSQL outbox tables.
+/// </summary>
+/// <remarks>
+/// V1's <c>UpScript</c> is the literal historical baseline DDL — the MSSQL outbox builder
+/// shape before <c>Dispatched</c> (as at commit <c>3c30343fa^</c>; pre-CloudEvents). The outbox
+/// first shipped in commit <c>3cf37bbe9</c> (June 2015); the <c>Id</c> column was added in
+/// <c>e6ff9e673</c> (October 2016).
+/// The fresh-install fast path (ADR 0057 §3) takes its DDL from <see cref="FreshInstallDdl"/>
+/// instead, so V1.UpScript carries the historical shape. V2..V7 are conditional
+/// <c>ALTER TABLE ADD</c> statements guarded by <c>IF COL_LENGTH(...) IS NULL</c> per ADR
+/// 0057 §5, so each one is idempotent and safe to re-execute on chain replay. V8 adds
+/// <c>CausationId</c> plus a replay index on it. V9 adds a unique MessageId index that ignores
+/// duplicate inserts without discarding distinct messages from a bulk insert. Existing duplicate
+/// IDs stop the migration without changing rows or advancing history; resolve them and retry.
+/// <para>
+/// V9 takes an exclusive table lock while checking duplicates and creating the index. Schedule
+/// provisioning accordingly for large or busy outboxes. To identify conflicts before upgrading,
+/// substitute the configured schema and table in this query:
+/// <code>
+/// SELECT [MessageId], COUNT_BIG(*) AS [Copies]
+/// FROM [dbo].[Outbox]
+/// GROUP BY [MessageId] HAVING COUNT_BIG(*) &gt; 1;
+/// </code>
+/// Review payloads and dispatch state before choosing which conflicting rows to retain.
+/// </para>
+/// <para>
+/// The accumulated <c>LogicalColumns</c> across
+/// V1..V9 plus the MSSQL housekeeping <c>Id</c> column equals the live builder's column set
+/// — verified by the drift test in <c>tests/Paramore.Brighter.MSSQL.Tests/BoxProvisioning</c>.
+/// </para>
+/// </remarks>
+public class MsSqlOutboxMigrationCatalog : IAmABoxMigrationCatalog
+{
+    internal const int MESSAGE_ID_UNIQUENESS_VERSION = 9;
+
+    private const string DefaultSchema = "dbo";
+
+    private static readonly string[] s_v1Columns =
+        ["MessageId", "Topic", "MessageType", "Timestamp", "HeaderBag", "Body"];
+
+    // The outbox DDL before Dispatched (as at 3c30343fa^). {0} is the validated table
+    // name, bracket-quoted so reserved words (User, Order) parse.
+    private const string V1HistoricalDdl =
+        """
+        CREATE TABLE [{0}]
+            (
+              [Id] [BIGINT] NOT NULL IDENTITY ,
+              [MessageId] UNIQUEIDENTIFIER NOT NULL ,
+              [Topic] NVARCHAR(255) NULL ,
+              [MessageType] NVARCHAR(32) NULL ,
+              [Timestamp] DATETIME NULL ,
+              [HeaderBag] NTEXT NULL ,
+              [Body] NTEXT NULL ,
+              PRIMARY KEY ( [Id] )
+            );
+        """;
+
+    private static readonly string[] s_v2AddedColumns = ["Dispatched"];
+    private static readonly string[] s_v3AddedColumns = ["CorrelationId", "ReplyTo", "ContentType"];
+    private static readonly string[] s_v4AddedColumns = ["PartitionKey"];
+
+    private static readonly string[] s_v5AddedColumns =
+        ["Source", "Type", "DataSchema", "Subject", "TraceParent", "TraceState", "Baggage"];
+
+    private static readonly string[] s_v6AddedColumns = ["WorkflowId", "JobId"];
+    private static readonly string[] s_v7AddedColumns = ["DataRef", "SpecVersion"];
+    private static readonly string[] s_v8AddedColumns = ["CausationId"];
+
+    /// <inheritdoc />
+    public string FreshInstallDdl(IAmARelationalDatabaseConfiguration configuration)
+    {
+        Identifiers.AssertSafe(
+            configuration.OutBoxTableName,
+            nameof(IAmARelationalDatabaseConfiguration.OutBoxTableName));
+        if (configuration.SchemaName is not null)
+        {
+            Identifiers.AssertSafe(
+                configuration.SchemaName,
+                nameof(IAmARelationalDatabaseConfiguration.SchemaName));
+        }
+        return SqlOutboxBuilder.GetDDL(
+            configuration.OutBoxTableName,
+            configuration.BinaryMessagePayload,
+            configuration.SchemaName);
+    }
+
+    /// <summary>
+    /// Returns all migrations for the MSSQL outbox, ordered by version.
+    /// </summary>
+    /// <param name="configuration">The relational database configuration.</param>
+    /// <returns>An ordered list of migrations from V1 to V9.</returns>
+    public IReadOnlyList<IAmABoxMigration> All(IAmARelationalDatabaseConfiguration configuration)
+    {
+        var schema = configuration.SchemaName ?? DefaultSchema;
+        var table = configuration.OutBoxTableName;
+
+        Identifiers.AssertSafe(table, nameof(IAmARelationalDatabaseConfiguration.OutBoxTableName));
+        Identifiers.AssertSafe(schema, nameof(IAmARelationalDatabaseConfiguration.SchemaName));
+
+        return
+        [
+            new BoxMigration(
+                Version: 1,
+                Description: "Create outbox table",
+                UpScript: string.Format(V1HistoricalDdl, table),
+                LogicalColumns: Cumulative(1)),
+
+            new BoxMigration(
+                Version: 2,
+                Description: "Add Dispatched column",
+                UpScript: AddColumns(schema, table, ("Dispatched", "DATETIME")),
+                LogicalColumns: Cumulative(2),
+                SourceReference: "3c30343fa"),
+
+            new BoxMigration(
+                Version: 3,
+                Description: "Add CorrelationId, ReplyTo, ContentType columns",
+                UpScript: AddColumns(schema, table,
+                    ("CorrelationId", "NVARCHAR(255)"),
+                    ("ReplyTo", "NVARCHAR(255)"),
+                    ("ContentType", "NVARCHAR(128)")),
+                LogicalColumns: Cumulative(3),
+                SourceReference: "79100f509 / #1401"),
+
+            new BoxMigration(
+                Version: 4,
+                Description: "Add PartitionKey column",
+                UpScript: AddColumns(schema, table, ("PartitionKey", "NVARCHAR(255)")),
+                LogicalColumns: Cumulative(4),
+                SourceReference: "1cdc04b60 / #2560"),
+
+            new BoxMigration(
+                Version: 5,
+                Description: "Add CloudEvents columns (Source, Type, DataSchema, Subject, TraceParent, TraceState, Baggage)",
+                UpScript: AddColumns(schema, table,
+                    ("Source", "NVARCHAR(255)"),
+                    ("Type", "NVARCHAR(255)"),
+                    ("DataSchema", "NVARCHAR(255)"),
+                    ("Subject", "NVARCHAR(255)"),
+                    ("TraceParent", "NVARCHAR(255)"),
+                    ("TraceState", "NVARCHAR(255)"),
+                    ("Baggage", "NVARCHAR(MAX)")),
+                LogicalColumns: Cumulative(5),
+                SourceReference: "b740a68ed / #3633"),
+
+            new BoxMigration(
+                Version: 6,
+                Description: "Add WorkflowId, JobId columns",
+                UpScript: AddColumns(schema, table,
+                    ("WorkflowId", "NVARCHAR(255)"),
+                    ("JobId", "NVARCHAR(255)")),
+                LogicalColumns: Cumulative(6),
+                SourceReference: "0e79332f1 / #3693"),
+
+            new BoxMigration(
+                Version: 7,
+                Description: "Add DataRef, SpecVersion columns",
+                UpScript: AddColumns(schema, table,
+                    ("DataRef", "NVARCHAR(255)"),
+                    ("SpecVersion", "NVARCHAR(255)")),
+                LogicalColumns: Cumulative(7),
+                SourceReference: "d67dac947 / #3790"),
+
+            new BoxMigration(
+                Version: 8,
+                Description: "Add CausationId column and replay index",
+                UpScript: AddColumns(schema, table, ("CausationId", "NVARCHAR(255)"))
+                    + Environment.NewLine
+                    + AddCausationIndex(schema, table),
+                LogicalColumns: Cumulative(8),
+                SourceReference: "#2541"),
+
+            new BoxMigration(
+                Version: MESSAGE_ID_UNIQUENESS_VERSION,
+                Description: "Enforce MessageId uniqueness",
+                UpScript: AddMessageIdIndex(schema, table),
+                LogicalColumns: Cumulative(9),
+                SourceReference: "#4677")
+        ];
+    }
+
+    internal static string MessageIdIndexQuery(string objectId) => $"""
+        SELECT 1 FROM sys.indexes i
+        WHERE i.object_id = {objectId}
+          AND i.is_unique = 1 AND i.ignore_dup_key = 1
+          AND i.is_disabled = 0 AND i.is_hypothetical = 0 AND i.has_filter = 0
+          AND (SELECT COUNT(*) FROM sys.index_columns ic
+               WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) = 1
+          AND EXISTS (SELECT 1 FROM sys.index_columns ic
+                      JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                      WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id
+                        AND ic.key_ordinal = 1 AND c.name = 'MessageId')
+        """;
+
+    private static string AddMessageIdIndex(string schema, string table) => $"""
+        IF NOT EXISTS ({MessageIdIndexQuery($"OBJECT_ID(N'[{schema}].[{table}]')")})
+        BEGIN
+            IF EXISTS (
+                SELECT [MessageId] FROM [{schema}].[{table}] WITH (TABLOCKX, HOLDLOCK)
+                GROUP BY [MessageId] HAVING COUNT_BIG(*) > 1
+            )
+                THROW 50001, 'Cannot enforce MessageId uniqueness on [{schema}].[{table}]: duplicate MessageId values exist. Resolve the conflicting rows and retry provisioning. No messages have been removed.', 1;
+
+            CREATE UNIQUE INDEX [UX_BrighterOutbox_MessageId]
+                ON [{schema}].[{table}] ([MessageId]) WITH (IGNORE_DUP_KEY = ON);
+        END;
+        """;
+
+    private static IReadOnlyCollection<string> Cumulative(int upToVersion)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (upToVersion >= 1) { set.UnionWith(s_v1Columns); }
+        if (upToVersion >= 2) { set.UnionWith(s_v2AddedColumns); }
+        if (upToVersion >= 3) { set.UnionWith(s_v3AddedColumns); }
+        if (upToVersion >= 4) { set.UnionWith(s_v4AddedColumns); }
+        if (upToVersion >= 5) { set.UnionWith(s_v5AddedColumns); }
+        if (upToVersion >= 6) { set.UnionWith(s_v6AddedColumns); }
+        if (upToVersion >= 7) { set.UnionWith(s_v7AddedColumns); }
+        if (upToVersion >= 8) { set.UnionWith(s_v8AddedColumns); }
+        return set;
+    }
+
+    private static string AddColumns(string schema, string table, params (string Column, string Type)[] columns) =>
+        string.Join(Environment.NewLine, columns.Select(c => AddColumn(schema, table, c.Column, c.Type)));
+
+    private static string AddColumn(string schema, string table, string column, string type) =>
+        $"IF COL_LENGTH(N'[{schema}].[{table}]', N'{column}') IS NULL{Environment.NewLine}" +
+        $"    ALTER TABLE [{schema}].[{table}] ADD [{column}] {type} NULL;";
+
+    // The CREATE INDEX runs through EXEC so it compiles after the preceding ALTER has added
+    // CausationId; in the same batch it would fail with "invalid column name".
+    private static string AddCausationIndex(string schema, string table) =>
+        $"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name] = N'idx_{table}_CausationId' " +
+        $"AND [object_id] = OBJECT_ID(N'[{schema}].[{table}]')){Environment.NewLine}" +
+        $"    EXEC('CREATE INDEX [idx_{table}_CausationId] ON [{schema}].[{table}] ([CausationId]);');";
+}

@@ -1,0 +1,51 @@
+﻿using System;
+using System.Collections.Generic;
+
+namespace Paramore.Brighter.MessagingGateway.AzureServiceBus.AzureServiceBusWrappers
+{
+    /// <summary>
+    /// Wrapper for a Brokered Message
+    /// </summary>
+    public interface IBrokeredMessageWrapper
+    {
+        /// <summary>
+        /// Message Body.
+        /// </summary>
+        byte[]? MessageBodyValue { get; }
+
+        /// <summary>
+        /// Message Body as <see cref="ReadOnlyMemory{T}"/> of <see cref="byte"/> for zero-copy access.
+        /// </summary>
+        ReadOnlyMemory<byte> MessageBodyMemory { get; }
+
+        /// <summary>
+        /// Application Properties
+        /// </summary>
+        IReadOnlyDictionary<string, object> ApplicationProperties { get; }
+
+        /// <summary>
+        /// The Lock Token
+        /// </summary>
+        string LockToken { get; }
+
+        /// <summary>
+        /// The broker-assigned sequence number. Uniquely identifies a message within a Service Bus entity.
+        /// </summary>
+        long SequenceNumber { get; }
+
+        /// <summary>
+        /// The message Id.
+        /// </summary>
+        string Id { get; }
+
+        /// <summary>
+        /// The Correlation Id.
+        /// </summary>
+        string CorrelationId { get; }
+
+        /// <summary>
+        /// The Mime Type.
+        /// </summary>
+        string ContentType { get; }
+    }
+}

@@ -23,6 +23,8 @@ THE SOFTWARE. */
 #endregion
 
 using System;
+using System.Net.Mime;
+using System.Text.Json.Serialization;
 
 namespace Paramore.Brighter
 {
@@ -33,67 +35,88 @@ namespace Paramore.Brighter
     public class Message : IEquatable<Message>
     {
         public const string OriginalMessageIdHeaderName = "x-original-message-id";
+        /// <summary>
+        /// Tag name for the delivery tag header   
+        /// </summary>
         public const string DeliveryTagHeaderName = "DeliveryTag";
+        
+        /// <summary>
+        /// Tag name for the redelivered header
+        /// </summary>
         public const string RedeliveredHeaderName = "Redelivered";
+        
+        /// <summary>
+        /// Tag name for the reason a message was rejected
+        /// </summary>
+        public const string RejectionReasonHeaderName = "RejectionReason";
+
+        /// <summary>
+        /// Bag key (not a typed header property — lives in <see cref="MessageHeader.Bag"/>)
+        /// carrying the publication topic when the message mapper overrides <see cref="MessageHeader.Topic"/>
+        /// (e.g. for Reply messages whose topic is the reply address).
+        /// Read by the outbox dispatcher so it can still locate the registered producer.
+        /// </summary>
+        public const string ProducerTopicHeaderName = "paramore.brighter.ProducerTopic";
 
         /// <summary>
         /// Gets the header.
         /// </summary>
         /// <value>The header.</value>
-        public MessageHeader Header { get; private set; }
+        public MessageHeader Header { get; init; }
+
         /// <summary>
         /// Gets the body.
         /// </summary>
         /// <value>The body.</value>
-        public MessageBody Body { get; private set; }
+        public MessageBody Body { get; set; }
 
         /// <summary>
-        /// Gets the identifier.
+        /// RMQ: An identifier for the message set by the broker. Only valid on the same thread that consumed the message.
         /// </summary>
-        /// <value>The identifier.</value>
-        public Guid Id
-        {
-            get { return Header.Id; }
-        }
-
-        /// <summary>
-        /// Initializes a new instance of the <see cref="Message"/> class.
-        /// </summary>
-        public Message()
-        {
-            Header = new MessageHeader(messageId: Guid.Empty, topic: string.Empty, messageType: MessageType.MT_NONE);
-            Body = new MessageBody(string.Empty);
-        }
-
-        /// <summary>
-        /// Initializes a new instance of the <see cref="Message"/> class.
-        /// </summary>
-        /// <param name="header">The header.</param>
-        /// <param name="body">The body.</param>
-        public Message(MessageHeader header, MessageBody body)
-        {
-            Header = header;
-            Body = body;
-        }
-
+        [JsonIgnore]
         public ulong DeliveryTag
         {
             get
             {
-                if (Header.Bag.ContainsKey(DeliveryTagHeaderName))
-                    return (ulong) Header.Bag[DeliveryTagHeaderName];
+                if (Header.Bag.TryGetValue(DeliveryTagHeaderName, out object? value))
+                    return (ulong) value;
                 else
-                    return (ulong) 0;
+                    return 0;
             }
             set { Header.Bag[DeliveryTagHeaderName] = value; }
         }
+        
+        public static Message Empty => new();
+        
+        /// <summary>
+        /// Returns true if this is an empty Message.
+        /// </summary>
+#pragma warning disable CS0618 // Message types still identify pump control signals.
+        public bool IsEmpty => Header.MessageType == MessageType.MT_NONE;
+#pragma warning restore CS0618
 
+        /// <summary>
+        /// Gets the identifier of the message.
+        /// </summary>
+        /// <value>The identifier.</value>
+        public Id Id => Header.MessageId;
+
+        /// <summary>
+        /// RMQ: Is the message persistent
+        /// </summary>
+        [JsonIgnore]
+        public bool Persist { get; set; }
+        
+        /// <summary>
+        /// RMQ: Has this message been redelivered
+        /// </summary>
+        [JsonIgnore]
         public bool Redelivered
         {
             get
             {
-                if (Header.Bag.ContainsKey(RedeliveredHeaderName))
-                    return (bool) Header.Bag[RedeliveredHeaderName];
+                if (Header.Bag.TryGetValue(RedeliveredHeaderName, out object? value))
+                    return (bool) value;
                 else
                 {
                     return false;
@@ -102,25 +125,89 @@ namespace Paramore.Brighter
             set { Header.Bag[RedeliveredHeaderName] = value; }
         }
 
-        public bool Persist { get; set; }
-
-        public void UpdateHandledCount()
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Message"/> class.
+        /// </summary>
+        public Message()
         {
-            Header.UpdateHandledCount();
+            Header = new MessageHeader(messageId: string.Empty, topic: RoutingKey.Empty, messageType: MessageType.MT_NONE);
+            Body = new MessageBody(string.Empty);
         }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Message"/> class.
+        /// </summary>
+        /// <param name="header">The header.</param>
+        /// <param name="body">The body.</param>
+        [JsonConstructor]
+        [Newtonsoft.Json.JsonConstructor]
+        public Message(MessageHeader header, MessageBody body)
+        {
+            Body = body;
+            Header = header;
+            var contentType = Header.ContentType;
+            if (contentType is null && Body.ContentType is not null)
+                // If the header does not have a content type, but the body does, then we set the header to the body content type
+                contentType = Body.ContentType;
+            else if (contentType is null)
+                //otherwise we just default to text/plain 
+                contentType = new ContentType(MediaTypeNames.Text.Plain);    
+            Header.ContentType = contentType;
+        }
+
+        /// <summary>
+        /// Determines if the message has been requeued a number of times greater than a threshold
+        /// </summary>
+        /// <remarks>Generally used to send the message to a DLQ to prevent a poision pill</remarks>
+        /// <param name="requeueCount">The threshold to determine if the count exceeds</param>
+        /// <returns></returns>
         public bool HandledCountReached(int requeueCount)
         {
             return Header.HandledCount >= requeueCount;
         }
 
-        public void Execute()
-        {
-            if (Header.MessageType != MessageType.MT_CALLBACK)
-            {
-                throw new InvalidOperationException("You cannot execute a callback unless the message is a callback method");
-            }
+        internal Message CopyForDelivery() => new(Header.CopyForDelivery(),
+            new MessageBody(Body.Memory,
+                Body.ContentType is null ? null : new System.Net.Mime.ContentType(Body.ContentType.ToString()),
+                Body.CharacterEncoding)) { Persist = Persist };
 
-            //Body.Postback.Call();
+        /// <summary>
+        /// Propogates the trace context for the message, when being sent across a trace boundary.
+        /// We set this value in the headers of the message
+        /// </summary>
+        /// <param name="message">The message to set the trace context into</param>
+        /// <param name="key">A key representing the value to set</param>
+        /// <param name="value">The value to set </param>
+        public static void PropogateContext(Message message, string key, string? value)
+        {
+            if (value is null)
+                return;
+            
+            switch (key)
+            {
+                case "traceparent":
+                    message.Header.TraceParent = value;
+                    break;
+                case "tracestate":
+                    message.Header.TraceState = value;
+                    break;
+                case "baggage":
+                    message.Header.Baggage.LoadBaggage(value);
+                    break;
+            }
+        }
+        
+        /// <summary>
+        /// Creates a failure message, used to indicate that a message could not be successfully retrieved from a channel
+        /// </summary>
+        /// <param name="topic">The topic of the channel</param>
+        /// <param name="messageId">The id of he message, may be Id.Empty if not known</param>
+        /// <returns></returns>
+        public static Message FailureMessage(RoutingKey? topic, Id? messageId = null)
+        {
+            var header = MessageHeader.FailureMessageHeader(topic, messageId);
+            var message = new Message(header, new MessageBody(string.Empty));
+            return message;
         }
 
         /// <summary>
@@ -128,7 +215,7 @@ namespace Paramore.Brighter
         /// </summary>
         /// <param name="other">An object to compare with this object.</param>
         /// <returns>true if the current object is equal to the <paramref name="other" /> parameter; otherwise, false.</returns>
-        public bool Equals(Message other)
+        public bool Equals(Message? other)
         {
             if (ReferenceEquals(null, other)) return false;
             if (ReferenceEquals(this, other)) return true;
@@ -140,7 +227,7 @@ namespace Paramore.Brighter
         /// </summary>
         /// <param name="obj">The object to compare with the current object.</param>
         /// <returns><c>true</c> if the specified <see cref="System.Object" /> is equal to this instance; otherwise, <c>false</c>.</returns>
-        public override bool Equals(object obj)
+        public override bool Equals(object? obj)
         {
             if (ReferenceEquals(null, obj)) return false;
             if (ReferenceEquals(this, obj)) return true;
@@ -156,7 +243,7 @@ namespace Paramore.Brighter
         {
             unchecked
             {
-                return ((Header != null ? Header.GetHashCode() : 0) * 397) ^ (Body != null ? Body.GetHashCode() : 0);
+                return (Header.GetHashCode() * 397) ^ (Body is not null ? Body.GetHashCode() : 0);
             }
         }
 
@@ -166,7 +253,7 @@ namespace Paramore.Brighter
         /// <param name="left">The left.</param>
         /// <param name="right">The right.</param>
         /// <returns>The result of the operator.</returns>
-        public static bool operator ==(Message left, Message right)
+        public static bool operator ==(Message? left, Message? right)
         {
             return Equals(left, right);
         }
@@ -177,11 +264,9 @@ namespace Paramore.Brighter
         /// <param name="left">The left.</param>
         /// <param name="right">The right.</param>
         /// <returns>The result of the operator.</returns>
-        public static bool operator !=(Message left, Message right)
+        public static bool operator !=(Message? left, Message? right)
         {
             return !Equals(left, right);
         }
-
-
     }
 }

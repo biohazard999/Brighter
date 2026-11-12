@@ -1,0 +1,84 @@
+﻿using System;
+using System.Net.Http;
+using System.Threading.Tasks;
+using Amazon.S3;
+using Amazon.S3.Model;
+using Microsoft.Extensions.DependencyInjection;
+using Paramore.Brighter.AWS.V4.Tests.Helpers;
+using Paramore.Brighter.Transformers.AWS.V4;
+using Paramore.Brighter.Transforms.Storage;
+using Xunit;
+
+namespace Paramore.Brighter.AWS.V4.Tests.Transformers;
+
+[Trait("Category", "AWS")] 
+public class S3LuggageStoreExistsTests : IAsyncLifetime
+{
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly string _bucketName = $"brightertestbucket-{Guid.NewGuid()}";
+
+    public S3LuggageStoreExistsTests()
+    {
+        //arrange
+        var services = new ServiceCollection();
+        services.AddHttpClient();
+        var provider = services.BuildServiceProvider();
+        _httpClientFactory = provider.GetRequiredService<IHttpClientFactory>();
+    }
+    
+    [Fact]
+    public async Task When_checking_store_that_exists()
+    {
+        //arrange
+        var luggageStore = new S3LuggageStore(new S3LuggageOptions(GatewayFactory.CreateS3Connection(), _bucketName)
+        {
+            HttpClientFactory = _httpClientFactory,
+            BucketAddressTemplate = CredentialsChain.GetBucketAddressTemplate(),
+            ACLs = S3CannedACL.Private,
+            Tags = [new Tag { Key = "BrighterTests", Value = "S3LuggageUploadTests" }],
+        });
+        
+        await luggageStore.EnsureStoreExistsAsync();
+
+        //allow bucket endpoint to come into existence
+        await Task.Delay(5000);
+
+        //act
+        luggageStore = new S3LuggageStore(new S3LuggageOptions(GatewayFactory.CreateS3Connection(), _bucketName)
+        {
+            Strategy = StorageStrategy.Validate,
+            HttpClientFactory = _httpClientFactory, 
+            BucketAddressTemplate = CredentialsChain.GetBucketAddressTemplate(),
+            Tags = [new Tag { Key = "BrighterTests", Value = "S3LuggageUploadTests" }],
+        });
+
+        Assert.NotNull(luggageStore);
+    }
+    
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    public Task DisposeAsync() => S3TestBucketCleanup.DeleteAsync(_bucketName);
+
+    [Fact]
+    public async Task When_checking_store_that_does_not_exist()
+    {
+        //act
+         var doesNotExist = await Catch.ExceptionAsync(async () =>
+             {
+                 var luggageStore = new S3LuggageStore(
+                     new S3LuggageOptions(GatewayFactory.CreateS3Connection(), $"brightertestbucket-{Guid.NewGuid()}")
+                     {
+                         Strategy = StorageStrategy.Validate,
+                         HttpClientFactory = _httpClientFactory,
+                         BucketAddressTemplate = CredentialsChain.GetBucketAddressTemplate(),
+                         ACLs = S3CannedACL.Private,
+                         Tags = [new Tag { Key = "BrighterTests", Value = "S3LuggageUploadTests" }],
+                     });
+
+                 await luggageStore.EnsureStoreExistsAsync();
+             });
+         
+         Assert.NotNull(doesNotExist);
+         Assert.True(doesNotExist is InvalidOperationException);
+    }
+}

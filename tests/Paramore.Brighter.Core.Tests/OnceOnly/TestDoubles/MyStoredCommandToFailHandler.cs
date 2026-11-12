@@ -4,10 +4,10 @@ using Paramore.Brighter.Inbox.Attributes;
 
 namespace Paramore.Brighter.Core.Tests.OnceOnly.TestDoubles
 {
-    internal class MyStoredCommandToFailHandler : RequestHandler<MyCommandToFail>
+    internal sealed class MyStoredCommandToFailHandler : RequestHandler<MyCommandToFail>
     {
         [UseInbox(1, onceOnly: true, contextKey: typeof(MyStoredCommandToFailHandler), timing: HandlerTiming.Before)]
-        public override MyCommandToFail Handle(MyCommandToFail command)
+        public override MyCommandToFail Handle(MyCommandToFail myCommandToFail)
         {
             throw new NotImplementedException();
         }

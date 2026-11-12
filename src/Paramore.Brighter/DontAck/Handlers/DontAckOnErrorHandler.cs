@@ -1,0 +1,65 @@
+#region Licence
+/* The MIT License (MIT)
+Copyright © 2026 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+
+#endregion
+
+using System;
+using Paramore.Brighter.Actions;
+
+namespace Paramore.Brighter.DontAck.Handlers;
+
+/// <summary>
+/// Handler that catches unhandled exceptions and converts them to <see cref="DontAckAction"/>.
+/// When used with a message pump (Reactor or Proactor), this asks the channel to apply its not-acknowledged
+/// disposition. The resulting redelivery behavior is transport-specific.
+/// </summary>
+/// <typeparam name="TRequest">The type of request being handled.</typeparam>
+/// <remarks>
+/// This handler should be positioned at the outermost layer of the pipeline (lowest step number)
+/// to act as a backstop for application exceptions that escape inner handlers.
+/// Explicit pump actions and non-empty aggregates whose direct inner exceptions are all pump actions
+/// propagate unchanged. Other exceptions, including cancellation, use this backstop's configured action.
+/// </remarks>
+public class DontAckOnErrorHandler<TRequest> : RequestHandler<TRequest>, IAmABackstopHandler
+    where TRequest : class, IRequest
+{
+    /// <summary>
+    /// Handles the request by passing it to the next handler in the pipeline.
+    /// Unhandled application exceptions are caught and converted to a <see cref="DontAckAction"/>.
+    /// </summary>
+    /// <param name="request">The request to handle.</param>
+    /// <returns>The request after processing.</returns>
+    /// <exception cref="DontAckAction">
+    /// Thrown when an unhandled application exception occurs in the pipeline. The original exception is preserved as <see cref="Exception.InnerException"/>.
+    /// </exception>
+    public override TRequest Handle(TRequest request)
+    {
+        try
+        {
+            return base.Handle(request);
+        }
+        catch (Exception ex) when (!BackstopExceptionFilter.ShouldPropagate(ex))
+        {
+            throw new DontAckAction(ex.Message, ex);
+        }
+    }
+}

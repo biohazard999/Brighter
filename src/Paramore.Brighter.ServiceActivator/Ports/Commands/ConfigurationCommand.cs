@@ -22,8 +22,6 @@ THE SOFTWARE. */
 
 #endregion
 
-using System;
-
 namespace Paramore.Brighter.ServiceActivator.Ports.Commands
 {
     /// <summary>
@@ -52,15 +50,20 @@ namespace Paramore.Brighter.ServiceActivator.Ports.Commands
         /// <value>The type.</value>
         public ConfigurationCommandType Type { get; set; }
 
-        public string ConnectionName { get; set; }
+        /// <summary>
+        /// Gets or sets the subscription name.
+        /// </summary>
+        public SubscriptionName SubscriptionName { get; set; }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ConfigurationCommand" /> class.
         /// </summary>
         /// <param name="type">The type.</param>
-        public ConfigurationCommand(ConfigurationCommandType type) : base(Guid.NewGuid())
+        /// <param name="subscriptionName"></param>
+        public ConfigurationCommand(ConfigurationCommandType type, SubscriptionName subscriptionName) : base(Id.Random())
         {
             Type = type;
+            SubscriptionName = subscriptionName;
         }
     }
 }

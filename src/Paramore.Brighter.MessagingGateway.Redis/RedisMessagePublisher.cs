@@ -24,9 +24,13 @@ THE SOFTWARE. */
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
+using System.Net.Mime;
 using System.Text;
-using Newtonsoft.Json;
+using System.Text.Json;
+using Paramore.Brighter.Extensions;
+using Paramore.Brighter.JsonConverters;
 
 namespace Paramore.Brighter.MessagingGateway.Redis
 {
@@ -38,12 +42,7 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         private const string BEGINNING_OF_BODY = "<BODY";
         private const string END_OF_BODY = "BODY/>";
         
-        private StringWriter _writer;
-
-        public RedisMessagePublisher()
-        {
-            _writer = new StringWriter(new StringBuilder());
-        }
+        private readonly StringWriter _writer = new(new StringBuilder());
 
         public string Create(Message message)
         {
@@ -74,85 +73,132 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         {
             var headers = new Dictionary<string, string>();
             
-            //Read Message Id
             WriteMessageId(messageHeader, headers);
-            //Read TimeStamp
             WriteTimeStamp(messageHeader, headers);
-            //Read Topic
             WriteTopic(messageHeader, headers);
-            //Read MessageType
             WriteMessageType(messageHeader, headers);
-           //Read HandledCount
             WriteHandledCount(messageHeader, headers);
-            //Read DelayedMilliseconds
             WriteDelayedMilliseconds(messageHeader, headers);
-            //Read MessageBag
             WriteMessageBag(messageHeader, headers);
-            //reply to
-            WrtiteReplyTo(messageHeader, headers);
-            //content type
+            WriteReplyTo(messageHeader, headers);
             WriteContentType(messageHeader, headers);
-            //correlation id
             WriteCorrelationId(messageHeader, headers);
+            WriteSource(messageHeader, headers);
+            WriteType(messageHeader, headers);
+            WriteDataSchema(messageHeader, headers);
+            WriteSubject(messageHeader, headers);
+            WriteTraceParent(messageHeader, headers);
+            WriteTraceState(messageHeader, headers);
+            WriteBaggage(messageHeader, headers);
 
-            return JsonConvert.SerializeObject(headers);
-        }
 
-        private void WriteContentType(MessageHeader messageHeader, Dictionary<string, string> headers)
-        {
-            headers.Add(HeaderNames.CONTENT_TYPE, messageHeader.ContentType.ToString());
-        }
-
-        private void WriteCorrelationId(MessageHeader messageHeader, Dictionary<string, string> headers)
-        {
-            headers.Add(HeaderNames.CORRELATION_ID, messageHeader.CorrelationId.ToString());
-        }
-
-        private void WriteDelayedMilliseconds(MessageHeader messageHeader, Dictionary<string, string> headers)
-        {
-            headers.Add(HeaderNames.DELAYED_MILLISECONDS, messageHeader.DelayedMilliseconds.ToString());
+            return JsonSerializer.Serialize(headers, JsonSerialisationOptions.Options);
         }
         
-        private void WriteHandledCount(MessageHeader messageHeader, Dictionary<string, string> headers)
+        private static void WriteBaggage(MessageHeader messageHeader, Dictionary<string, string> headers)
+        {
+            headers.Add(HeaderNames.W3C_BAGGAGE, messageHeader.Baggage.ToString());
+        }   
+
+        private static void WriteContentType(MessageHeader messageHeader, Dictionary<string, string> headers)
+        {
+            var contentType = messageHeader.ContentType is not null ? messageHeader.ContentType.ToString() : MediaTypeNames.Text.Plain;
+            headers.Add(HeaderNames.CONTENT_TYPE, contentType);
+        }
+
+        private static void WriteCorrelationId(MessageHeader messageHeader, Dictionary<string, string> headers)
+        {
+            headers.Add(HeaderNames.CORRELATION_ID, messageHeader.CorrelationId.Value);
+        }
+        
+        private static void WriteDataSchema(MessageHeader messageHeader, Dictionary<string, string> headers)
+        {
+            if (messageHeader.DataSchema != null)
+            {
+                headers.Add(HeaderNames.CLOUD_EVENTS_DATA_SCHEMA, messageHeader.DataSchema.ToString());
+            }
+        }
+
+        private static void WriteDelayedMilliseconds(MessageHeader messageHeader, Dictionary<string, string> headers)
+        {
+            headers.Add(HeaderNames.DELAYED_MILLISECONDS, messageHeader.Delayed.TotalMilliseconds.ToString(CultureInfo.InvariantCulture));
+        }
+        
+        private static void WriteHandledCount(MessageHeader messageHeader, Dictionary<string, string> headers)
         {
             headers.Add(HeaderNames.HANDLED_COUNT, messageHeader.HandledCount.ToString());
         }
 
-        private void WriteMessageBag(MessageHeader messageHeader, Dictionary<string, string> headers)
+        private static void WriteMessageBag(MessageHeader messageHeader, Dictionary<string, string> headers)
         {
-            var flatBag = JsonConvert.SerializeObject(messageHeader.Bag);
+            var flatBag = JsonSerializer.Serialize(messageHeader.BagWithoutLocalHeaders(), JsonSerialisationOptions.Options);
             headers.Add(HeaderNames.BAG, flatBag);
         }
 
-        private void WriteMessageId(MessageHeader messageHeader, Dictionary<string, string> headers)
+        private static void WriteMessageId(MessageHeader messageHeader, Dictionary<string, string> headers)
         {
-            headers.Add(HeaderNames.MESSAGE_ID, messageHeader.Id.ToString());
+            headers.Add(HeaderNames.MESSAGE_ID, messageHeader.MessageId.Value);
         }
         
-        private void WriteMessageType(MessageHeader messageHeader, Dictionary<string, string> headers)
+        private static void WriteMessageType(MessageHeader messageHeader, Dictionary<string, string> headers)
         {
+#pragma warning disable CS0618 // Preserve the legacy message type for transport compatibility.
             headers.Add(HeaderNames.MESSAGE_TYPE, messageHeader.MessageType.ToString());
+#pragma warning restore CS0618
         }
         
-        private void WrtiteReplyTo(MessageHeader messageHeader, Dictionary<string, string> headers)
+        private static void WriteReplyTo(MessageHeader messageHeader, Dictionary<string, string> headers)
         {
-            headers.Add(HeaderNames.REPLY_TO, messageHeader.ReplyTo);
+            headers.Add(HeaderNames.REPLY_TO, messageHeader.ReplyTo?.Value ?? string.Empty);
+        }
+        
+        private static void WriteSource(MessageHeader messageHeader, Dictionary<string, string> headers)
+        {
+            headers.Add(HeaderNames.CLOUD_EVENTS_SOURCE, messageHeader.Source.ToString());
         }
 
-        private void WriteTopic(MessageHeader messageHeader, Dictionary<string, string> headers)
+        private static void WriteTopic(MessageHeader messageHeader, Dictionary<string, string> headers)
         {
-            headers.Add(HeaderNames.TOPIC, messageHeader.Topic);
+            headers.Add(HeaderNames.TOPIC, messageHeader.Topic.Value);
+        }
+        
+        private static void WriteSubject(MessageHeader messageHeader, Dictionary<string, string> headers)
+        {
+            if (!string.IsNullOrEmpty(messageHeader.Subject))
+            {
+                headers.Add(HeaderNames.CLOUD_EVENTS_SUBJECT, messageHeader.Subject!);
+            }
+        }
+        
+        private static void WriteTraceParent(MessageHeader messageHeader, Dictionary<string, string> headers)
+        {
+            if (messageHeader.TraceParent != null)
+            {
+                headers.Add(HeaderNames.CLOUD_EVENTS_TRACE_PARENT, messageHeader.TraceParent.Value);
+            }
+        }
+        
+        private static void WriteTraceState(MessageHeader messageHeader, Dictionary<string, string> headers)
+        {
+            if (messageHeader.TraceState != null)
+            {
+                headers.Add(HeaderNames.CLOUD_EVENTS_TRACE_STATE, messageHeader.TraceState.Value);
+            }
         }
 
-        private void WriteTimeStamp(MessageHeader messageHeader, Dictionary<string, string> headers)
+        private static void WriteTimeStamp(MessageHeader messageHeader, Dictionary<string, string> headers)
         {
-            headers.Add(HeaderNames.TIMESTAMP, JsonConvert.SerializeObject(messageHeader.TimeStamp));
+            headers.Add(HeaderNames.TIMESTAMP, messageHeader.TimeStamp.ToRfc3339());
         }
-
+        
+        private static void WriteType(MessageHeader messageHeader, Dictionary<string, string> headers)
+        {
+            headers.Add(HeaderNames.CLOUD_EVENTS_TYPE, messageHeader.Type.Value);
+        }
 
         public void Dispose()
         {
-            _writer?.Dispose();
+            _writer.Dispose();
         }
     }
 }

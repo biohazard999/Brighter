@@ -28,7 +28,7 @@ using System.Threading.Tasks;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyPreAndPostDecoratedHandlerAsync : RequestHandlerAsync<MyCommand>, IDisposable
+    internal sealed class MyPreAndPostDecoratedHandlerAsync : RequestHandlerAsync<MyCommand>, IDisposable
     {
         private static MyCommand s_command;
         public static bool DisposeWasCalled { get; set; }
@@ -41,7 +41,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 
         [MyPreValidationHandlerAsync(2, HandlerTiming.Before)]
         [MyPostLoggingHandlerAsync(1, HandlerTiming.After)]
-        public override async Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default(CancellationToken))
+        public override async Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
             {

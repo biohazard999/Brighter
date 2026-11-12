@@ -55,21 +55,23 @@ namespace Paramore.Brighter
 
         private void AddDefaultPolicies()
         {
+#pragma warning disable CS0618 // Type or member is obsolete
             Add(CommandProcessor.CIRCUITBREAKER, Policy.Handle<Exception>().CircuitBreaker(10, new TimeSpan(5000)));
             Add(CommandProcessor.CIRCUITBREAKERASYNC,
                 Policy.Handle<Exception>().CircuitBreakerAsync(10, new TimeSpan(5000)));
             Add(CommandProcessor.RETRYPOLICY,
-                Policy.Handle<Exception>().WaitAndRetry(new[]
-                {
+                Policy.Handle<Exception>().WaitAndRetry(
+                [
                     TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100),
                     TimeSpan.FromMilliseconds(150)
-                }));
+                ]));
             Add(CommandProcessor.RETRYPOLICYASYNC,
-                Policy.Handle<Exception>().WaitAndRetryAsync(new[]
-                {
+                Policy.Handle<Exception>().WaitAndRetryAsync(
+                [
                     TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100),
                     TimeSpan.FromMilliseconds(150)
-                }));
+                ]));
+#pragma warning restore CS0618 // Type or member is obsolete
         }
     }
 }

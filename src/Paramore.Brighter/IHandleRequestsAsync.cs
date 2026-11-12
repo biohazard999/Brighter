@@ -42,12 +42,12 @@ namespace Paramore.Brighter
         /// Gets or sets the context. Usually the context is given to you by the pipeline and you do not need to set this
         /// </summary>
         /// <value>The context.</value>
-        IRequestContext Context { get; set; }
+        IRequestContext? Context { get; set; }
 
         /// <summary>
         /// If false we use a thread from the thread pool to run any continuation, if true we use the originating thread.
         /// Default to false unless you know that you need true, as you risk deadlocks with the originating thread if you Wait 
-        /// or access the Result or otherwise block. You may need the orginating thread if you need to access thread specific storage
+        /// or access the Result or otherwise block. You may need the originating thread if you need to access thread specific storage
         /// such as HTTPContext 
         /// </summary>
         bool ContinueOnCapturedContext { get; set; }
@@ -67,7 +67,7 @@ namespace Paramore.Brighter
         /// for an attribute-handler pair used to provide orthogonal QoS to the pipeline.
         /// </summary>
         /// <param name="initializerList">The initializer list.</param>
-        void InitializeFromAttributeParams(params object[] initializerList);
+        void InitializeFromAttributeParams(params object?[] initializerList);
 
         /// <summary>
         /// Gets the name of the Handler. Useful for diagnostic purposes
@@ -76,7 +76,7 @@ namespace Paramore.Brighter
         HandlerName Name { get; }
 
         /// <summary>
-        /// Adds to lifetime so that the pipeline can manage destroying handlers created as part of the pipeline by calling the client provided <see cref="IAmAHandlerFactory"/> .
+        /// Adds to lifetime so that the pipeline can manage destroying handlers created as part of the pipeline by calling the client provided <see cref="IAmAHandlerFactorySync"/> .
         /// </summary>
         /// <param name="instanceScope">The instance scope.</param>
         void AddToLifetime(IAmALifetime instanceScope);
@@ -101,7 +101,7 @@ namespace Paramore.Brighter
         /// <param name="request">The request.</param>
         /// <param name="cancellationToken">A cancellation token (optional). Can be used to signal that the pipeline should end by the caller</param>
         /// <returns>Awaitable <see cref="Task{TRequest}"/>.</returns>
-        Task<TRequest> HandleAsync(TRequest request, CancellationToken cancellationToken = default(CancellationToken));
+        Task<TRequest> HandleAsync(TRequest request, CancellationToken cancellationToken = default);
 
 
         /// <summary>
@@ -111,7 +111,7 @@ namespace Paramore.Brighter
         /// <param name="request">The request.</param>
         /// <param name="cancellationToken">A cancellation token (optional). Can be used to signal that the pipeline should end by the caller</param>
         /// <returns>Awaitable <see cref="Task{TRequest}"/>.</returns>
-        Task<TRequest> FallbackAsync(TRequest request, CancellationToken cancellationToken = default(CancellationToken));
+        Task<TRequest> FallbackAsync(TRequest request, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Sets the successor.

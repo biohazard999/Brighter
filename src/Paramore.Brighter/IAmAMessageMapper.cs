@@ -29,7 +29,7 @@ namespace Paramore.Brighter
     /// Map between a <see cref="Command"/> or an <see cref="Event"/> and a <see cref="Message"/>. You must implement this for each Command or Message you intend to send over
     /// a <a href="http://parlab.eecs.berkeley.edu/wiki/_media/patterns/taskqueue.pdf">Task Queue</a> 
     /// </summary>
-    public interface IAmAMessageMapper { }
+    public interface IAmAMessageMapper;
 
     /// <summary>
     /// Interface IAmAMessageMapper
@@ -40,11 +40,19 @@ namespace Paramore.Brighter
     public interface IAmAMessageMapper<TRequest> : IAmAMessageMapper where TRequest : class, IRequest
     {
         /// <summary>
+        /// Gets or sets the context. Usually the context is given to you by the pipeline and you do not need to set this
+        /// </summary>
+        /// <value>The context.</value>
+        IRequestContext? Context { get; set; }
+        
+        /// <summary>
         /// Maps to message.
         /// </summary>
         /// <param name="request">The request.</param>
+        /// <param name="publication">The Publication for the channel we are writing the message to, for metadata such as Topic/RoutingKey or CloudEvents</param>
         /// <returns>Message.</returns>
-        Message MapToMessage(TRequest request);
+        Message MapToMessage(TRequest request, Publication publication);
+        
         /// <summary>
         /// Maps to request.
         /// </summary>

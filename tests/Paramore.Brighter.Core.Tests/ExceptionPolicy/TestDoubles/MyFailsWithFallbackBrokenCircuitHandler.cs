@@ -29,7 +29,7 @@ using Polly.CircuitBreaker;
 
 namespace Paramore.Brighter.Core.Tests.ExceptionPolicy.TestDoubles
 {
-    internal class MyFailsWithFallbackBrokenCircuitHandler: RequestHandler<MyCommand>
+    internal sealed class MyFailsWithFallbackBrokenCircuitHandler: RequestHandler<MyCommand>
     {
         public static bool FallbackCalled { get; set; }
         public static bool ReceivedCommand { get; set; }
@@ -41,7 +41,7 @@ namespace Paramore.Brighter.Core.Tests.ExceptionPolicy.TestDoubles
         }
 
         [FallbackPolicy(false, true, 1)]
-        public override MyCommand Handle(MyCommand command)
+        public override MyCommand Handle(MyCommand myCommand)
         {
             ReceivedCommand = true;
             throw new BrokenCircuitException();

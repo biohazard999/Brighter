@@ -26,7 +26,7 @@ using System;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyThrowingEventHandler : RequestHandler<MyEvent>
+    internal sealed class MyThrowingEventHandler : RequestHandler<MyEvent>
     {
         private static MyEvent s_receivedEvent;
 
@@ -36,9 +36,9 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
             s_receivedEvent = null;
         }
 
-        public override MyEvent Handle(MyEvent command)
+        public override MyEvent Handle(MyEvent myEvent)
         {
-            LogEvent(command);
+            LogEvent(myEvent);
 
             throw new InvalidOperationException();
         }

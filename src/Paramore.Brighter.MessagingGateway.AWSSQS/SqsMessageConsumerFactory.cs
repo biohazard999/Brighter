@@ -1,19 +1,25 @@
-﻿// ***********************************************************************
-// Assembly         : paramore.brighter.messaginggateway.awssqs
-// Author           : ian
-// Created          : 08-17-2015
-//
-// Last Modified By : ian
-// Last Modified On : 10-25-2015
-// ***********************************************************************
-// <copyright file="SqsMessageConsumerFactory.cs" company="">
-//     Copyright ©  2015
-// </copyright>
-// <summary></summary>
-// ***********************************************************************
+﻿#region Licence
+/* The MIT License (MIT)
+Copyright © 2022 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
-using Amazon;
-using Amazon.Runtime;
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the “Software”), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+#endregion
 
 namespace Paramore.Brighter.MessagingGateway.AWSSQS
 {
@@ -35,11 +41,54 @@ namespace Paramore.Brighter.MessagingGateway.AWSSQS
         /// <summary>
         /// Creates a consumer for the specified queue.
         /// </summary>
-        /// <param name="connection">The queue to connect to</param>
-        /// <returns>IAmAMessageConsumer.</returns>
-        public IAmAMessageConsumer Create(Connection connection)
+        /// <param name="subscription">The queue to connect to</param>
+        /// <returns>IAmAMessageConsumerSync.</returns>
+        public IAmAMessageConsumerSync Create(Subscription subscription)
         {
-            return new SqsMessageConsumer(_awsConnection, connection.ChannelName.ToValidSQSQueueName());
+            return CreateImpl(subscription);
+        }
+
+        public IAmAMessageConsumerAsync CreateAsync(Subscription subscription)
+        {
+            return CreateImpl(subscription);
+        }
+
+
+        private SqsMessageConsumer CreateImpl(Subscription subscription)
+        {
+            SqsSubscription? sqsSubscription = subscription as SqsSubscription;
+            if (sqsSubscription == null) throw new ConfigurationException("We expect an SqsSubscription or SqsSubscription<T> as a parameter");
+
+            //if it is a url, don't alter; if it is just a name, ensure it is valid
+            ChannelName queueName = subscription.ChannelName;
+            if (sqsSubscription.FindQueueBy == QueueFindBy.Name)
+               queueName =queueName.ToValidSQSQueueName(sqsSubscription.QueueAttributes.Type == SqsType.Fifo);
+
+            // Extract DLQ and invalid message routing keys if subscription supports them
+            RoutingKey? deadLetterRoutingKey = null;
+            RoutingKey? invalidMessageRoutingKey = null;
+
+            if (sqsSubscription is IUseBrighterDeadLetterSupport dlqSupport)
+            {
+                deadLetterRoutingKey = dlqSupport.DeadLetterRoutingKey;
+            }
+
+            if (sqsSubscription is IUseBrighterInvalidMessageSupport invalidSupport)
+            {
+                invalidMessageRoutingKey = invalidSupport.InvalidMessageRoutingKey;
+            }
+
+            return new SqsMessageConsumer(
+                awsConnection: _awsConnection,
+                queueName: queueName,
+                batchSize: subscription.BufferSize,
+                deadLetterRoutingKey: deadLetterRoutingKey,
+                invalidMessageRoutingKey: invalidMessageRoutingKey,
+                makeChannels: sqsSubscription.MakeChannels,
+                isQueueUrl: (sqsSubscription.FindQueueBy == QueueFindBy.Url),
+                rawMessageDelivery: sqsSubscription.QueueAttributes.RawMessageDelivery,
+                queueAttributes: sqsSubscription.QueueAttributes
+            );
         }
     }
 }

@@ -39,15 +39,15 @@ namespace Paramore.Brighter
         /// Gets or sets the context. Usually the context is given to you by the pipeline and you do not need to set this
         /// </summary>
         /// <value>The context.</value>
-
-        IRequestContext Context { get; set; }
+        IRequestContext? Context { get; set; }
+        
         /// <summary>
         /// Describes the path. To support pipeline tracing. Generally return the name of this handler to <see cref="IAmAPipelineTracer"/>,
         ///  or other information to determine the path a request will take
         /// </summary>
         /// <param name="pathExplorer">The path explorer.</param>
-
         void DescribePath(IAmAPipelineTracer pathExplorer);
+        
         /// <summary>
         /// Initializes from the <see cref="RequestHandlerAttribute"/> attribute parameters. Use when you need to provide parameter information from the
         /// attribute to the handler. Note that the attribute implementation might include types other than primitives that you intend to pass across, but
@@ -56,7 +56,7 @@ namespace Paramore.Brighter
         /// for an attribute-handler pair used to provide orthogonal QoS to the pipeline.
         /// </summary>
         /// <param name="initializerList">The initializer list.</param>
-        void InitializeFromAttributeParams(params object[] initializerList);
+        void InitializeFromAttributeParams(params object?[] initializerList);
 
         /// <summary>
         /// Gets the name of the Handler. Useful for diagnostic purposes
@@ -65,7 +65,7 @@ namespace Paramore.Brighter
         HandlerName Name { get; }
 
         /// <summary>
-        /// Adds to lifetime so that the pipeline can manage destroying handlers created as part of the pipeline by calling the client provided <see cref="IAmAHandlerFactory"/> .
+        /// Adds to lifetime so that the pipeline can manage destroying handlers created as part of the pipeline by calling the client provided <see cref="IAmAHandlerFactorySync"/> .
         /// </summary>
         /// <param name="instanceScope">The instance scope.</param>
         void AddToLifetime(IAmALifetime instanceScope);

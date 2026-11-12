@@ -24,11 +24,14 @@ THE SOFTWARE. */
 #endregion
 
 using System;
-using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
 using Paramore.Brighter.Inbox.Exceptions;
+using Paramore.Brighter.JsonConverters;
+using Paramore.Brighter.Observability;
 
 namespace Paramore.Brighter
 {
@@ -44,7 +47,7 @@ namespace Paramore.Brighter
         /// <param name="requestBody">The request body.</param>
         /// <param name="writeTime">The request arrived at when.</param>
         /// <param name="contextKey">An identifier for the context in which the command has been processed (for example, the name of the handler)</param>
-        private InboxItem(Type requestType, string requestBody, DateTime writeTime, string contextKey)
+        public InboxItem(Type requestType, string requestBody, DateTimeOffset writeTime, string contextKey)
         {
             RequestType = requestType;
             RequestBody = requestBody;
@@ -53,18 +56,16 @@ namespace Paramore.Brighter
         }
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="InboxItem"/> class.
-        /// </summary>
-        /// <param name="requestType">Type of the command.</param>
-        /// <param name="requestBody">The command body.</param>
-        public InboxItem(Type requestType, string requestBody, string contextKey)
-            : this(requestType, requestBody, DateTime.UtcNow, contextKey) {}
-
-        /// <summary>
         /// Gets or sets the command body.
         /// </summary>
         /// <value>The command body.</value>
         public string RequestBody { get; set; }
+
+        /// <summary>
+        /// Gets or sets the causation id linking this inbox entry to the outbox messages produced during the
+        /// handler invocation that stored it. Null when no causation id was supplied.
+        /// </summary>
+        public string? CausationId { get; set; }
         
         /// <summary>
         /// Gets the type of the command.
@@ -77,7 +78,7 @@ namespace Paramore.Brighter
         /// </summary>
         /// <value>The command when.</value>
 
-        public DateTime WriteTime { get; }
+        public DateTimeOffset WriteTime { get; }
 
         /// <summary>
         /// The Id and the key for the context i.e. message type, that we are looking for
@@ -92,7 +93,7 @@ namespace Paramore.Brighter
         /// <param name="id">The Guid for the request</param>
         /// <param name="contextKey">The handler this is for</param>
         /// <returns></returns>
-        public static string CreateKey(Guid id, string contextKey)
+        public static string CreateKey(string id, string contextKey)
         {
             return $"{id}:{contextKey}";
         }
@@ -109,53 +110,88 @@ namespace Paramore.Brighter
     /// It is possible to use multiple performers within one process as competing consumers, and if you want to use an InMemoryInbox this is the most
     /// viable strategy - otherwise use an out-of-process inbox that provides shared state to all consumers
     /// </summary>
-    public class InMemoryInbox : InMemoryBox<InboxItem>, IAmAnInbox, IAmAnInboxAsync
+    public class InMemoryInbox(TimeProvider timeProvider,
+        InstrumentationOptions instrumentationOptions = InstrumentationOptions.All)
+        : InMemoryBox<InboxItem>(timeProvider), IAmAnInboxSync, IAmAnInboxAsync, IAmACausationTrackingInbox
     {
-        /// <summary>
-        /// If false we the default thread synchronization context to run any continuation, if true we re-use the original synchronization context.
-        /// Default to false unless you know that you need true, as you risk deadlocks with the originating thread if you Wait
-        /// or access the Result or otherwise block. You may need the orginating synchronization context if you need to access thread specific storage
-        /// such as HTTPContext
-        /// </summary>
-        /// <value><c>true</c> if [continue on captured context]; otherwise, <c>false</c>.</value>
+        private readonly TimeProvider _timeProvider = timeProvider;
+        private readonly InstrumentationOptions _instrumentationOptions = instrumentationOptions;
+
+        /// <inheritdoc />
         public bool ContinueOnCapturedContext { get; set; }
-        
+
+        /// <inheritdoc />
+        public IAmABrighterTracer? Tracer { private get; set; }
+
         /// <summary>
-        /// Adds the specified identifier.
+        ///   Adds a command to the in-memory store.
         /// </summary>
         /// <typeparam name="T"></typeparam>
         /// <param name="command">The command.</param>
-        /// <param name="contextKey"></param>
-        /// <param name="timeoutInMilliseconds">The timeout in milliseconds.</param>
-        public void Add<T>(T command, string contextKey, int timeoutInMilliseconds = -1) where T : class, IRequest
+        /// <param name="contextKey">An identifier for the context in which the command has been processed (for example, the name of the handler)</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>
+        /// <param name="timeoutInMilliseconds">Ignored as commands are stored in-memory</param>
+        public void Add<T>(T command, string contextKey, RequestContext? requestContext, int timeoutInMilliseconds = -1) 
+            where T : class, IRequest
         {
-            ClearExpiredMessages();
-            
-            string key = InboxItem.CreateKey(command.Id, contextKey);
-            if (!Exists<T>(command.Id, contextKey))
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.InboxDbName, BoxDbOperation.Add, InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions);
+
+            try
             {
-                if (!_requests.TryAdd(key, new InboxItem(typeof (T), string.Empty, contextKey)))
+                ClearExpiredMessages();
+                EnforceCapacityLimit();
+
+                string key = InboxItem.CreateKey(command.Id.Value, contextKey);
+                var requestBody = JsonSerializer.Serialize(command, JsonSerialisationOptions.Options);
+                var causationId = ReadCausationId(requestContext);
+                InboxItem item;
+                if (!ExistsInternal<T>(command.Id.Value, contextKey))
                 {
-                    throw new Exception($"Could not add command: {command.Id} to the Inbox");
+                    item = new InboxItem(typeof(T), requestBody, _timeProvider.GetUtcNow(), contextKey)
+                    {
+                        CausationId = causationId
+                    };
+                    if (!Requests.TryAdd(key, item))
+                    {
+                        throw new Exception($"Could not add command: {command.Id} to the Inbox");
+                    }
+                }
+                else
+                {
+                    if (!Requests.TryGetValue(key, out item!))
+                    {
+                        throw new Exception($"Could not find command: {command.Id} in the Inbox");
+                    }
+
+                    item.RequestBody = requestBody;
+                    item.CausationId = causationId;
                 }
             }
-
-            _requests[key].RequestBody = JsonConvert.SerializeObject(command);
+            finally
+            {
+                Tracer?.EndSpan(span);
+            }
         }
 
         /// <summary>
-        /// Awaitably adds the specified identifier.
+        ///   Awaitably adds a command to the store.
         /// </summary>
         /// <typeparam name="T"></typeparam>
         /// <param name="command">The command.</param>
-        /// <param name="contextKey"></param>
-        /// <param name="timeoutInMilliseconds">The timeout in milliseconds.</param>
-        /// <param name="cancellationToken"></param>
-        /// <returns><see cref="Task" />Allows the sender to cancel the call, optional</returns>
-        /// <exception cref="System.NotImplementedException"></exception>
-        public Task AddAsync<T>(T command, string contextKey, int timeoutInMilliseconds = -1, CancellationToken cancellationToken = default(CancellationToken)) where T : class, IRequest
+        /// <param name="contextKey">An identifier for the context in which the command has been processed (for example, the name of the handler)</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>
+        /// <param name="timeoutInMilliseconds">Ignored as commands are stored in-memory</param>
+        /// <param name="cancellationToken">Allow the sender to cancel the operation, if the parameter is supplied</param>
+        /// <returns><see cref="Task"/>.</returns>
+        public Task AddAsync<T>(T command, string contextKey, RequestContext? requestContext, 
+            int timeoutInMilliseconds = -1, CancellationToken cancellationToken = default) 
+            where T : class, IRequest
         {
-            var tcs = new TaskCompletionSource<object>();
+            // Note: Don't create a span here - we call the sync method behind the scenes
+            var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (cancellationToken.IsCancellationRequested)
             {
@@ -163,51 +199,91 @@ namespace Paramore.Brighter
                 return tcs.Task;
             }
 
-            Add(command, contextKey, timeoutInMilliseconds);
+            Add(command, contextKey, requestContext, timeoutInMilliseconds);
 
             tcs.SetResult(new object());
             return tcs.Task;
         }
 
         /// <summary>
-        /// Finds the command with the specified identifier.
+        ///   Finds a command with the specified identifier.
         /// </summary>
         /// <typeparam name="T"></typeparam>
         /// <param name="id">The identifier.</param>
-        /// <param name="contextKey"></param>
-        /// <param name="timeoutInMilliseconds">The timeout in milliseconds.</param>
-        /// <returns>ICommand.</returns>
-        /// <exception cref="System.TypeLoadException"></exception>
-        public T Get<T>(Guid id, string contextKey, int timeoutInMilliseconds = -1) where T : class, IRequest
+        /// <param name="contextKey">An identifier for the context in which the command has been processed (for example, the name of the handler)</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>
+        /// <param name="timeoutInMilliseconds">Ignored as commands are stored in-memory</param>
+        /// <returns><see cref="T"/></returns>
+        public T Get<T>(string id, string contextKey, RequestContext? requestContext, int timeoutInMilliseconds = -1) 
+            where T : class, IRequest
         {
-            ClearExpiredMessages();
-            
-            if (_requests.TryGetValue(InboxItem.CreateKey(id, contextKey), out InboxItem inboxItem))
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.InboxDbName, BoxDbOperation.Get, InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions);
+
+            try
             {
-                return JsonConvert.DeserializeObject<T>(inboxItem.RequestBody);
+                ClearExpiredMessages();
+
+                if (Requests.TryGetValue(InboxItem.CreateKey(id, contextKey), out InboxItem? inboxItem))
+                {
+                    var result = JsonSerializer.Deserialize<T>(inboxItem.RequestBody, JsonSerialisationOptions.Options);
+
+                    if (result is null) throw new ArgumentException("Body must not be null");
+                    return result;
+                }
+
+                throw new RequestNotFoundException<T>(id);
             }
-
-            throw new RequestNotFoundException<T>(id);
-        }
-
-        public bool Exists<T>(Guid id, string contextKey, int timeoutInMilliseconds = -1) where T : class, IRequest
-        {
-            ClearExpiredMessages();
-
-            return _requests.ContainsKey(InboxItem.CreateKey(id, contextKey));
+            finally
+            {
+                Tracer?.EndSpan(span);
+            }
         }
 
         /// <summary>
-        /// Checks whether a command with the specified identifier exists in the store
+        ///   Checks whether a command with the specified identifier exists in the store.
         /// </summary>
         /// <typeparam name="T"></typeparam>
         /// <param name="id">The identifier.</param>
-        /// <param name="contextKey"></param>
-        /// <param name="timeoutInMilliseconds"></param>
-        /// <returns>True if it exists, False otherwise</returns>
-        public Task<bool> ExistsAsync<T>(Guid id, string contextKey, int timeoutInMilliseconds = -1, CancellationToken cancellationToken = default(CancellationToken)) where T : class, IRequest
+        /// <param name="contextKey">An identifier for the context in which the command has been processed (for example, the name of the handler)</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>
+        /// <param name="timeoutInMilliseconds">Ignored as commands are stored in-memory</param>
+        /// <returns><see langword="true"/> if it exists, otherwise <see langword="false"/>.</returns>
+        public bool Exists<T>(string id, string contextKey, RequestContext? requestContext, int timeoutInMilliseconds = -1) where T : class, IRequest
         {
-            var tcs = new TaskCompletionSource<bool>();
+            var span = Tracer?.CreateDbSpan(
+                new BoxSpanInfo(DbSystem.Brighter, InMemoryAttributes.InboxDbName, BoxDbOperation.Exists, InMemoryAttributes.DbTable),
+                requestContext?.Span,
+                options: _instrumentationOptions
+            );
+
+            try
+            {
+                return ExistsInternal<T>(id, contextKey);
+            }
+            finally
+            {
+                Tracer?.EndSpan(span);
+            }
+        }
+
+        /// <summary>
+        ///   Awaitable checks whether a command with the specified identifier exists in the store.
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="id">The identifier.</param>
+        /// <param name="contextKey">An identifier for the context in which the command has been processed (for example, the name of the handler)</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>
+        /// <param name="timeoutInMilliseconds">Ignored as commands are stored in-memory</param>
+        /// <param name="cancellationToken">Allow the sender to cancel the operation, if the parameter is supplied</param>
+        /// <returns><see cref="Task{true}"/> if it exists, otherwise <see cref="Task{false}"/>.</returns>
+        public Task<bool> ExistsAsync<T>(string id, string contextKey, RequestContext? requestContext, int timeoutInMilliseconds = -1,
+            CancellationToken cancellationToken = default) where T : class, IRequest
+        {
+            // Note: Don't create a span here - we call the sync method behind the scenes
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (cancellationToken.IsCancellationRequested)
             {
@@ -215,26 +291,27 @@ namespace Paramore.Brighter
                 return tcs.Task;
             }
 
-            var command = Exists<T>(id, contextKey, timeoutInMilliseconds);
+            var command = Exists<T>(id, contextKey, requestContext, timeoutInMilliseconds);
 
             tcs.SetResult(command);
             return tcs.Task;
         }
 
         /// <summary>
-        /// Awaitably finds the specified identifier.
+        ///   Awaitably finds a command with the specified identifier.
         /// </summary>
         /// <typeparam name="T"></typeparam>
         /// <param name="id">The identifier.</param>
-        /// <param name="contextKey"></param>
-        /// <param name="timeoutInMilliseconds">The timeout in milliseconds.</param>
-        /// <param name="cancellationToken"></param>
-        /// <returns><see cref="Task{T}" />.</returns>
-        /// <returns><see cref="Task" />Allows the sender to cancel the call, optional</returns>
-        /// <exception cref="System.NotImplementedException"></exception>
-        public Task<T> GetAsync<T>(Guid id, string contextKey, int timeoutInMilliseconds = -1, CancellationToken cancellationToken = default(CancellationToken)) where T : class, IRequest
+        /// <param name="contextKey">An identifier for the context in which the command has been processed (for example, the name of the handler)</param>
+        /// <param name="requestContext">What is the context for this request; used to access the Span</param>
+        /// <param name="timeoutInMilliseconds">Ignored as commands are stored in-memory</param>
+        /// <param name="cancellationToken">Allow the sender to cancel the operation, if the parameter is supplied</param>
+        /// <returns><see cref="Task{T}"/>.</returns>
+        public Task<T> GetAsync<T>(string id, string contextKey, RequestContext? requestContext, int timeoutInMilliseconds = -1,
+            CancellationToken cancellationToken = default) where T : class, IRequest
         {
-            var tcs = new TaskCompletionSource<T>();
+            // Note: Don't create a span here - we call the sync method behind the scenes
+            var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (cancellationToken.IsCancellationRequested)
             {
@@ -242,10 +319,88 @@ namespace Paramore.Brighter
                 return tcs.Task;
             }
 
-            var command = Get<T>(id, contextKey, timeoutInMilliseconds);
+            var command = Get<T>(id, contextKey, requestContext, timeoutInMilliseconds);
 
             tcs.SetResult(command);
             return tcs.Task;
         }
-   }
+
+        protected override void RemoveExpiredMessages(DateTimeOffset now)
+        {
+            var expiredEntries =
+                Requests
+                    .Where(entry => (now - entry.Value.WriteTime) >= EntryTimeToLive)
+                    .Select(entry => entry.Key);
+
+            foreach (var key in expiredEntries)
+            {
+                //if this fails ignore, killed by something else like compaction
+                Requests.TryRemove(key, out _);
+            }
+        }
+
+        protected override void Compact(int entriesToRemove)
+        {
+            var removalList =
+                Requests
+                    .OrderBy(entry => entry.Value.WriteTime)
+                    .Take(entriesToRemove)
+                    .Select(entry => entry.Key);
+
+            foreach (var key in removalList)
+            {
+                //ignore errors, likely just something else has cleared it such as TTL eviction
+                Requests.TryRemove(key, out _);
+            }
+        }
+
+        // Performs the logic of checking whether a command exists in the inbox without creating telemetry
+        private bool ExistsInternal<T>(string id, string contextKey)
+        {
+            ClearExpiredMessages();
+
+            return Requests.ContainsKey(InboxItem.CreateKey(id, contextKey));
+        }
+
+        /// <inheritdoc />
+        public bool SupportsCausationTracking() => true;
+
+        /// <inheritdoc />
+        public Task<bool> SupportsCausationTrackingAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult(true);
+
+        /// <inheritdoc />
+        public string? GetCausationId(string id, string contextKey, RequestContext? requestContext,
+            int timeoutInMilliseconds = -1)
+        {
+            ClearExpiredMessages();
+
+            return Requests.TryGetValue(InboxItem.CreateKey(id, contextKey), out InboxItem? inboxItem)
+                ? inboxItem.CausationId
+                : null;
+        }
+
+        /// <inheritdoc />
+        public Task<string?> GetCausationIdAsync(string id, string contextKey, RequestContext? requestContext,
+            int timeoutInMilliseconds = -1, CancellationToken cancellationToken = default)
+        {
+            // Note: Don't create a span here - we call the sync method behind the scenes
+            var tcs = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                tcs.SetCanceled();
+                return tcs.Task;
+            }
+
+            tcs.SetResult(GetCausationId(id, contextKey, requestContext, timeoutInMilliseconds));
+            return tcs.Task;
+        }
+
+        // Reads the causation id from the request context bag, if present
+        private static string? ReadCausationId(RequestContext? requestContext)
+            => requestContext?.Bag.TryGetValue(RequestContextBagNames.CausationId, out var value) == true
+                ? value as string
+                : null;
+    }
 }

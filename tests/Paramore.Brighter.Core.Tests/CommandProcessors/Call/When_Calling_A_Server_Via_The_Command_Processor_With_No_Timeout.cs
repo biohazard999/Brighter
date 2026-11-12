@@ -1,0 +1,98 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Transactions;
+using Microsoft.Extensions.Time.Testing;
+using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
+using Paramore.Brighter.Core.Tests.TestHelpers;
+using Paramore.Brighter.Extensions;
+using Paramore.Brighter.Observability;
+using Polly.Registry;
+using Xunit;
+
+namespace Paramore.Brighter.Core.Tests.CommandProcessors.Call
+{
+    public class CommandProcessorCallTestsNoTimeout
+    {
+        private readonly CommandProcessor _commandProcessor;
+        private readonly MyRequest _myRequest = new();
+
+        public CommandProcessorCallTestsNoTimeout()
+        {
+            _myRequest.RequestValue = "Hello World";
+
+            var messageMapperRegistry = new MessageMapperRegistry(new SimpleMessageMapperFactory((type) =>
+            {
+                if (type == typeof(MyRequestMessageMapper))
+                    return new MyRequestMessageMapper();
+                if (type == typeof(MyResponseMessageMapper))
+                    return new MyResponseMessageMapper();
+
+                throw new ConfigurationException($"No mapper found for {type.Name}");
+            }), null);
+            
+            messageMapperRegistry.Register<MyRequest, MyRequestMessageMapper>();
+            messageMapperRegistry.Register<MyResponse, MyResponseMessageMapper>();
+
+            var subscriberRegistry = new SubscriberRegistry();
+            subscriberRegistry.Register<MyResponse, MyResponseHandler>();
+            var handlerFactory = new SimpleHandlerFactorySync(_ => new MyResponseHandler());
+
+            var replySubs = new List<Subscription>
+            {
+                new Subscription<MyResponse>()
+            };
+            
+            var resiliencePipelineRegistry = new ResiliencePipelineRegistry<string>()
+                .AddBrighterDefault();
+
+            const string topic = "MyRequest";
+            var routingKey = new RoutingKey(topic);
+            var fakeTimeProvider = new FakeTimeProvider();
+
+            var producerRegistry = new ProducerRegistry(new Dictionary<RoutingKey, IAmAMessageProducer>
+            {
+                { 
+                    routingKey, new InMemoryMessageProducer(new InternalBus(), new Publication {Topic = routingKey, RequestType = typeof(MyRequest)})
+                }
+            });
+
+            var tracer = new BrighterTracer(fakeTimeProvider);
+            IAmAnOutboxProducerMediator bus = new OutboxProducerMediator<Message, CommittableTransaction>(
+                producerRegistry, 
+                resiliencePipelineRegistry, 
+                messageMapperRegistry,
+                new EmptyMessageTransformerFactory(),
+                new EmptyMessageTransformerFactoryAsync(),
+                tracer,
+                new FindPublicationByPublicationTopicOrRequestType(),
+                new InMemoryOutbox( fakeTimeProvider) {Tracer = tracer}
+            );
+
+            _commandProcessor = new CommandProcessor(
+                subscriberRegistry,
+                handlerFactory,
+                new InMemoryRequestContextFactory(),
+                new DefaultPolicy(),
+                resiliencePipelineRegistry,
+                bus,
+                replySubscriptions:replySubs,
+                responseChannelFactory: new InMemoryChannelFactory(new InternalBus(), TimeProvider.System),
+                requestSchedulerFactory: new InMemorySchedulerFactory()
+            );
+           
+            PipelineBuilder<MyRequest>.ClearPipelineCache();
+        }
+
+
+        [Fact]
+        public void When_Calling_A_Server_Via_The_Command_Processor_With_No_Timeout()
+        {
+            var exception = Catch.Exception(() => _commandProcessor.Call<MyRequest, MyResponse>(
+                _myRequest, timeOut: TimeSpan.FromMilliseconds(0))
+            );
+            
+            //should throw an exception as we require a timeout to be set
+            Assert.IsType<InvalidOperationException>(exception);
+        }
+    }
+}

@@ -24,15 +24,15 @@ THE SOFTWARE. */
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyUnusedCommandHandler : RequestHandler<MyCommand>
+    internal sealed class MyUnusedCommandHandler : RequestHandler<MyCommand>
     {
         private static MyCommand s_command;
 
         [MyAbortingHandler(1, HandlerTiming.Before)]
-        public override MyCommand Handle(MyCommand command)
+        public override MyCommand Handle(MyCommand myCommand)
         {
-            LogCommand(command);
-            return base.Handle(command);
+            LogCommand(myCommand);
+            return base.Handle(myCommand);
         }
 
         public static bool Shouldreceive(MyCommand expectedCommand)

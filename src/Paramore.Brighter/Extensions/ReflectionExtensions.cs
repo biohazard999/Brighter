@@ -22,9 +22,7 @@ THE SOFTWARE. */
 
 #endregion
 
-using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Reflection;
 using Paramore.Brighter.Inbox.Attributes;
 
@@ -33,30 +31,19 @@ namespace Paramore.Brighter.Extensions
     internal static class ReflectionExtensions
     {
         internal static IEnumerable<RequestHandlerAttribute> GetOtherHandlersInPipeline(this MethodInfo targetMethod)
-        {
-            var customAttributes = targetMethod.GetCustomAttributes(true);
-            return customAttributes
-                .Select(attr => (Attribute) attr)
-                .Where(a => a.GetType().GetTypeInfo().BaseType == typeof (RequestHandlerAttribute))
-                .Cast<RequestHandlerAttribute>()
-                .ToList();
-        }
+            => targetMethod.GetCustomAttributes<RequestHandlerAttribute>(true);
+
+        internal static IEnumerable<WrapWithAttribute> GetOtherWrapsInPipeline(this MethodInfo targetMethod)
+            => targetMethod.GetCustomAttributes<WrapWithAttribute>(true);
+
+        internal static IEnumerable<UnwrapWithAttribute> GetOtherUnwrapsInPipeline(this MethodInfo targetMethod)
+            => targetMethod.GetCustomAttributes<UnwrapWithAttribute>(true);
 
         internal static bool HasNoInboxAttributesInPipeline(this MethodInfo targetMethod)
-        {
-             var customAttributes = targetMethod.GetCustomAttributes(true);
-             return customAttributes
-                .Select(attr => (Attribute) attr)
-                .Any(a => IntrospectionExtensions.GetTypeInfo(a.GetType()) == typeof (NoGlobalInboxAttribute));
-        }
+            => targetMethod.IsDefined(typeof(NoGlobalInboxAttribute), true);
 
         internal static bool HasExistingUseInboxAttributesInPipeline(this MethodInfo targetMethod)
-        {
-              var customAttributes = targetMethod.GetCustomAttributes(true);
-              return customAttributes
-                .Select(attr => (Attribute) attr)
-                .Any(a => IntrospectionExtensions.GetTypeInfo(a.GetType()) == typeof (UseInboxAttribute)
-                          || IntrospectionExtensions.GetTypeInfo(a.GetType()) == typeof (UseInboxAsyncAttribute));
-        }
+            => targetMethod.IsDefined(typeof(UseInboxAttribute), true)
+               || targetMethod.IsDefined(typeof(UseInboxAsyncAttribute), true);
     }
 }

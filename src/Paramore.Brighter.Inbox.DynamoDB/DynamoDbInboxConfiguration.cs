@@ -22,6 +22,7 @@ THE SOFTWARE. */
 
 #endregion
 
+using System;
 using Amazon;
 using Amazon.Runtime;
 
@@ -30,27 +31,17 @@ namespace Paramore.Brighter.Inbox.DynamoDB
     /// <summary>
     /// Class DynamoDbStoreConfiguration
     /// </summary>
-    public class DynamoDbInboxConfiguration
+    public class DynamoDbInboxConfiguration(string? tableName = null)
     {
         //What AWS Credentials to use
-        public AWSCredentials Credentials { get; }
+        public AWSCredentials? Credentials { get; }
         /// <summary>
         /// Which AWS region
         /// </summary>
-        public RegionEndpoint Region { get; }
+        public RegionEndpoint? Region { get; }
         /// <summary>
         /// The table that forms the Outbox
         /// </summary>
-        public string TableName { get; set; }
-
-        public DynamoDbInboxConfiguration(
-            AWSCredentials credentials, 
-            RegionEndpoint region,
-            string tableName)
-        {
-            Credentials = credentials;
-            Region = region;
-            TableName = tableName;
-        }
-   }     
+        public string TableName { get; set; } = tableName ?? "brighter_inbox";
+    }     
 }

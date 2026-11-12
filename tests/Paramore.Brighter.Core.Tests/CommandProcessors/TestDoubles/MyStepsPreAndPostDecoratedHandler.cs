@@ -26,7 +26,7 @@ using System;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyStepsPreAndPostDecoratedHandler : RequestHandler<MyCommand>, IDisposable
+    internal sealed class MyStepsPreAndPostDecoratedHandler : RequestHandler<MyCommand>, IDisposable
     {
         private static MyCommand s_command;
         public static bool DisposeWasCalled { get; set; }
@@ -39,10 +39,10 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 
         [MyStepsPreValidationHandler(2, HandlerTiming.Before)]
         [MyStepsPostLoggingHandler(1, HandlerTiming.After)]
-        public override MyCommand Handle(MyCommand command)
+        public override MyCommand Handle(MyCommand myCommand)
         {
-            LogCommand(command);
-            return base.Handle(command);
+            LogCommand(myCommand);
+            return base.Handle(myCommand);
         }
 
         public static bool ShouldReceive(MyCommand expectedCommand)

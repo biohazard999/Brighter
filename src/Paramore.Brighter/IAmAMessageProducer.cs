@@ -1,6 +1,6 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
-Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+Copyright © 2022 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the “Software”), to deal
@@ -19,36 +19,30 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE. */
-
 #endregion
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using Paramore.Brighter.Observability;
 
 namespace Paramore.Brighter
 {
-    /// <summary>
-    /// Interface IAmASendMessageGateway
-    /// Abstracts away the Application Layer used to push messages onto a <a href="http://parlab.eecs.berkeley.edu/wiki/_media/patterns/taskqueue.pdf">Task Queue</a>
-    /// Usually clients do not need to instantiate as access is via an <see cref="IAmAChannel"/> derived class.
-    /// We provide the following default gateway applications
-    /// <list type="bullet">
-    /// <item>AMQP</item>
-    /// <item>RESTML</item>
-    /// </list>
-    /// </summary>
-    public interface IAmAMessageProducer : IDisposable
+    public interface IAmAMessageProducer 
     {
         /// <summary>
-        /// Sends the specified message.
+        /// The <see cref="Publication "/>that this Producer is for.
         /// </summary>
-        /// <param name="message">The message.</param>
-        void Send(Message message);
+        Publication Publication { get; }
         
         /// <summary>
-        /// Send the specified message with specified delay
+        /// Allows us to set a <see cref="BrighterTracer"/> to let a Producer participate in our telemetry
         /// </summary>
-        /// <param name="message">The message.</param>
-        /// <param name="delayMilliseconds">Number of milliseconds to delay delivery of the message.</param>
-        void SendWithDelay(Message message, int delayMilliseconds = 0);
-     }
+        Activity? Span { get; set; }
+        
+        /// <summary>
+        /// The external message scheduler
+        /// </summary>
+        IAmAMessageScheduler? Scheduler { get; set; }
+    }
 }

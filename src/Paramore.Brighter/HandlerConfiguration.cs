@@ -39,16 +39,11 @@ namespace Paramore.Brighter
         /// </summary>
         /// <value>The handler factory.</value>
         public IAmAHandlerFactory HandlerFactory { get; private set; }
-        /// <summary>
-        /// Gets the async handler factory.
-        /// </summary>
-        /// <value>The handler factory.</value>
-        public IAmAHandlerFactoryAsync AsyncHandlerFactory { get; private set; }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="HandlerConfiguration"/> class.
         /// We use the <see cref="IAmASubscriberRegistry"/> instance to look up subscribers for messages when dispatching. Use <see cref="SubscriberRegistry"/> unless
-        /// you have some reason to override. We expect a <see cref="CommandProcessor.Send{T}(T)"/> to have one registered handler
+        /// you have some reason to override. We expect a <see cref="CommandProcessor.Send{T}"/> to have one registered handler
         /// We use the 
         /// </summary>
         /// <param name="subscriberRegistry">The subscriber registry.</param>
@@ -61,42 +56,13 @@ namespace Paramore.Brighter
 
         /// <summary>
         /// Initializes a new instance of the <see cref="HandlerConfiguration"/> class.
-        /// We use the <see cref="IAmASubscriberRegistry"/> instance to look up subscribers for messages when dispatching. Use <see cref="SubscriberRegistry"/> unless
-        /// you have some reason to override. We expect a <see cref="CommandProcessor.Send{T}(T)"/> to have one registered handler
-        /// We use the 
-        /// </summary>
-        /// <param name="subscriberRegistry">The subscriber registry.</param>
-        /// <param name="asyncHandlerFactory">The async handler factory.</param>
-        public HandlerConfiguration(IAmASubscriberRegistry subscriberRegistry, IAmAHandlerFactoryAsync asyncHandlerFactory)
-        {
-            SubscriberRegistry = subscriberRegistry;
-            AsyncHandlerFactory = asyncHandlerFactory;
-        }
-
-        /// <summary>
-        /// Initializes a new instance of the <see cref="HandlerConfiguration"/> class.
-        /// We use the <see cref="IAmASubscriberRegistry"/> instance to look up subscribers for messages when dispatching. Use <see cref="SubscriberRegistry"/> unless
-        /// you have some reason to override. We expect a <see cref="CommandProcessor.Send{T}(T)"/> to have one registered handler
-        /// We use the 
-        /// </summary>
-        /// <param name="subscriberRegistry">The subscriber registry.</param>
-        /// <param name="handlerFactory">The handler factory.</param>
-        /// <param name="asyncHandlerFactory">The async handler factory.</param>
-        public HandlerConfiguration(IAmASubscriberRegistry subscriberRegistry, IAmAHandlerFactory handlerFactory, IAmAHandlerFactoryAsync asyncHandlerFactory)
-        {
-            SubscriberRegistry = subscriberRegistry;
-            HandlerFactory = handlerFactory;
-            AsyncHandlerFactory = asyncHandlerFactory;
-        }
-
-        /// <summary>
-        /// Initializes a new instance of the <see cref="HandlerConfiguration"/> class.
         /// The default constructor is used when we want to create an empty handler configuration.
         /// Normally this is only useful for a ControlBusSender command processor, which posts
         /// all of its requests and does not have a local handler.
-        /// As you cannot se the HandlerFactory and SubscriberRegistry post-creation, don't use
+        /// As you cannot see the HandlerFactory and SubscriberRegistry post-creation, don't use
         /// this constructor in uses cases where you want anything other than an empty configuration.
         /// </summary>
-        public HandlerConfiguration() {}
+        public HandlerConfiguration() : this(new SubscriberRegistry(), new SimpleHandlerFactorySync(_ => throw new ConfigurationException("No Handlers have been configured.")))
+        { }
     }
 }

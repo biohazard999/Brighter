@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -22,31 +22,29 @@ THE SOFTWARE. */
 
 #endregion
 
+using System.Collections.Generic;
+
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyCommandHandler : RequestHandler<MyCommand>
+    public sealed class MyCommandHandler(IDictionary<string, string> receivedMessages) : RequestHandler<MyCommand>
     {
-        private static MyCommand s_command;
+        private MyCommand? _command = null;
 
-        public MyCommandHandler()
+        public override MyCommand Handle(MyCommand myCommand)
         {
-            s_command = null;
+            LogCommand(myCommand);
+            return base.Handle(myCommand);
         }
 
-        public override MyCommand Handle(MyCommand command)
+        public  bool ShouldReceive(MyCommand expectedCommand)
         {
-            LogCommand(command);
-            return base.Handle(command);
-        }
-
-        public static bool ShouldReceive(MyCommand expectedCommand)
-        {
-            return (s_command != null) && (expectedCommand.Id == s_command.Id);
+            return (_command != null) && (expectedCommand.Id == _command.Id);
         }
 
         private void LogCommand(MyCommand request)
         {
-            s_command = request;
+            _command = request;
+            receivedMessages.Add(nameof(MyCommandHandler), request.Id);
         }
     }
 }

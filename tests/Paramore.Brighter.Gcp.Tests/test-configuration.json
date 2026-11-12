@@ -1,0 +1,74 @@
+{
+  "Namespace": "Paramore.Brighter.Gcp.Tests",
+  "MessagingGateways": {
+    "Pull": {
+      "Publication": "Paramore.Brighter.MessagingGateway.GcpPubSub.GcpPublication",
+      "Subscription": "Paramore.Brighter.MessagingGateway.GcpPubSub.GcpPubSubSubscription",
+      "MessageGatewayProvider": "Paramore.Brighter.Gcp.Tests.MessagingGateway.GcpPullMessageGatewayProvider",
+      "Category": "GcpPubSubPull",
+      "CollectionName": "Pull",
+      "LedgerKey": "GCP / Pull",
+      "HasSupportToPublishConfirmation": false,
+      "HasSupportToValidateBrokerExistence": true,
+      "ReceiveMessageTimeoutInMilliseconds": 5000
+    },
+    "PullOrdering": {
+      "Publication": "Paramore.Brighter.MessagingGateway.GcpPubSub.GcpPublication",
+      "Subscription": "Paramore.Brighter.MessagingGateway.GcpPubSub.GcpPubSubSubscription",
+      "MessageGatewayProvider": "Paramore.Brighter.Gcp.Tests.MessagingGateway.GcpPullOrderingMessageGatewayProvider",
+      "MessageBuilder": "FifoMessageBuilder",
+      "Category": "GcpPubSubPullOrdering",
+      "CollectionName": "PullOrdering",
+      "LedgerKey": "GCP / PullOrdering",
+      "HasSupportToPublishConfirmation": false,
+      "HasSupportToValidateBrokerExistence": true,
+      "ReceiveMessageTimeoutInMilliseconds": 15000
+    },
+    "Stream": {
+      "Publication": "Paramore.Brighter.MessagingGateway.GcpPubSub.GcpPublication",
+      "Subscription": "Paramore.Brighter.MessagingGateway.GcpPubSub.GcpPubSubSubscription",
+      "MessageGatewayProvider": "Paramore.Brighter.Gcp.Tests.MessagingGateway.GcpStreamMessageGatewayProvider",
+      "Category": "GcpPubSubStream",
+      "CollectionName": "Stream",
+      "LedgerKey": "GCP / Stream",
+      "HasSupportToPublishConfirmation": false,
+      "HasSupportToValidateBrokerExistence": true,
+      "ReceiveMessageTimeoutInMilliseconds": 5000
+    },
+    "StreamOrdering": {
+      "Publication": "Paramore.Brighter.MessagingGateway.GcpPubSub.GcpPublication",
+      "Subscription": "Paramore.Brighter.MessagingGateway.GcpPubSub.GcpPubSubSubscription",
+      "MessageGatewayProvider": "Paramore.Brighter.Gcp.Tests.MessagingGateway.GcpStreamOrderingMessageGatewayProvider",
+      "MessageBuilder": "FifoMessageBuilder",
+      "Category": "GcpPubSubStreamOrdering",
+      "CollectionName": "StreamOrdering",
+      "LedgerKey": "GCP / StreamOrdering",
+      "HasSupportToPublishConfirmation": false,
+      "HasSupportToValidateBrokerExistence": true,
+      "ReceiveMessageTimeoutInMilliseconds": 15000
+    }
+  },
+  "Outboxes": {
+    "Firestore": {
+      "Transaction": "Paramore.Brighter.Firestore.FirestoreTransaction",
+      "OutboxProvider": "FirestoreOutboxProvider",
+      "Category": "Firestore",
+      "CollectionName": "FirestoreOutbox"
+    },
+    "SpannerBinary": {
+      "Transaction": "System.Data.Common.DbTransaction",
+      "OutboxProvider": "SpannerBinaryOutboxProvider",
+      "Category": "Spanner",
+      "CollectionName": "Spanner"
+    },
+    "SpannerText": {
+      "Transaction": "System.Data.Common.DbTransaction",
+      "OutboxProvider": "SpannerTextOutboxProvider",
+      "Category": "Spanner",
+      "CollectionName": "Spanner"
+    }
+  },
+  "GatewayConformance": {
+    "SubscriptionType": "Paramore.Brighter.MessagingGateway.GcpPubSub.GcpPubSubSubscription"
+  }
+}

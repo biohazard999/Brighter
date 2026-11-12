@@ -26,7 +26,7 @@ using System;
 
 namespace Paramore.Brighter.MessagingGateway.Redis
 {
-    public class RedisMessagingGatewayConfiguration
+    public class RedisMessagingGatewayConfiguration : IAmGatewayConfiguration
     {
         /// <summary>
         /// The default RedisClient Socket ConnectTimeout (default -1, None)
@@ -44,7 +44,7 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         public int? DefaultReceiveTimeout { get; set; }
 
         /// <summary>
-        /// Default Idle TimeOut before a connection is considered to be stale (default 240 secs)
+        /// Default Idle TimeOut before a subscription is considered to be stale (default 240 secs)
         /// </summary>
         public int? DefaultIdleTimeOutSecs { get; set; }
 
@@ -74,7 +74,7 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         public static int? AssumeServerVersion { get; set; }
 
         /// <summary>
-        /// How long to hold deactivated clients for before disposing their connection (default 1 min)
+        /// How long to hold deactivated clients for before disposing their subscription (default 1 min)
         /// Dispose of deactivated Clients immediately with TimeSpan.Zero
         /// </summary>
         public TimeSpan? DeactivatedClientsExpiry { get; set; }
@@ -85,13 +85,13 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         public bool? DisableVerboseLogging { get; set; }
         
         /// <summary>
-        /// Exponential backoff interval for retrying connections on socker failure, default 10ms
+        /// Exponential backoff interval for retrying connections on socket failure, default 10ms
         /// </summary>
         /// <returns></returns>
         public int? BackoffMultiplier { get; set; }
         
         /// <summary>
-        /// How big can the pool get (default None)?
+        /// How big can the pool get (default None)? Per-gateway cap, not process-wide.
         /// </summary>
         public int? MaxPoolSize { get; set; }
         
@@ -104,6 +104,6 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         /// <summary>
         /// How do we connect to Redis
         /// </summary>
-        public string RedisConnectionString { get; set; }
+        public string? RedisConnectionString { get; set; }
     }
 }

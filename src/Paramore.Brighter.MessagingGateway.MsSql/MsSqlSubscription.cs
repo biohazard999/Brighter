@@ -1,0 +1,189 @@
+﻿#region Licence
+/* The MIT License (MIT)
+Copyright © 2020 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+
+#endregion
+
+using System;
+
+namespace Paramore.Brighter.MessagingGateway.MsSql
+{
+    /// <summary>
+    /// Configures a competing consumer of an MS SQL queue.
+    /// </summary>
+    /// <remarks>
+    /// For a plain <see cref="Publication"/> the channel name must match the producer's topic. With
+    /// <see cref="MsSqlPublication"/> it must name one of the configured subscriber queues. Receivers using the same queue table
+    /// and channel compete for messages: each queued message is removed by one receiver.
+    /// Different subscription names do not create separate copies of messages.
+    /// Use <see cref="MsSqlPublication"/> with <see cref="IsIndependentSubscriber"/> enabled to opt in to explicit subscriber fan-out.
+    /// </remarks>
+    public class MsSqlSubscription : Subscription, IUseBrighterDeadLetterSupport, IUseBrighterInvalidMessageSupport
+    {
+        /// <summary>
+        /// Gets or sets whether the channel is an independent subscriber queue of an <see cref="MsSqlPublication"/>.
+        /// </summary>
+        /// <value>Defaults to false for legacy topic queues, including SQL-equivalent spellings of the topic.</value>
+        /// <remarks>
+        /// Enable this for fan-out subscribers so delayed retries target only the receiving queue.
+        /// A positive subscription requeue delay requires a queue-targeted scheduler.
+        /// </remarks>
+        public bool IsIndependentSubscriber { get; set; }
+
+        /// <inheritdoc />
+        public override Type ChannelFactoryType => typeof(ChannelFactory);
+
+        /// <summary>
+        /// The routing key for the dead letter channel. When set, rejected messages with
+        /// <see cref="RejectionReason.DeliveryError"/> will be forwarded to this channel.
+        /// </summary>
+        public RoutingKey? DeadLetterRoutingKey { get; set; }
+
+        /// <summary>
+        /// The routing key for the invalid message channel. When set, rejected messages with
+        /// <see cref="RejectionReason.Unacceptable"/> will be forwarded to this channel.
+        /// </summary>
+        public RoutingKey? InvalidMessageRoutingKey { get; set; }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Subscription"/> class.
+        /// </summary>
+        /// <param name="subscriptionName">The name identifying this subscription in the dispatcher; it does not create an independent queue.</param>
+        /// <param name="channelName">The physical queue to read: a subscriber channel from <see cref="MsSqlPublication"/>, or the topic for a plain <see cref="Publication"/>.</param>
+        /// <param name="routingKey">The routing key. Defaults to the data type's full name.</param>
+        /// <param name="requestType">Type of the data.</param>
+        /// <param name="getRequestType">The <see cref="Func{Message, Type}"/> that determines how we map a message to a type. Defaults to returning the <paramref name="requestType"/> if null</param>
+        /// <param name="bufferSize">The number of messages to buffer at any one time, also the number of messages to retrieve at once. Min of 1 Max of 10</param>
+        /// <param name="noOfPerformers">The no of threads reading this channel.</param>
+        /// <param name="timeOut">The timeout in milliseconds.</param>
+        /// <param name="requeueCount">The number of times you want to requeue a message before dropping it.</param>
+        /// <param name="requeueDelay">The delay the delivery of a requeue message. 0 is no delay. Defaults to 0</param>
+        /// <param name="unacceptableMessageLimit">The number of unacceptable messages to handle, before stopping reading from the channel.</param>
+        /// <param name="unacceptableMessageLimitWindow">The time window over which to enforce the unacceptable message limit. Defaults to null, so the count does not reset.</param>
+        /// <param name="messagePumpType">Is this channel read asynchronously</param>
+        /// <param name="channelFactory">The channel factory to create channels for Consumer.</param>
+        /// <param name="makeChannels">Should we make channels if they don't exist, defaults to creating</param>
+        /// <param name="emptyChannelDelay">How long to pause when a channel is empty in milliseconds</param>
+        /// <param name="channelFailureDelay">How long to pause when there is a channel failure in milliseconds</param>
+        /// <param name="deadLetterRoutingKey">The routing key for the dead letter channel</param>
+        /// <param name="invalidMessageRoutingKey">The routing key for the invalid message channel</param>
+        public MsSqlSubscription(SubscriptionName subscriptionName,
+            ChannelName channelName,
+            RoutingKey routingKey,
+            Type? requestType = null,
+            Func<Message, Type>? getRequestType = null,
+            int bufferSize = 1,
+            int noOfPerformers = 1,
+            TimeSpan? timeOut = null,
+            int requeueCount = -1,
+            TimeSpan? requeueDelay = null,
+            int unacceptableMessageLimit = 0,
+            TimeSpan? unacceptableMessageLimitWindow = null,
+            MessagePumpType messagePumpType = MessagePumpType.Proactor,
+            IAmAChannelFactory? channelFactory = null,
+            OnMissingChannel makeChannels = OnMissingChannel.Create,
+            TimeSpan? emptyChannelDelay = null,
+            TimeSpan? channelFailureDelay = null,
+            RoutingKey? deadLetterRoutingKey = null,
+            RoutingKey? invalidMessageRoutingKey = null)
+            : base(subscriptionName, channelName, routingKey, requestType, getRequestType, bufferSize,
+                noOfPerformers, timeOut, requeueCount, requeueDelay, unacceptableMessageLimit,
+                messagePumpType, channelFactory, makeChannels, emptyChannelDelay, channelFailureDelay, unacceptableMessageLimitWindow)
+        {
+            DeadLetterRoutingKey = deadLetterRoutingKey;
+            InvalidMessageRoutingKey = invalidMessageRoutingKey;
+        }
+    }
+
+    /// <summary>
+    /// Configures a competing MS SQL consumer for requests of type <typeparamref name="T"/>.
+    /// </summary>
+    /// <typeparam name="T">The request type handled by the subscription.</typeparam>
+    /// <remarks>
+    /// Receivers sharing a queue table and channel compete for messages, even when their
+    /// subscription names differ. For fan-out, choose a channel configured on <see cref="MsSqlPublication"/>.
+    /// </remarks>
+    public class MsSqlSubscription<T> : MsSqlSubscription where T : IRequest
+    {
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Subscription"/> class.
+        /// </summary>
+        /// <param name="subscriptionName">The dispatcher subscription name. Defaults to the data type's full name; it does not create an independent queue.</param>
+        /// <param name="channelName">The physical queue to read. Defaults to the data type's full name. For fan-out, use a subscriber channel configured on <see cref="MsSqlPublication"/>.</param>
+        /// <param name="routingKey">The routing key. Defaults to the data type's full name.</param>
+        /// <param name="getRequestType">The <see cref="Func{Message, Type}"/> that determines how we map a message to a type. Defaults to returning the <typeparamref name="T"/> if null</param>
+        /// <param name="bufferSize">The number of messages to buffer at any one time, also the number of messages to retrieve at once. Min of 1 Max of 10</param>
+        /// <param name="noOfPerformers">The no of threads reading this channel.</param>
+        /// <param name="timeOut">The timeout to wait for messages</param>
+        /// <param name="requeueCount">The number of times you want to requeue a message before dropping it.</param>
+        /// <param name="requeueDelay">The Delay to the requeue of a message. 0 is no delay. Defaults to 0</param>
+        /// <param name="unacceptableMessageLimit">The number of unacceptable messages to handle, before stopping reading from the channel.</param>
+        /// <param name="unacceptableMessageLimitWindow">The time window over which to enforce the unacceptable message limit. Defaults to null, so the count does not reset.</param>
+        /// <param name="messagePumpType">Is this channel read asynchronously</param>
+        /// <param name="channelFactory">The channel factory to create channels for Consumer.</param>
+        /// <param name="makeChannels">Should we make channels if they don't exist, defaults to creating</param>
+        /// <param name="emptyChannelDelay">How long to pause when a channel is empty in milliseconds</param>
+        /// <param name="channelFailureDelay">How long to pause when there is a channel failure in milliseconds</param>
+        /// <param name="deadLetterRoutingKey">The routing key for the dead letter channel</param>
+        /// <param name="invalidMessageRoutingKey">The routing key for the invalid message channel</param>
+        public MsSqlSubscription(SubscriptionName? subscriptionName = null,
+            ChannelName? channelName = null,
+            RoutingKey? routingKey = null,
+            Func<Message, Type>? getRequestType = null,
+            int bufferSize = 1,
+            int noOfPerformers = 1,
+            TimeSpan? timeOut = null,
+            int requeueCount = -1,
+            TimeSpan? requeueDelay = null,
+            int unacceptableMessageLimit = 0,
+            TimeSpan? unacceptableMessageLimitWindow = null,
+            MessagePumpType messagePumpType = MessagePumpType.Proactor,
+            IAmAChannelFactory? channelFactory = null,
+            OnMissingChannel makeChannels = OnMissingChannel.Create,
+            TimeSpan? emptyChannelDelay = null,
+            TimeSpan? channelFailureDelay = null,
+            RoutingKey? deadLetterRoutingKey = null,
+            RoutingKey? invalidMessageRoutingKey = null)
+            : base(
+                subscriptionName ?? new SubscriptionName(typeof(T).FullName!),
+                channelName ?? new ChannelName(typeof(T).FullName!),
+                routingKey ?? new RoutingKey(typeof(T).FullName!),
+                typeof(T),
+                getRequestType,
+                bufferSize,
+                noOfPerformers,
+                timeOut,
+                requeueCount,
+                requeueDelay,
+                unacceptableMessageLimit,
+                unacceptableMessageLimitWindow,
+                messagePumpType,
+                channelFactory,
+                makeChannels,
+                emptyChannelDelay,
+                channelFailureDelay,
+                deadLetterRoutingKey,
+                invalidMessageRoutingKey)
+        {
+        }
+
+    }
+}

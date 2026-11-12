@@ -1,7 +1,32 @@
-﻿using System;
+﻿#region Licence
+/* The MIT License (MIT)
+Copyright © 2024 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the “Software”), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+
+#endregion
+
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -15,24 +40,30 @@ namespace Paramore.Brighter
         /// <summary>
         /// When was this item written to the box
         /// </summary>
-        DateTime WriteTime { get; }
+        DateTimeOffset WriteTime { get; }
     }
      
     /// <summary>
     /// Base class for in-memory inboxes, handles TTL on entries and cache clearing requirements
     /// </summary>
     /// <typeparam name="T">An entry in the box, needs to a writetime so we know if we can clear it from the box</typeparam>
-    public class InMemoryBox<T> where T: IHaveABoxWriteTime
+    public abstract class InMemoryBox<T>(TimeProvider timeProvider) where T: IHaveABoxWriteTime
     {
-        protected readonly ConcurrentDictionary<string, T> _requests = new ConcurrentDictionary<string, T>();
-        private DateTime _lastScanAt = DateTime.UtcNow;
-        private readonly object _cleanupRunningLockObject = new object();
+        protected readonly ConcurrentDictionary<string, T> Requests = new ConcurrentDictionary<string, T>();
+        private DateTimeOffset _lastScanAt = timeProvider.GetUtcNow();
+        private DateTimeOffset _lastCompactionAttemptAt = DateTimeOffset.MinValue;
+        private readonly object _cleanupStateLock = new object();
+        private DateTimeOffset? _expiryRequestedAt;
+        private int? _compactionRequested;
+        private bool _cleanupWorkerRunning;
+        private int _entryLimit = 2048;
 
         /// <summary>
-        /// How long does an entry last in the Outbox before we delete it (defaults to 5 min)
-        /// Think about your typical data volumes over a window of time, they all use memory to store
-        /// But contrast with how long you want to be able to resend due to broker failure for.
-        /// Memory is not reclaimed until an expiration scan
+        /// How long an entry lives before it becomes eligible for expiry removal (defaults to 5 min).
+        /// The reference time depends on the subclass: the outbox measures from dispatch time
+        /// (<see cref="OutboxEntry.TimeFlushed"/>), while the inbox measures from write time.
+        /// Think about your typical data volumes over a window of time, they all use memory to store.
+        /// Memory is not reclaimed until an expiration scan.
         /// </summary>
         public TimeSpan EntryTimeToLive { get; set; } = TimeSpan.FromMinutes(5);
 
@@ -47,96 +78,164 @@ namespace Paramore.Brighter
         /// <summary>
         /// For diagnostics 
         /// </summary>
-        public int EntryCount => _requests.Count;
+        public int EntryCount => Requests.Count;
      
         /// <summary>
-        /// How many messages should we retain, before we compact the Outbox
+        /// How many messages should we retain, before we compact the Outbox.
+        /// Use -1 to disable compaction. Must be -1 or a positive integer.
         /// </summary>
-        public int EntryLimit { get; set; } = 2048;
+        public int EntryLimit
+        {
+            get => _entryLimit;
+            set
+            {
+                if (value == 0 || value < -1)
+                    throw new ArgumentOutOfRangeException(nameof(EntryLimit), value,
+                        "EntryLimit must be -1 (disabled) or a positive integer.");
+                _entryLimit = value;
+            }
+        }
 
         /// <summary>
-        /// At what percentage of our size limit should we return, once we hit that limit
+        /// Target size as a fraction of <see cref="EntryLimit"/> after compaction.
+        /// For example 0.5 means compact down to 50% of the limit. Defaults to 0.5.
+        /// A value of 0 removes all eligible entries on each compaction.
         /// </summary>
-        public double CompactionPercentage{ get; set; }
+        public double CompactionPercentage{ get; set; } = 0.5;
 
-        protected void ClearExpiredMessages()
+        public void ClearExpiredMessages()
         {
-            var now = DateTime.Now;
+            var now = timeProvider.GetUtcNow();
 
-            if (Monitor.TryEnter(_cleanupRunningLockObject))
-            {
+            TimeSpan elapsedSinceLastScan = now - _lastScanAt;
+            if (elapsedSinceLastScan < ExpirationScanInterval)
+                return;
 
-                if (now - _lastScanAt < ExpirationScanInterval)
-                    return;
-
-                //This is expensive, so use a background thread
-                Task.Factory.StartNew(
-                    action: state => RemoveExpiredMessages((DateTime)state),
-                    state: now,
-                    cancellationToken: CancellationToken.None,
-                    creationOptions: TaskCreationOptions.DenyChildAttach,
-                    scheduler: TaskScheduler.Default);
-
-            }
-        }
-
-        private void RemoveExpiredMessages(DateTime now)
-        {
-            var expiredEntries = 
-                _requests
-                .Where<KeyValuePair<string, T>>(entry => (now - entry.Value.WriteTime) >= EntryTimeToLive)
-                    .Select(entry => entry.Key);
-           
-            foreach (var key in expiredEntries)
-            {
-                //if this fails ignore, killed by something else like compaction
-                _requests.TryRemove(key, out _);
-            }
-            
             _lastScanAt = now;
-            Monitor.Exit(_cleanupRunningLockObject);
+
+            //This is expensive, so hand it to the background cleanup worker
+            lock (_cleanupStateLock)
+            {
+                _expiryRequestedAt = now;
+            }
+
+            EnsureCleanupWorker();
         }
+
+        protected abstract void RemoveExpiredMessages(DateTimeOffset now);
 
         protected void EnforceCapacityLimit()
         {
-            if (Monitor.TryEnter(_cleanupRunningLockObject))
-            {
+                if (EntryLimit == -1)
+                    return;
+
+                var now = timeProvider.GetUtcNow();
+                if ((now - _lastCompactionAttemptAt) < ExpirationScanInterval)
+                    return;
+
                 //Take a copy as it may change whilst we are doing the calculation, we ignore that
                 var count = EntryCount;
                 var upperSize = EntryLimit;
 
                 if (count >= upperSize)
                 {
-                    int newSize = (int)(count * CompactionPercentage);
-                    int entriesToRemove = upperSize - newSize;
+                    int newSize = (int)(upperSize * CompactionPercentage);
+                    int entriesToRemove = count - newSize;
 
-                    Task.Factory.StartNew(
-                        action: state => Compact((int)state),
-                        state: entriesToRemove,
-                        CancellationToken.None,
-                        TaskCreationOptions.DenyChildAttach,
-                        TaskScheduler.Default);
+                    _lastCompactionAttemptAt = now;
+
+                    lock (_cleanupStateLock)
+                    {
+                        _compactionRequested = entriesToRemove;
+                    }
+
+                    EnsureCleanupWorker();
                 }
+        }
+
+        protected abstract void Compact(int entriesToRemove);
+
+        // Cleanup requests are coalesced onto a single background worker: a request made while the worker
+        // is running is picked up by its next pass, so no request is lost (the scan interval and compaction
+        // cooldown would stop it being retried) and no more than one pool thread is ever used for cleanup.
+        // The worker runs on the default scheduler, so never on a caller's SynchronizationContext.
+        private void EnsureCleanupWorker()
+        {
+            lock (_cleanupStateLock)
+            {
+                if (_cleanupWorkerRunning)
+                    return;
+
+                _cleanupWorkerRunning = true;
+            }
+
+            Task.Factory.StartNew(
+                action: RunCleanupWorker,
+                cancellationToken: CancellationToken.None,
+                creationOptions: TaskCreationOptions.DenyChildAttach,
+                scheduler: TaskScheduler.Default);
+        }
+
+        // A failed operation must not skip the others taken in the same pass, nor end the worker early:
+        // the worker only ever stops in TryTakeCleanupRequests, so no request can be stranded. The first
+        // failure is rethrown once the worker has stopped, surfacing as an unobserved task exception.
+        private void RunCleanupWorker()
+        {
+            ExceptionDispatchInfo? firstFailure = null;
+
+            while (TryTakeCleanupRequests(out var expiryRequestedAt, out var compactionRequested))
+            {
+                if (expiryRequestedAt.HasValue)
+                    TryRunCleanup(() => RemoveExpiredMessages(expiryRequestedAt.Value), ref firstFailure);
+
+                if (compactionRequested.HasValue)
+                    TryRunCleanup(() => CompactIfStillOverLimit(compactionRequested.Value), ref firstFailure);
+            }
+
+            firstFailure?.Throw();
+        }
+
+        private static void TryRunCleanup(Action cleanup, ref ExceptionDispatchInfo? firstFailure)
+        {
+            try
+            {
+                cleanup();
+            }
+            catch (Exception exception)
+            {
+                firstFailure ??= ExceptionDispatchInfo.Capture(exception);
             }
         }
-        
-        // Compaction algorithm is to sort into date deposited order, with oldest first
-        // Then remove entries until newsize is reached
-        private void Compact(int entriesToRemove)
-        {
-            var removalList = 
-                _requests
-                    .OrderBy(entry => entry.Value.WriteTime)
-                    .Take(entriesToRemove)
-                    .Select(entry => entry.Key);
 
-            foreach (var key in removalList)
+        private bool TryTakeCleanupRequests(out DateTimeOffset? expiryRequestedAt, out int? compactionRequested)
+        {
+            lock (_cleanupStateLock)
             {
-                //ignore errors, likely just something else has cleared it such as TTL eviction
-                _requests.TryRemove(key, out _);
+                expiryRequestedAt = _expiryRequestedAt;
+                compactionRequested = _compactionRequested;
+                _expiryRequestedAt = null;
+                _compactionRequested = null;
+
+                //deciding to stop under the same lock as a request is made means no request can be missed
+                if (!expiryRequestedAt.HasValue && !compactionRequested.HasValue)
+                    _cleanupWorkerRunning = false;
+
+                return _cleanupWorkerRunning;
             }
-            
-            Monitor.Exit(_cleanupRunningLockObject);
+        }
+
+        // The request was sized when it was made; by the time it runs an expiry pass may already have
+        // brought the box back under its limit, so re-check, and never compact below the target size
+        private void CompactIfStillOverLimit(int entriesRequested)
+        {
+            var count = EntryCount;
+            var upperSize = EntryLimit;
+
+            if (upperSize == -1 || count < upperSize)
+                return;
+
+            int newSize = (int)(upperSize * CompactionPercentage);
+            Compact(Math.Min(entriesRequested, count - newSize));
         }
     }
 }

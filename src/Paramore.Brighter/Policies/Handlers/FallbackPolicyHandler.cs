@@ -34,7 +34,7 @@ namespace Paramore.Brighter.Policies.Handlers
         /// </summary>
         public const string CAUSE_OF_FALLBACK_EXCEPTION = "Fallback_Exception_Cause";
 
-        private Func<TRequest, TRequest> _exceptionHandlerFunc;
+        private Func<TRequest, TRequest>? _exceptionHandlerFunc;
 
         #region Overrides of RequestHandler<TRequest>
 
@@ -42,16 +42,16 @@ namespace Paramore.Brighter.Policies.Handlers
         /// Initializes from attribute parameters.
         /// </summary>
         /// <param name="initializerList">The initializer list.</param>
-        public override void InitializeFromAttributeParams(params object[] initializerList)
+        public override void InitializeFromAttributeParams(params object?[] initializerList)
         {
             bool catchAll = Convert.ToBoolean(initializerList[0]);
             bool catchBrokenCircuit = Convert.ToBoolean(initializerList[1]);
 
-            if (catchBrokenCircuit == true)
+            if (catchBrokenCircuit)
             {
                 _exceptionHandlerFunc = CatchBrokenCircuit;
             }
-            else if (catchAll == true)
+            else if (catchAll)
             {
                 _exceptionHandlerFunc = CatchAll;
             }
@@ -69,11 +69,13 @@ namespace Paramore.Brighter.Policies.Handlers
         /// The original exception is stored in the <see cref="IHandleRequests{TRequest}.Context"/> under the key <see cref="FallbackPolicyHandler{TRequest}.CAUSE_OF_FALLBACK_EXCEPTION"/> for probing
         /// by handlers in the pipeline called on fallback
         /// </summary>
-        /// <param name="command">The command.</param>
+        /// <param name="request">The command.</param>
         /// <returns>TRequest.</returns>
-        public override TRequest Handle(TRequest command)
+        public override TRequest Handle(TRequest request)
         {
-            return _exceptionHandlerFunc(command);
+            if (_exceptionHandlerFunc is null)
+                throw new ArgumentException("ExceptionHandler must be set before handling.");
+            return _exceptionHandlerFunc(request);
         }
 
         private TRequest CatchAll(TRequest command)
@@ -84,7 +86,7 @@ namespace Paramore.Brighter.Policies.Handlers
             }
             catch (Exception exception)
             {
-                Context.Bag.Add(CAUSE_OF_FALLBACK_EXCEPTION, exception);
+                Context?.Bag.AddOrUpdate(CAUSE_OF_FALLBACK_EXCEPTION, exception, (_, _) => exception);
                 return base.Fallback(command);
             }
         }
@@ -95,14 +97,14 @@ namespace Paramore.Brighter.Policies.Handlers
             {
                 return base.Handle(command);
             }
-            catch (BrokenCircuitException brokenCircuitExceptionexception)
+            catch (BrokenCircuitException brokenCircuitException)
             {
-                Context.Bag.Add(CAUSE_OF_FALLBACK_EXCEPTION, brokenCircuitExceptionexception);
+                Context?.Bag.AddOrUpdate(CAUSE_OF_FALLBACK_EXCEPTION, brokenCircuitException, (_, _) => brokenCircuitException);
                 return base.Fallback(command);
             }
         }
 
-        private TRequest CatchNone(TRequest command)
+        private static TRequest CatchNone(TRequest command)
         {
             return command;
         }

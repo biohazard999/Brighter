@@ -1,30 +1,97 @@
 ﻿using System;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
+using Paramore.Brighter.MsSql;
 
 namespace Paramore.Brighter.MessagingGateway.MsSql
 {
-    public class MsSqlMessageConsumerFactory : IAmAMessageConsumerFactory
+    public partial class MsSqlMessageConsumerFactory : IAmAMessageConsumerFactory
     {
-        private static readonly Lazy<ILog> Logger = new Lazy<ILog>(LogProvider.For<MsSqlMessageConsumerFactory>);
-        private readonly MsSqlMessagingGatewayConfiguration _msSqlMessagingGatewayConfiguration;
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MsSqlMessageConsumerFactory>();
+        private readonly RelationalDatabaseConfiguration _msSqlConfiguration;
+        private IAmAMessageScheduler? _scheduler;
 
-        public MsSqlMessageConsumerFactory(MsSqlMessagingGatewayConfiguration msSqlMessagingGatewayConfiguration)
+        /// <summary>
+        /// Gets the configuration for the MsSql database, so that a channel factory built on this
+        /// one can provision the queue store the consumers will read from. Deliberately internal:
+        /// the only caller is <see cref="ChannelFactory"/> in this assembly, and this object carries
+        /// the connection string, so there is no reason to widen a shipped package's public surface
+        /// or to offer a second public route to it.
+        /// </summary>
+        internal RelationalDatabaseConfiguration Configuration => _msSqlConfiguration;
+
+        /// <summary>
+        /// Gets or sets the message scheduler for delayed requeue support.
+        /// Can be set after construction to allow channel factories to forward the scheduler from DI.
+        /// </summary>
+        public IAmAMessageScheduler? Scheduler
         {
-            _msSqlMessagingGatewayConfiguration = msSqlMessagingGatewayConfiguration ??
-                                                  throw new ArgumentNullException(
-                                                      nameof(msSqlMessagingGatewayConfiguration));
+            get => _scheduler;
+            set => _scheduler = value;
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="MsSqlMessageConsumerFactory"/> class.
+        /// </summary>
+        /// <param name="msSqlConfiguration">The configuration for connecting to the MsSql database</param>
+        /// <param name="scheduler">The optional message scheduler for delayed requeue support</param>
+        public MsSqlMessageConsumerFactory(RelationalDatabaseConfiguration msSqlConfiguration, IAmAMessageScheduler? scheduler = null)
+        {
+            _msSqlConfiguration = msSqlConfiguration ?? throw new ArgumentNullException(nameof(msSqlConfiguration));
+            _scheduler = scheduler;
         }
 
         /// <summary>
         /// Creates a consumer for the specified queue.
         /// </summary>
-        /// <param name="connection">The queue to connect to</param>
-        /// <returns>IAmAMessageConsumer</returns>
-         public IAmAMessageConsumer Create(Connection connection)
+        /// <param name="subscription">The queue to connect to</param>
+        /// <returns>IAmAMessageConsumerSync</returns>
+         public IAmAMessageConsumerSync Create(Subscription subscription)
         {
-            if (connection.ChannelName == null) throw new ArgumentNullException(nameof(connection.ChannelName));
-            Logger.Value.Debug($"MsSqlMessageConsumerFactory: create consumer for topic {connection.ChannelName}");
-            return new MsSqlMessageConsumer(_msSqlMessagingGatewayConfiguration, connection.ChannelName);
+            ValidateSubscription(subscription, false);
+
+            var deadLetterRoutingKey = (subscription as IUseBrighterDeadLetterSupport)?.DeadLetterRoutingKey;
+            var invalidMessageRoutingKey = (subscription as IUseBrighterInvalidMessageSupport)?.InvalidMessageRoutingKey;
+
+            Log.MsSqlMessageConsumerFactoryCreate(s_logger, subscription.ChannelName);
+            return new MsSqlMessageConsumer(_msSqlConfiguration, subscription.ChannelName!,
+                (subscription as MsSqlSubscription)?.IsIndependentSubscriber ?? false,
+                scheduler: _scheduler, deadLetterRoutingKey: deadLetterRoutingKey, invalidMessageRoutingKey: invalidMessageRoutingKey);
+        }
+
+        public IAmAMessageConsumerAsync CreateAsync(Subscription subscription)
+        {
+            ValidateSubscription(subscription, true);
+
+            var deadLetterRoutingKey = (subscription as IUseBrighterDeadLetterSupport)?.DeadLetterRoutingKey;
+            var invalidMessageRoutingKey = (subscription as IUseBrighterInvalidMessageSupport)?.InvalidMessageRoutingKey;
+
+            Log.MsSqlMessageConsumerFactoryCreateAsync(s_logger, subscription.ChannelName);
+            return new MsSqlMessageConsumer(_msSqlConfiguration, subscription.ChannelName!,
+                (subscription as MsSqlSubscription)?.IsIndependentSubscriber ?? false,
+                scheduler: _scheduler, deadLetterRoutingKey: deadLetterRoutingKey, invalidMessageRoutingKey: invalidMessageRoutingKey);
+        }
+
+        internal void ValidateSubscription(Subscription subscription, bool async)
+        {
+            if (subscription.ChannelName is null)
+                throw new ConfigurationException(nameof(subscription.ChannelName));
+            if (subscription.RequeueDelay <= TimeSpan.Zero || subscription is not MsSqlSubscription { IsIndependentSubscriber: true })
+                return;
+
+            if (async ? _scheduler is not IAmAMessageRequeueSchedulerAsync : _scheduler is not IAmAMessageRequeueSchedulerSync)
+                throw new ConfigurationException("Delayed MS SQL subscriber retries require a queue-targeted scheduler implementing " +
+                    (async ? nameof(IAmAMessageRequeueSchedulerAsync) : nameof(IAmAMessageRequeueSchedulerSync)) + ".");
+        }
+
+        private static partial class Log
+        {
+            [LoggerMessage(LogLevel.Debug, "MsSqlMessageConsumerFactory: create consumer for topic {ChannelName}")]
+            public static partial void MsSqlMessageConsumerFactoryCreate(ILogger logger, string? channelName);
+
+            [LoggerMessage(LogLevel.Debug, "MsSqlMessageConsumerFactory: create consumer for topic {ChannelName}")]
+            public static partial void MsSqlMessageConsumerFactoryCreateAsync(ILogger logger, string? channelName);
         }
     }
 }
+

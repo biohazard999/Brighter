@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -23,37 +23,120 @@ THE SOFTWARE. */
 #endregion
 
 using System;
+using Paramore.Brighter.Observability;
 
 namespace Paramore.Brighter.ServiceActivator
 {
-    internal class ConsumerFactory<TRequest> : IConsumerFactory where TRequest : class, IRequest
+    internal sealed class ConsumerFactory : IConsumerFactory
     {
         private readonly IAmACommandProcessor _commandProcessor;
-        private readonly IAmAMessageMapperRegistry _messageMapperRegistry;
-        private readonly Connection _connection;
+        private readonly IAmAMessageMapperRegistry? _messageMapperRegistry;
+        private readonly Subscription _subscription;
+        private readonly IAmAMessageTransformerFactory? _messageTransformerFactory;
+        private readonly IAmARequestContextFactory _requestContextFactory;
+        private readonly IAmABrighterTracer? _tracer;
+        private readonly InstrumentationOptions _instrumentationOptions;
         private readonly ConsumerName _consumerName;
+        private readonly IAmAMessageMapperRegistryAsync? _messageMapperRegistryAsync;
+        private readonly IAmAMessageTransformerFactoryAsync? _messageTransformerFactoryAsync;
+        private readonly Func<Message, Type> _mapRequestType;
 
-        public ConsumerFactory(IAmACommandProcessor commandProcessor, IAmAMessageMapperRegistry messageMapperRegistry, Connection connection)
+        public ConsumerFactory(
+            IAmACommandProcessor commandProcessor,
+            Subscription subscription,
+            IAmAMessageMapperRegistry messageMapperRegistry,
+            IAmAMessageTransformerFactory? messageTransformerFactory,
+            IAmARequestContextFactory requestContextFactory,
+            IAmABrighterTracer? tracer,
+            InstrumentationOptions instrumentationOptions = InstrumentationOptions.All)
         {
             _commandProcessor = commandProcessor;
             _messageMapperRegistry = messageMapperRegistry;
-            _connection = connection;
-            _consumerName = new ConsumerName($"{_connection.Name}-{Guid.NewGuid()}");
+            _subscription = subscription;
+            _mapRequestType = subscription.MapRequestType!;
+            _messageTransformerFactory = messageTransformerFactory ?? new EmptyMessageTransformerFactory();
+            _requestContextFactory = requestContextFactory;
+            _tracer = tracer;
+            _instrumentationOptions = instrumentationOptions;
+            _consumerName = new ConsumerName($"{_subscription.Name}-{Uuid.NewAsString()}");
+        }
+        
+        public ConsumerFactory(
+            IAmACommandProcessor commandProcessor,
+            Subscription subscription,
+            IAmAMessageMapperRegistryAsync messageMapperRegistryAsync,
+            IAmAMessageTransformerFactoryAsync? messageTransformerFactoryAsync,
+            IAmARequestContextFactory requestContextFactory,
+            IAmABrighterTracer? tracer,
+            InstrumentationOptions instrumentationOptions = InstrumentationOptions.All)
+        {
+            _commandProcessor = commandProcessor;
+            _messageMapperRegistryAsync = messageMapperRegistryAsync;
+            _subscription = subscription;
+            _mapRequestType = subscription.MapRequestType;
+            _messageTransformerFactoryAsync = messageTransformerFactoryAsync ?? new EmptyMessageTransformerFactoryAsync();
+            _requestContextFactory = requestContextFactory;
+            _tracer = tracer;
+            _instrumentationOptions = instrumentationOptions;
+            _consumerName = new ConsumerName($"{_subscription.Name}-{Uuid.NewAsString()}");
         }
 
         public Consumer Create()
         {
-            var channel = _connection.ChannelFactory.CreateChannel(_connection);
-            var messagePump = new MessagePump<TRequest>(_commandProcessor, _messageMapperRegistry.Get<TRequest>())
+            if (_subscription.MessagePumpType == MessagePumpType.Proactor)
+                return CreateProactor();
+            else
+                return CreateReactor();
+        }
+
+        private Consumer CreateReactor()
+        {
+            if (_messageMapperRegistry is null || _messageTransformerFactory is null)
+                throw new ArgumentException("Message Mapper Registry and Transform factory must be set");
+            
+            if (_subscription.ChannelFactory is null)
+                throw new ArgumentException("Subscription must have a Channel Factory in order to create a consumer.");
+            
+            var channel = _subscription.ChannelFactory.CreateSyncChannel(_subscription);
+            var messagePump = new Reactor(_commandProcessor,  _mapRequestType, _messageMapperRegistry, 
+                _messageTransformerFactory, _requestContextFactory, channel, _tracer, _instrumentationOptions)
             {
                 Channel = channel,
-                TimeoutInMilliseconds = _connection.TimeoutInMiliseconds,
-                RequeueCount = _connection.RequeueCount,
-                RequeueDelayInMilliseconds = _connection.RequeueDelayInMilliseconds,
-                UnacceptableMessageLimit = _connection.UnacceptableMessageLimit
+                TimeOut = _subscription.TimeOut,
+                RequeueCount = _subscription.RequeueCount,
+                EmptyChannelDelay = _subscription.EmptyChannelDelay,
+                ChannelFailureDelay = _subscription.ChannelFailureDelay,
+                RequeueDelay = _subscription.RequeueDelay,
+                UnacceptableMessageLimit = _subscription.UnacceptableMessageLimit,
+                UnacceptableMessageLimitWindow = _subscription.UnacceptableMessageLimitWindow
             };
 
-            return new Consumer(_consumerName, _connection.Name, channel, messagePump);
+            return new Consumer(_consumerName, _subscription, channel, messagePump);
         }
-   }
+
+        private Consumer CreateProactor()
+        {
+            if (_messageMapperRegistryAsync is null || _messageTransformerFactoryAsync is null)
+                throw new ArgumentException("Message Mapper Registry and Transform factory must be set");
+
+            if (_subscription.ChannelFactory is null)
+                throw new ArgumentException("Subscription must have a Channel Factory in order to create a consumer.");
+            
+            var channel = _subscription.ChannelFactory.CreateAsyncChannel(_subscription);
+            var messagePump = new Proactor(_commandProcessor, _mapRequestType, _messageMapperRegistryAsync, 
+                _messageTransformerFactoryAsync, _requestContextFactory, channel, _tracer, _instrumentationOptions)
+            {
+                Channel = channel,
+                TimeOut = _subscription.TimeOut,
+                RequeueCount = _subscription.RequeueCount,
+                RequeueDelay = _subscription.RequeueDelay,
+                UnacceptableMessageLimit = _subscription.UnacceptableMessageLimit,
+                UnacceptableMessageLimitWindow = _subscription.UnacceptableMessageLimitWindow,
+                EmptyChannelDelay = _subscription.EmptyChannelDelay,
+                ChannelFailureDelay = _subscription.ChannelFailureDelay
+            };
+
+            return new Consumer(_consumerName, _subscription, channel, messagePump);
+        }
+    }
 }

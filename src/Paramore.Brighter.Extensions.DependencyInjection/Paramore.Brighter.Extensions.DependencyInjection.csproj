@@ -1,13 +1,32 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>netstandard2.0</TargetFrameworks>
+    <Description>Microsoft.Extensions.DependencyInjection integration for Paramore.Brighter Command Processor. Provides dependency injection container support for registering handlers, policies, and framework components.</Description>
     <Authors>Daniel Stockhammer, Toby Henderson</Authors>
-    <Description>Brighter Microsoft.Extensions.DependencyInjection support</Description>
+    <TargetFrameworks>$(BrighterTargetFrameworks)</TargetFrameworks>
+    <!-- Remove these XML documentation suppressions as the existing comments are corrected. -->
+    <NoWarn>$(NoWarn);CS1574</NoWarn>
+    <PackageTags>Dependency Injection;DI;Container;Command;Event;Command Processor;Microsoft Extensions;Brighter</PackageTags>
+    <Nullable>enable</Nullable>
   </PropertyGroup>
+
   <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="5.0.1" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions"/>
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions"/>
+    <PackageReference Include="Microsoft.Extensions.Options"/>
+    <PackageReference Include="System.Text.Json"/>
   </ItemGroup>
+
+  <ItemGroup Condition=" '$(TargetFramework)' == 'netstandard2.0' ">
+    <!-- ServiceProviderLifetimeScope disposes IAsyncDisposable service scopes on every TFM. IAsyncDisposable
+         (Microsoft.Bcl.AsyncInterfaces) and ValueTask (System.Threading.Tasks.Extensions) are not in the
+         netstandard2.0 BCL; reference them explicitly rather than relying on the transitive copy the DI
+         abstractions pull in, so a later dependency bump that drops or downgrades them cannot break the
+         netstandard2.0 async-disposal path. -->
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" />
+    <PackageReference Include="System.Threading.Tasks.Extensions" />
+  </ItemGroup>
+
   <ItemGroup>
-    <ProjectReference Include="..\Paramore.Brighter\Paramore.Brighter.csproj" />
+    <ProjectReference Include="..\Paramore.Brighter\Paramore.Brighter.csproj"/>
   </ItemGroup>
 </Project>

@@ -1,20 +1,22 @@
-﻿using System;
-using Newtonsoft.Json.Linq;
+﻿using System.Text.Json;
+using Paramore.Brighter.Extensions;
+using Paramore.Brighter.JsonConverters;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
     public class MyResponseMessageMapper : IAmAMessageMapper<MyResponse>
     {
-        public Message MapToMessage(MyResponse request)
+        public IRequestContext Context { get; set; }
+
+        public Message MapToMessage(MyResponse request, Publication publication)
         {
             var header = new MessageHeader(
                 messageId: request.Id,
                 topic: request.SendersAddress.Topic,
-                messageType: MessageType.MT_COMMAND,
+                messageType: request.RequestToMessageType(),
                 correlationId: request.SendersAddress.CorrelationId);
 
-            var json = new JObject(new JProperty("Id", request.Id), new JProperty("ReplyValue", request.ReplyValue));
-            var body = new MessageBody(json.ToString());
+            var body = new MessageBody(JsonSerializer.Serialize(new MyResponseObject(request.Id.ToString(), request.ReplyValue), JsonSerialisationOptions.Options));
             var message = new Message(header, body);
             return message;
         }
@@ -23,9 +25,9 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
         {
             var replyAddress = new ReplyAddress(topic: message.Header.ReplyTo, correlationId: message.Header.CorrelationId);
             var command = new MyResponse(replyAddress);
-            var messageBody = JObject.Parse(message.Body.Value);
-            command.Id = Guid.Parse((string)messageBody["Id"]);
-            command.ReplyValue = (string) messageBody["ReplyValue"];
+            var messageBody = JsonSerializer.Deserialize<MyResponseObject>(message.Body.Value, JsonSerialisationOptions.Options);
+            command.Id = messageBody.Id;
+            command.ReplyValue = messageBody.ReplyValue;
             return command;
         }
     }

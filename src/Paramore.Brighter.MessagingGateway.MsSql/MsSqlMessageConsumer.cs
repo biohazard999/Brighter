@@ -1,20 +1,146 @@
 ﻿using System;
+using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
 using Paramore.Brighter.MessagingGateway.MsSql.SqlQueues;
+using Paramore.Brighter.MsSql;
+using Paramore.Brighter.Observability;
 
 namespace Paramore.Brighter.MessagingGateway.MsSql
 {
-    public class MsSqlMessageConsumer : IAmAMessageConsumer
+    public partial class MsSqlMessageConsumer : IAmAMessageConsumerSync, IAmAMessageConsumerAsync, IHaveAMessagingSystem
     {
-        private readonly string _topic;
-        private static readonly Lazy<ILog> Logger = new Lazy<ILog>(LogProvider.For<MsSqlMessageConsumer>);
-        private readonly MsSqlMessageQueue<Message> _sqlQ;
+        /// <inheritdoc />
+        public MessagingSystem MessagingSystem => MessagingSystem.MsSql;
 
-        public MsSqlMessageConsumer(MsSqlMessagingGatewayConfiguration msSqlMessagingGatewayConfiguration, string topic)
+        private readonly string _topic;
+        private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MsSqlMessageConsumer>();
+        private readonly MsSqlMessageQueue<Message> _sqlMessageQueue;
+        private readonly RelationalDatabaseConfiguration _msSqlConfiguration;
+        private readonly RoutingKey? _deadLetterRoutingKey;
+        private readonly RoutingKey? _invalidMessageRoutingKey;
+        private readonly Lazy<MsSqlMessageProducer?>? _deadLetterProducer;
+        private readonly Lazy<MsSqlMessageProducer?>? _invalidMessageProducer;
+        private readonly IAmAMessageScheduler? _scheduler;
+        private MsSqlMessageProducer? _requeueProducer;
+        private bool _requeueProducerInitialized;
+        private object? _requeueProducerLock;
+        private readonly bool _isIndependentSubscriber;
+
+        public MsSqlMessageConsumer(
+            RelationalDatabaseConfiguration msSqlConfiguration,
+            string topic,
+            RelationalDbConnectionProvider connectionProvider,
+            IAmAMessageScheduler? scheduler = null,
+            RoutingKey? deadLetterRoutingKey = null,
+            RoutingKey? invalidMessageRoutingKey = null)
         {
             _topic = topic ?? throw new ArgumentNullException(nameof(topic));
-            _sqlQ = new MsSqlMessageQueue<Message>(msSqlMessagingGatewayConfiguration);
+            _msSqlConfiguration = msSqlConfiguration ?? throw new ArgumentNullException(nameof(msSqlConfiguration));
+            _sqlMessageQueue = new MsSqlMessageQueue<Message>(msSqlConfiguration, connectionProvider);
+            _scheduler = scheduler;
+            _deadLetterRoutingKey = deadLetterRoutingKey;
+            _invalidMessageRoutingKey = invalidMessageRoutingKey;
+
+            // LazyThreadSafetyMode.None: message pumps are single-threaded per consumer, so no
+            // thread-safety mode is needed. None does not cache exceptions, allowing the factory
+            // to retry on the next .Value access after a transient failure.
+            if (_deadLetterRoutingKey != null)
+                _deadLetterProducer = new Lazy<MsSqlMessageProducer?>(CreateDeadLetterProducer, LazyThreadSafetyMode.None);
+            if (_invalidMessageRoutingKey != null)
+                _invalidMessageProducer = new Lazy<MsSqlMessageProducer?>(CreateInvalidMessageProducer, LazyThreadSafetyMode.None);
+        }
+
+        public MsSqlMessageConsumer(
+            RelationalDatabaseConfiguration msSqlConfiguration,
+            string topic,
+            IAmAMessageScheduler? scheduler = null,
+            RoutingKey? deadLetterRoutingKey = null,
+            RoutingKey? invalidMessageRoutingKey = null)
+            : this(msSqlConfiguration, topic, new MsSqlConnectionProvider(msSqlConfiguration), scheduler, deadLetterRoutingKey, invalidMessageRoutingKey)
+        {}
+
+        /// <summary>
+        /// Initializes a consumer with an explicit choice of topic or independent subscriber routing.
+        /// </summary>
+        /// <param name="msSqlConfiguration">The SQL queue configuration.</param>
+        /// <param name="topic">The physical queue name.</param>
+        /// <param name="isIndependentSubscriber">True to target this queue when scheduling retries of fan-out copies.</param>
+        /// <param name="connectionProvider">An optional connection provider; defaults to the MS SQL provider.</param>
+        /// <param name="scheduler">The optional message scheduler.</param>
+        /// <param name="deadLetterRoutingKey">The optional dead-letter destination.</param>
+        /// <param name="invalidMessageRoutingKey">The optional invalid-message destination.</param>
+        public MsSqlMessageConsumer(
+            RelationalDatabaseConfiguration msSqlConfiguration,
+            string topic,
+            bool isIndependentSubscriber,
+            RelationalDbConnectionProvider? connectionProvider = null,
+            IAmAMessageScheduler? scheduler = null,
+            RoutingKey? deadLetterRoutingKey = null,
+            RoutingKey? invalidMessageRoutingKey = null)
+            : this(msSqlConfiguration, topic, connectionProvider ?? new MsSqlConnectionProvider(msSqlConfiguration),
+                scheduler, deadLetterRoutingKey, invalidMessageRoutingKey)
+        {
+            _isIndependentSubscriber = isIndependentSubscriber;
+        }
+
+        /// <summary>
+        /// Acknowledges the specified message.
+        /// </summary>
+        /// <remarks>
+        /// No implementation required because of atomic 'read-and-delete'
+        /// </remarks>
+        /// <param name="message">The message.</param>
+        public void Acknowledge(Message message) {}
+
+        public Task AcknowledgeAsync(Message message, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Nacks the specified message.
+        /// </summary>
+        /// <remarks>
+        /// No implementation required because of atomic 'read-and-delete'
+        /// </remarks>
+        /// <param name="message">The message.</param>
+        public void Nack(Message message) {}
+
+        public Task NackAsync(Message message, CancellationToken cancellationToken = default)
+        {
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Purges this consumer's physical queue in bounded batches.
+        /// </summary>
+        /// <remarks>
+        /// Rows above the queue's highest identity observed at the start are preserved.
+        /// Outside an ambient transaction each batch commits independently, so failure can leave a partial purge.
+        /// An ambient transaction retains locks across batches until it completes.
+        /// </remarks>
+        public void Purge()
+        {
+            Log.PurgingQueue(s_logger);
+            _sqlMessageQueue.PurgeTopic(_topic);
+        }
+
+        /// <summary>
+        /// Purges this consumer's physical queue asynchronously in bounded batches.
+        /// </summary>
+        /// <param name="cancellationToken">Cancellation for the purge command.</param>
+        /// <returns>A task that completes when all rows up to the initial identity cutoff have been purged.</returns>
+        /// <remarks>
+        /// Rows above the initial identity cutoff remain queued. Outside an ambient transaction,
+        /// cancellation or failure can leave committed batches deleted and later batches still queued.
+        /// An ambient transaction retains locks across batches until it completes.
+        /// </remarks>
+        public async Task PurgeAsync(CancellationToken cancellationToken = default(CancellationToken))
+        {
+            Log.PurgingQueue(s_logger);
+            await _sqlMessageQueue.PurgeTopicAsync(_topic, cancellationToken);
         }
 
         /// <summary>
@@ -22,72 +148,375 @@ namespace Paramore.Brighter.MessagingGateway.MsSql
         /// An abstraction over a third-party messaging library. Used to read messages from the broker and to acknowledge the processing of those messages or requeue them.
         /// Used by a <see cref="Channel"/> to provide access to a third-party message queue.
         /// </summary>
-        /// <param name="timeoutInMilliseconds">The timeout in milliseconds.</param>
-        /// <returns>Message.</returns>
-        public Message[] Receive(int timeoutInMilliseconds)
+        /// <param name="timeOut">How long to wait on a recieve. Default is 300ms</param>
+        /// <returns>Message</returns>
+        public Message[] Receive(TimeSpan? timeOut = null)
         {
-            var rc = _sqlQ.TryReceive(_topic, timeoutInMilliseconds);
+            timeOut ??= TimeSpan.FromMilliseconds(300);
+
+            var rc = _sqlMessageQueue.TryReceive(_topic, timeOut.Value);
             var message = !rc.IsDataValid ? new Message() : rc.Message;
-            return new Message[]{message};
+            return [message!];
         }
 
         /// <summary>
-        /// Acknowledges the specified message.
+        /// Receives the specified queue name.
+        /// An abstraction over a third-party messaging library. Used to read messages from the broker and to acknowledge the processing of those messages or requeue them.
+        /// Used by a <see cref="Channel"/> to provide access to a third-party message queue.
         /// </summary>
-        /// <param name="message">The message.</param>
-        public void Acknowledge(Message message)
+        /// <param name="timeOut">How long to wait on a recieve. Default is 300ms</param>
+        /// <param name="cancellationToken">The <see cref="CancellationToken"/> for the operation</param>
+        /// <returns>Message</returns>
+        public async Task<Message[]> ReceiveAsync(TimeSpan? timeOut = null, CancellationToken cancellationToken = default(CancellationToken))
         {
-            // Not required because of atomic 'read-and-delete'
-        }
+            cancellationToken.ThrowIfCancellationRequested();
 
-         /// <summary>
-        /// Rejects the specified message.
-        /// </summary>
-        /// <param name="message">The message.</param>
-        /// <param name="requeue">if set to <c>true</c> [requeue].</param>
-        public void Reject(Message message, bool requeue)
-        {
-            Logger.Value.Info(
-                $"MsSqlMessagingConsumer: rejecting message with topic {message.Header.Topic} and id {message.Id.ToString()}, NOT IMPLEMENTED");
+            using var ct = new CancellationTokenSource(timeOut ?? TimeSpan.FromMilliseconds(300));
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, ct.Token);
+
+            var rc = await _sqlMessageQueue.TryReceiveAsync(_topic, linked.Token);
+            var message = !rc.IsDataValid ? new Message() : rc.Message;
+            return [message!];
         }
 
         /// <summary>
-        /// Purges the specified queue name.
+        /// Rejects the specified message, routing it to a DLQ or invalid message channel if configured.
         /// </summary>
-        public void Purge()
+        /// <remarks>
+        /// MsSql uses atomic read-and-delete, so the message has already been removed from the source queue
+        /// on <see cref="Receive"/>. Reject only needs to forward the message to the appropriate rejection channel.
+        /// </remarks>
+        /// <param name="message">The message.</param>
+        /// <param name="reason">The <see cref="MessageRejectionReason"/> that explains why we rejected the message</param>
+        public bool Reject(Message message, MessageRejectionReason? reason = null)
         {
-            Logger.Value.Debug("MsSqlMessagingConsumer: purging queue");
-            _sqlQ.Purge();
+            if (_deadLetterProducer == null && _invalidMessageProducer == null)
+            {
+                if (reason != null)
+                    Log.NoChannelsConfiguredForRejection(s_logger, message.Id.Value, reason.RejectionReason.ToString());
+
+                return true;
+            }
+
+            var rejectionReason = reason?.RejectionReason ?? RejectionReason.None;
+
+            try
+            {
+                RefreshMetadata(message, reason);
+
+                var (routingKey, shouldRoute, isFallingBackToDlq) = DetermineRejectionRoute(
+                    rejectionReason, _invalidMessageProducer != null, _deadLetterProducer != null);
+
+                MsSqlMessageProducer? producer = null;
+                if (shouldRoute)
+                {
+                    message.Header.Topic = routingKey!;
+                    if (isFallingBackToDlq)
+                        Log.FallingBackToDlq(s_logger, message.Id.Value);
+
+                    if (routingKey == _invalidMessageRoutingKey)
+                        producer = _invalidMessageProducer?.Value;
+                    else if (routingKey == _deadLetterRoutingKey)
+                        producer = _deadLetterProducer?.Value;
+                }
+
+                if (producer != null)
+                {
+                    producer.Send(message);
+                    Log.MessageSentToRejectionChannel(s_logger, message.Id.Value, rejectionReason.ToString());
+                }
+                else
+                {
+                    Log.NoChannelsConfiguredForRejection(s_logger, message.Id.Value, rejectionReason.ToString());
+                }
+            }
+            catch (Exception ex)
+            {
+                // DLQ send failed — the message was already atomically deleted from the source
+                // queue on Receive, so we cannot requeue it. Log and return true to prevent the
+                // message pump from retrying endlessly.
+                Log.ErrorSendingToRejectionChannel(s_logger, ex, message.Id.Value, rejectionReason.ToString());
+                return true;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Rejects the specified message asynchronously, routing it to a DLQ or invalid message channel if configured.
+        /// </summary>
+        /// <remarks>
+        /// MsSql uses atomic read-and-delete, so the message has already been removed from the source queue
+        /// on <see cref="ReceiveAsync"/>. Reject only needs to forward the message to the appropriate rejection channel.
+        /// </remarks>
+        /// <param name="message">The message.</param>
+        /// <param name="reason">The <see cref="MessageRejectionReason"/> that explains why we rejected the message</param>
+        /// <param name="cancellationToken">A <see cref="CancellationToken"/> to cancel the reject</param>
+        public async Task<bool> RejectAsync(Message message, MessageRejectionReason? reason = null, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            if (_deadLetterProducer == null && _invalidMessageProducer == null)
+            {
+                if (reason != null)
+                    Log.NoChannelsConfiguredForRejection(s_logger, message.Id.Value, reason.RejectionReason.ToString());
+
+                return true;
+            }
+
+            var rejectionReason = reason?.RejectionReason ?? RejectionReason.None;
+
+            try
+            {
+                RefreshMetadata(message, reason);
+
+                var (routingKey, shouldRoute, isFallingBackToDlq) = DetermineRejectionRoute(
+                    rejectionReason, _invalidMessageProducer != null, _deadLetterProducer != null);
+
+                MsSqlMessageProducer? producer = null;
+                if (shouldRoute)
+                {
+                    message.Header.Topic = routingKey!;
+                    if (isFallingBackToDlq)
+                        Log.FallingBackToDlq(s_logger, message.Id.Value);
+
+                    if (routingKey == _invalidMessageRoutingKey)
+                        producer = _invalidMessageProducer?.Value;
+                    else if (routingKey == _deadLetterRoutingKey)
+                        producer = _deadLetterProducer?.Value;
+                }
+
+                if (producer != null)
+                {
+                    await producer.SendAsync(message, cancellationToken);
+                    Log.MessageSentToRejectionChannel(s_logger, message.Id.Value, rejectionReason.ToString());
+                }
+                else
+                {
+                    Log.NoChannelsConfiguredForRejection(s_logger, message.Id.Value, rejectionReason.ToString());
+                }
+            }
+            catch (Exception ex)
+            {
+                // DLQ send failed — the message was already atomically deleted from the source
+                // queue on ReceiveAsync, so we cannot requeue it. Log and return true to prevent
+                // the message pump from retrying endlessly.
+                Log.ErrorSendingToRejectionChannel(s_logger, ex, message.Id.Value, rejectionReason.ToString());
+                return true;
+            }
+
+            return true;
         }
 
         /// <summary>
         /// Requeues the specified message.
         /// </summary>
+        /// <remarks>
+        /// Retries return to this consumer's physical queue and preserve the logical topic.
+        /// A subscriber retry uses an <see cref="IAmAMessageRequeueSchedulerSync"/> to honor a delay.
+        /// Without one, the copy is requeued immediately to the receiving queue and a warning is logged.
+        /// </remarks>
         /// <param name="message"></param>
-        /// <param name="delayMilliseconds">Number of milliseconds to delay delivery of the message.</param>
-        public void Requeue(Message message)
+        /// <param name="delay">The requested retry delay. Subscriber retries fall back to immediate delivery without a queue-targeted scheduler.</param>
+        /// <returns>True when message is requeued</returns>
+        public bool Requeue(Message message, TimeSpan? delay = null)
         {
+            delay ??= TimeSpan.Zero;
+
             var topic = message.Header.Topic;
+            Log.RequeuingMessage(s_logger, topic.Value, message.Id.ToString());
 
-            Logger.Value.Debug(
-                $"MsSqlMessagingConsumer: requeuing message with topic {topic} and id {message.Id.ToString()}");
+            if (!message.Header.Bag.ContainsKey(Message.OriginalMessageIdHeaderName))
+            {
+                message.Header.Bag[Message.OriginalMessageIdHeaderName] = message.Header.MessageId.ToString();
+            }
 
-            _sqlQ.Send(message, topic);
+            if (delay > TimeSpan.Zero)
+            {
+                if (!_isIndependentSubscriber)
+                {
+                    EnsureRequeueProducer();
+                    _requeueProducer!.SendWithDelay(message, delay);
+                    return true;
+                }
+                if (_scheduler is IAmAMessageRequeueSchedulerSync scheduler)
+                {
+                    scheduler.Requeue(message, new ChannelName(_topic), delay.Value);
+                    return true;
+                }
+                Log.SubscriberRetryDelayIgnored(s_logger, message.Id.Value, _topic, delay.Value);
+            }
+
+            _sqlMessageQueue.Send(message, new RoutingKey(_topic));
+            return true;
         }
 
         /// <summary>
         /// Requeues the specified message.
         /// </summary>
+        /// <remarks>
+        /// Retries return to this consumer's physical queue and preserve the logical topic.
+        /// A subscriber retry uses an <see cref="IAmAMessageRequeueSchedulerAsync"/> to honor a delay.
+        /// Without one, the copy is requeued immediately to the receiving queue and a warning is logged.
+        /// Cancellation requested before the call prevents scheduling and message metadata changes.
+        /// </remarks>
         /// <param name="message"></param>
-        /// <param name="delayMilliseconds">Number of milliseconds to delay delivery of the message.</param>
-        public void Requeue(Message message, int delayMilliseconds)
+        /// <param name="delay">The requested retry delay. Subscriber retries fall back to immediate delivery without a queue-targeted scheduler.</param>
+        /// <param name="cancellationToken">The <see cref="CancellationToken"/> for the operation</param>
+        /// <returns>True when message is requeued</returns>
+        public async Task<bool> RequeueAsync(Message message, TimeSpan? delay = null, CancellationToken cancellationToken = default(CancellationToken))
         {
-            Task.Delay(delayMilliseconds).Wait();
-            Requeue(message);
+            cancellationToken.ThrowIfCancellationRequested();
+            delay ??= TimeSpan.Zero;
+
+            var topic = message.Header.Topic;
+            Log.RequeuingMessage(s_logger, topic.Value, message.Id.ToString());
+
+            if (!message.Header.Bag.ContainsKey(Message.OriginalMessageIdHeaderName))
+            {
+                message.Header.Bag[Message.OriginalMessageIdHeaderName] = message.Header.MessageId.ToString();
+            }
+
+            if (delay > TimeSpan.Zero)
+            {
+                if (!_isIndependentSubscriber)
+                {
+                    EnsureRequeueProducer();
+                    await _requeueProducer!.SendWithDelayAsync(message, delay, cancellationToken);
+                    return true;
+                }
+                if (_scheduler is IAmAMessageRequeueSchedulerAsync scheduler)
+                {
+                    await scheduler.RequeueAsync(message, new ChannelName(_topic), delay.Value, cancellationToken);
+                    return true;
+                }
+                Log.SubscriberRetryDelayIgnored(s_logger, message.Id.Value, _topic, delay.Value);
+            }
+
+            await _sqlMessageQueue.SendAsync(message, _topic, null, cancellationToken: cancellationToken);
+            return true;
         }
-        
+
+        /// <summary>
+        /// Dispose of the consumer
+        /// </summary>
         public void Dispose()
         {
+            _requeueProducer?.Dispose();
+            GC.SuppressFinalize(this);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (_requeueProducer != null) await _requeueProducer.DisposeAsync();
+            GC.SuppressFinalize(this);
+        }
+
+        private void EnsureRequeueProducer()
+        {
+            LazyInitializer.EnsureInitialized(ref _requeueProducer, ref _requeueProducerInitialized,
+                ref _requeueProducerLock, () => new MsSqlMessageProducer(_msSqlConfiguration)
+                {
+                    Scheduler = _scheduler
+                });
+        }
+
+        private MsSqlMessageProducer? CreateDeadLetterProducer()
+        {
+            if (_deadLetterRoutingKey == null) return null;
+
+            try
+            {
+                return new MsSqlMessageProducer(_msSqlConfiguration,
+                    new Publication { Topic = _deadLetterRoutingKey });
+            }
+            catch (Exception e)
+            {
+                Log.ErrorCreatingDlqProducer(s_logger, e, _deadLetterRoutingKey.Value);
+                return null;
+            }
+        }
+
+        private MsSqlMessageProducer? CreateInvalidMessageProducer()
+        {
+            if (_invalidMessageRoutingKey == null) return null;
+
+            try
+            {
+                return new MsSqlMessageProducer(_msSqlConfiguration,
+                    new Publication { Topic = _invalidMessageRoutingKey });
+            }
+            catch (Exception e)
+            {
+                Log.ErrorCreatingInvalidMessageProducer(s_logger, e, _invalidMessageRoutingKey.Value);
+                return null;
+            }
+        }
+
+        private static void RefreshMetadata(Message message, MessageRejectionReason? reason)
+        {
+            message.Header.Bag["originalTopic"] = message.Header.Topic.Value;
+            message.Header.Bag["rejectionTimestamp"] = DateTimeOffset.UtcNow.ToString("o");
+#pragma warning disable CS0618 // Preserve the legacy message type for transport compatibility.
+            message.Header.Bag["originalMessageType"] = message.Header.MessageType.ToString();
+#pragma warning restore CS0618
+
+            if (reason == null) return;
+
+            message.Header.Bag["rejectionReason"] = reason.RejectionReason.ToString();
+            if (!string.IsNullOrEmpty(reason.Description))
+                message.Header.Bag["rejectionMessage"] = reason.Description ?? string.Empty;
+        }
+
+        private (RoutingKey? routingKey, bool foundProducer, bool isFallingBackToDlq) DetermineRejectionRoute(
+            RejectionReason rejectionReason,
+            bool hasInvalidProducer,
+            bool hasDeadLetterProducer)
+        {
+            switch (rejectionReason)
+            {
+                case RejectionReason.Unacceptable:
+                    if (hasInvalidProducer)
+                        return (_invalidMessageRoutingKey, true, false);
+                    if (hasDeadLetterProducer)
+                        return (_deadLetterRoutingKey, true, true);
+                    return (null, false, false);
+
+                case RejectionReason.DeliveryError:
+                case RejectionReason.None:
+                default:
+                    if (hasDeadLetterProducer)
+                        return (_deadLetterRoutingKey, true, false);
+                    return (null, false, false);
+            }
+        }
+
+        private static partial class Log
+        {
+            [LoggerMessage(LogLevel.Debug, "MsSqlMessagingConsumer: purging queue")]
+            public static partial void PurgingQueue(ILogger logger);
+
+            [LoggerMessage(LogLevel.Debug, "MsSqlMessagingConsumer: re-queuing message with topic {Topic} and id {Id}")]
+            public static partial void RequeuingMessage(ILogger logger, string topic, string id);
+
+            [LoggerMessage(LogLevel.Warning, "MsSqlMessagingConsumer: Requeuing message {MessageId} immediately to subscriber queue {ChannelName}; requested delay {Delay} requires a queue-targeted scheduler for this message pump")]
+            public static partial void SubscriberRetryDelayIgnored(ILogger logger, string messageId, string channelName, TimeSpan delay);
+
+            [LoggerMessage(LogLevel.Warning, "MsSqlMessagingConsumer: No DLQ or invalid message channels configured for message {MessageId}, rejection reason: {RejectionReason}")]
+            public static partial void NoChannelsConfiguredForRejection(ILogger logger, string messageId, string rejectionReason);
+
+            [LoggerMessage(LogLevel.Information, "MsSqlMessagingConsumer: Message {MessageId} sent to rejection channel, reason: {RejectionReason}")]
+            public static partial void MessageSentToRejectionChannel(ILogger logger, string messageId, string rejectionReason);
+
+            [LoggerMessage(LogLevel.Warning, "MsSqlMessagingConsumer: Falling back to DLQ for message {MessageId}")]
+            public static partial void FallingBackToDlq(ILogger logger, string messageId);
+
+            [LoggerMessage(LogLevel.Error, "MsSqlMessagingConsumer: Error sending message {MessageId} to rejection channel, reason: {RejectionReason}")]
+            public static partial void ErrorSendingToRejectionChannel(ILogger logger, Exception ex, string messageId, string rejectionReason);
+
+            [LoggerMessage(LogLevel.Error, "MsSqlMessagingConsumer: Error creating DLQ producer for routing key {RoutingKey}")]
+            public static partial void ErrorCreatingDlqProducer(ILogger logger, Exception ex, string routingKey);
+
+            [LoggerMessage(LogLevel.Error, "MsSqlMessagingConsumer: Error creating invalid message producer for routing key {RoutingKey}")]
+            public static partial void ErrorCreatingInvalidMessageProducer(ILogger logger, Exception ex, string routingKey);
         }
     }
 }

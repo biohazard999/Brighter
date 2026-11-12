@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Nullable disabled: FluentMigrator migration classes use generated code patterns -->
+    <Nullable>disable</Nullable>
+    <RootNamespace>SalutationsMigrations</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FluentMigrator"/>
+  </ItemGroup>
+
+</Project>

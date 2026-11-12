@@ -1,6 +1,7 @@
 #region Licence
+
 /* The MIT License (MIT)
-Copyright © 2015 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+Copyright © 2020 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the “Software”), to deal
@@ -27,10 +28,11 @@ using System;
 namespace Paramore.Brighter.MessagingGateway.Kafka
 {
     /// <summary>
-    /// Class HeaderResult.
+    /// A 'Maybe" type used to capture the result of reading values from a message; used to provide 'tolerant reading'
+    /// what do we need to know to process a message
     /// </summary>
     /// <typeparam name="TResult">The type of the t result.</typeparam>
-    internal class HeaderResult<TResult>
+    internal sealed class HeaderResult<TResult>
     {
         /// <summary>
         /// Initializes a new instance of the <see cref="HeaderResult{TResult}"/> class.
@@ -49,11 +51,9 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
         /// <typeparam name="TNew">The type of the t new.</typeparam>
         /// <param name="map">The map.</param>
         /// <returns>HeaderResult&lt;TNew&gt;.</returns>
-        public HeaderResult<TNew> Map<TNew>(Func<TResult, HeaderResult<TNew>> map)
+        public HeaderResult<TNew?> Map<TNew>(Func<TResult, HeaderResult<TNew?>> map)
         {
-            if (Success)
-                return map(Result);
-            return HeaderResult<TNew>.Empty();
+            return Success ? map(Result) : HeaderResult<TNew>.Empty();
         }
 
         /// <summary>
@@ -61,6 +61,7 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
         /// </summary>
         /// <value><c>true</c> if success; otherwise, <c>false</c>.</value>
         public bool Success { get; }
+
         /// <summary>
         /// Gets the result.
         /// </summary>
@@ -71,9 +72,19 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
         /// Empties this instance.
         /// </summary>
         /// <returns>HeaderResult&lt;TResult&gt;.</returns>
-        public static HeaderResult<TResult> Empty()
+        public static HeaderResult<TResult?> Empty()
         {
-            return new HeaderResult<TResult>(default(TResult), false);
+            if (typeof(TResult) == typeof(string))
+            {
+                return new HeaderResult<TResult?>((TResult)(object)string.Empty, false);
+            }
+
+            if (typeof(TResult) == typeof(RoutingKey))
+            {
+                return new HeaderResult<TResult?>((TResult)(object)RoutingKey.Empty, false);
+            }
+
+            return new HeaderResult<TResult?>(default(TResult), false);
         }
     }
 }

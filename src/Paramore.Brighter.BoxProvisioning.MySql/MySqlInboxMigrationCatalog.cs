@@ -1,0 +1,170 @@
+#region Licence
+/* The MIT License (MIT)
+Copyright © 2026 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+#endregion
+
+using System;
+using System.Collections.Generic;
+using Paramore.Brighter.Inbox.MySql;
+
+namespace Paramore.Brighter.BoxProvisioning.MySql;
+
+/// <summary>
+/// Defines the migration history for MySQL inbox tables.
+/// </summary>
+/// <remarks>
+/// V1's <c>UpScript</c> is the literal historical baseline DDL — the MySQL inbox builder
+/// shape before <c>ContextKey</c> (first shipped in commit <c>133e5a4aa</c>, September 2017). The fresh-install fast path (ADR
+/// 0057 §3) takes its DDL from <see cref="FreshInstallDdl"/> instead, so V1.UpScript carries
+/// the historical shape. V2 adds <c>ContextKey</c> via the MySQL <c>information_schema.columns</c>
+/// + prepared-statement idempotency pattern from ADR 0057 §5.
+/// <para>
+/// The MySQL inbox shipped without <c>ContextKey</c> until commit <c>787c31c52</c> added it,
+/// so a legacy table may be at V1, and V2 adds the column to it.
+/// </para>
+/// <para>
+/// Note that the per-version <see cref="IAmABoxMigration.UpScript"/> and
+/// <see cref="IAmABoxMigration.LogicalColumns"/> play different roles:
+/// </para>
+/// <list type="bullet">
+/// <item><description><see cref="IAmABoxMigration.UpScript"/> on V1 is the historical
+/// baseline DDL; no provisioning path runs it, since the fresh-install fast path uses
+/// <see cref="FreshInstallDdl"/> and the bootstrap and normal-update branches apply only
+/// V2 onwards. V_k's UpScript for k &gt; 1 is the incremental ALTER that takes V_{k-1} to
+/// V_k.</description></item>
+/// <item><description><see cref="IAmABoxMigration.LogicalColumns"/> on V1 reflects the
+/// 4-column V1 shape (no <c>ContextKey</c>); it is the detection contract
+/// used by the bootstrap branch to infer which V_k a legacy table sits at.</description></item>
+/// </list>
+/// <para>
+/// LogicalColumns are PascalCase with <see cref="StringComparer.OrdinalIgnoreCase"/> — MySQL
+/// identifiers are case-insensitive on lookup. Comparer mirrors
+/// <see cref="MySqlOutboxMigrationCatalog"/>.
+/// </para>
+/// </remarks>
+public class MySqlInboxMigrationCatalog : IAmABoxMigrationCatalog
+{
+    private static readonly string[] s_v1Columns =
+        ["CommandId", "CommandType", "CommandBody", "Timestamp"];
+
+    private static readonly string[] s_v2AddedColumns = ["ContextKey"];
+
+    private static readonly string[] s_v3AddedColumns = ["CausationId"];
+
+    // The inbox DDL before ContextKey (as at 787c31c52^).
+    // {0} is the table name, backtick-quoted so reserved words (Order, User) parse.
+    private const string V1HistoricalDdl =
+        """
+        CREATE TABLE `{0}`
+            (
+                `CommandId` CHAR(36) NOT NULL ,
+                `CommandType` VARCHAR(256) NOT NULL ,
+                `CommandBody` TEXT NOT NULL ,
+                `Timestamp` TIMESTAMP(4) NOT NULL ,
+                PRIMARY KEY (`CommandId`)
+            ) ENGINE = InnoDB;
+        """;
+
+    /// <inheritdoc />
+    public string FreshInstallDdl(IAmARelationalDatabaseConfiguration configuration)
+    {
+        Identifiers.AssertSafe(
+            configuration.InBoxTableName,
+            nameof(IAmARelationalDatabaseConfiguration.InBoxTableName));
+        if (configuration.SchemaName is not null)
+        {
+            Identifiers.AssertSafe(
+                configuration.SchemaName,
+                nameof(IAmARelationalDatabaseConfiguration.SchemaName));
+        }
+        return MySqlInboxBuilder.GetDDL(
+            configuration.InBoxTableName,
+            configuration.BinaryMessagePayload,
+            jsonMessage: false,
+            schemaName: configuration.SchemaName);
+    }
+
+    /// <summary>
+    /// Returns all migrations for the MySQL inbox, ordered by version.
+    /// </summary>
+    /// <param name="configuration">The relational database configuration.</param>
+    /// <returns>An ordered list of migrations from V1 to V3.</returns>
+    public IReadOnlyList<IAmABoxMigration> All(IAmARelationalDatabaseConfiguration configuration)
+    {
+        var table = configuration.InBoxTableName;
+        var schema = configuration.SchemaName;
+
+        Identifiers.AssertSafe(table, nameof(IAmARelationalDatabaseConfiguration.InBoxTableName));
+        if (schema is not null)
+        {
+            Identifiers.AssertSafe(schema, nameof(IAmARelationalDatabaseConfiguration.SchemaName));
+        }
+
+        return
+        [
+            new BoxMigration(
+                Version: 1,
+                Description: "Create inbox table",
+                UpScript: string.Format(V1HistoricalDdl, table),
+                LogicalColumns: Cumulative(1)),
+
+            new BoxMigration(
+                Version: 2,
+                Description: "Add ContextKey column",
+                UpScript: AddColumn(schema, table, "ContextKey", "VARCHAR(256)"),
+                LogicalColumns: Cumulative(2),
+                SourceReference: "787c31c52"),
+
+            new BoxMigration(
+                Version: 3,
+                Description: "Add CausationId column",
+                UpScript: AddColumn(schema, table, "CausationId", "VARCHAR(256)"),
+                LogicalColumns: Cumulative(3),
+                SourceReference: "#2541")
+        ];
+    }
+
+    private static IReadOnlyCollection<string> Cumulative(int upToVersion)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (upToVersion >= 1) { set.UnionWith(s_v1Columns); }
+        if (upToVersion >= 2) { set.UnionWith(s_v2AddedColumns); }
+        if (upToVersion >= 3) { set.UnionWith(s_v3AddedColumns); }
+        return set;
+    }
+
+    // MySQL 5.7 has no ADD COLUMN IF NOT EXISTS, so an information_schema probe decides whether a
+    // prepared statement runs the ALTER. A null schema means DATABASE() and an unqualified ALTER.
+    // Columns are added NULL-able: ADD COLUMN on a non-empty table needs NULL or a DEFAULT.
+    private static string AddColumn(string? schema, string table, string column, string type)
+    {
+        var tableScopeForProbe = schema is null ? "DATABASE()" : $"'{schema}'";
+        var qualifiedAlterTarget = schema is null ? $"`{table}`" : $"`{schema}`.`{table}`";
+        return $@"SET @q = (SELECT IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = {tableScopeForProbe} AND table_name = '{table}' AND column_name = '{column}') = 0,
+    'ALTER TABLE {qualifiedAlterTarget} ADD COLUMN `{column}` {type} NULL',
+    'SELECT 1'));
+PREPARE stmt FROM @q;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;";
+    }
+}

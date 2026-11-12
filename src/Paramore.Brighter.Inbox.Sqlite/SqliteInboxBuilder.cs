@@ -24,19 +24,62 @@ THE SOFTWARE. */
 
 namespace Paramore.Brighter.Inbox.Sqlite
 {
+    /// <summary>
+    /// Provide SQL statement helpers for creation of an Inbox
+    /// </summary>
     public class SqliteInboxBuilder
     {
-        const string _outboxDDL = "CREATE TABLE {0} (" +
-                "CommandId uniqueidentifier CONSTRAINT PK_MessageId PRIMARY KEY," +
-                "CommandType nvarchar(256)," +
-                "CommandBody ntext," +
-                "Timestamp TIMESTAMPTZ DEFAULT Now()," +
-                "ContextKey nvarchar(256)" +
-                ")";
+        private const string TextInboxDDL = """
+            CREATE TABLE IF NOT EXISTS {0} 
+            (
+                [CommandId] UNIQUEIDENTIFIER CONSTRAINT PK_MessageId PRIMARY KEY,
+                [CommandType] NVARCHAR(256),
+                [CommandBody] NTEXT,
+                [Timestamp] TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                [ContextKey] NVARCHAR(256),
+                [CausationId] NVARCHAR(256)
+            );
+            """;
 
-        public static string GetDDL(string tableName)
+        private const string BinaryInboxDDL =
+            """
+            CREATE TABLE IF NOT EXISTS {0}
+            (
+                [CommandId] UNIQUEIDENTIFIER CONSTRAINT PK_MessageId PRIMARY KEY,
+                [CommandType] NVARCHAR(256),
+                [CommandBody] BLOB NULL,
+                [Timestamp] TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                [ContextKey] NVARCHAR(256),
+                [CausationId] NVARCHAR(256)
+            );
+            """;
+
+
+        private const string InboxExistsSQL = "SELECT name FROM sqlite_master WHERE type='table' AND name='{0}'";
+
+        /// <summary>
+        /// Get the DDL statements to create an Inbox in Sqlite
+        /// </summary>
+        /// <param name="inboxTableName">The name you want to use for the table</param>
+        /// <returns>The required DDL</returns>
+        public static string GetDDL(string inboxTableName, bool binary = false)
         {
-            return string.Format(_outboxDDL, tableName);
+            if (binary)
+            {
+                return string.Format(BinaryInboxDDL, inboxTableName);
+            }
+
+            return string.Format(TextInboxDDL, inboxTableName);
+        }
+
+        /// <summary>
+        /// Get the SQL statements required to test for the existence of an Inbox in Sqlite
+        /// </summary>
+        /// <param name="inboxTableName">The name that was used for the Inbox table</param>
+        /// <returns>The required SQL</returns>
+        public static string GetExistsQuery(string inboxTableName)
+        {
+            return string.Format(InboxExistsSQL, inboxTableName);
         }
     }
 }

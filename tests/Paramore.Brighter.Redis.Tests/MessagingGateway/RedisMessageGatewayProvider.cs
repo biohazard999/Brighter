@@ -1,0 +1,484 @@
+#region Licence
+
+/* The MIT License (MIT)
+Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
+
+#endregion
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Paramore.Brighter.MessagingGateway.Redis;
+using Paramore.Brighter.Redis.Tests.TestDoubles;
+
+namespace Paramore.Brighter.Redis.Tests.MessagingGateway;
+
+public class RedisMessageGatewayProvider
+    : Proactor.IAmAMessageGatewayProactorProvider,
+        Reactor.IAmAMessageGatewayReactorProvider
+{
+    private readonly RedisMessagingGatewayConfiguration _configuration;
+    private RedisMessageConsumer? _dlqConsumer;
+    private RedisMessageConsumer? _invalidConsumer;
+    private ConformanceHarnessMessageScheduler? _scheduler;
+
+    public RedisMessageGatewayProvider()
+    {
+        _configuration = RedisFixture.RedisMessagingGatewayConfiguration();
+    }
+
+    // Redis has no native delayed delivery: the gateway delegates a requested delay to the
+    // scheduler seam (producer.Scheduler for send-with-delay; the consumer factory's
+    // scheduler for requeue-with-delay). One shared harness scheduler honours the delay by
+    // wall-clock and re-publishes to the topic. Lazily created; disposed in CleanUp.
+    private ConformanceHarnessMessageScheduler Scheduler =>
+        _scheduler ??= new ConformanceHarnessMessageScheduler(RepublishToRedis);
+
+    // The only part of scheduling that is Redis's: build a producer, send, and hand it back for
+    // the scheduler to dispose.
+    private IDisposable? RepublishToRedis(Message message)
+    {
+        var publication = new RedisMessagePublication
+        {
+            Topic = message.Header.Topic,
+            MakeChannels = OnMissingChannel.Create,
+        };
+
+        var producer = new RedisMessageProducer(_configuration, publication);
+        return ConformanceHarnessMessageScheduler.SendAndHandBack(producer, () => producer.Send(message));
+    }
+
+    public void CleanUp(
+        IAmAMessageProducerSync? producer,
+        IAmAChannelSync? channel,
+        IEnumerable<Message> messages
+    )
+    {
+        if (channel != null)
+        {
+            try { channel.Purge(); } catch { /* pool may already be disposed */ }
+            try { channel.Dispose(); } catch { /* best effort */ }
+        }
+
+        try { producer?.Dispose(); } catch { /* best effort */ }
+        try { _dlqConsumer?.Dispose(); } catch { /* best effort */ }
+        _dlqConsumer = null;
+        try { _invalidConsumer?.Dispose(); } catch { /* best effort */ }
+        _invalidConsumer = null;
+        try { _scheduler?.Dispose(); } catch { /* best effort */ }
+        _scheduler = null;
+    }
+
+    public async Task CleanUpAsync(
+        IAmAMessageProducerAsync? producer,
+        IAmAChannelAsync? channel,
+        IEnumerable<Message> messages
+    )
+    {
+        if (channel != null)
+        {
+            try { await channel.PurgeAsync(); } catch { /* pool may already be disposed */ }
+            try { channel.Dispose(); } catch { /* best effort */ }
+        }
+
+        if (producer != null)
+        {
+            try { await producer.DisposeAsync(); } catch { /* best effort */ }
+        }
+
+        if (_dlqConsumer != null)
+        {
+            try { await _dlqConsumer.DisposeAsync(); } catch { /* best effort */ }
+            _dlqConsumer = null;
+        }
+
+        if (_invalidConsumer != null)
+        {
+            try { await _invalidConsumer.DisposeAsync(); } catch { /* best effort */ }
+            _invalidConsumer = null;
+        }
+
+        try { _scheduler?.Dispose(); } catch { /* best effort */ }
+        _scheduler = null;
+    }
+
+    public IAmAChannelSync CreateChannel(RedisSubscription subscription)
+    {
+        var channel = new ChannelFactory(
+            new RedisMessageConsumerFactory(_configuration, Scheduler)
+        ).CreateSyncChannel(subscription);
+
+        // Redis requires a receive before send to establish the subscription
+        channel.Receive(TimeSpan.FromMilliseconds(100));
+
+        // Pre-subscribe DLQ consumer so it receives notifications when messages
+        // are rejected. Must be created before any requeue/reject operations.
+        if (subscription.DeadLetterRoutingKey != null)
+        {
+            var dlqQueueName = new ChannelName($"dlq-{Guid.NewGuid().ToString("N")[..8]}");
+            _dlqConsumer = new RedisMessageConsumer(
+                _configuration,
+                dlqQueueName,
+                subscription.DeadLetterRoutingKey
+            );
+            _dlqConsumer.Receive(TimeSpan.FromMilliseconds(1000));
+        }
+
+        // Pre-subscribe invalid-message consumer so it receives notifications when messages
+        // are rejected as unacceptable. Mirrors the DLQ hook above.
+        if (subscription.InvalidMessageRoutingKey != null)
+        {
+            var invalidQueueName = new ChannelName($"invalid-{Guid.NewGuid().ToString("N")[..8]}");
+            _invalidConsumer = new RedisMessageConsumer(
+                _configuration,
+                invalidQueueName,
+                subscription.InvalidMessageRoutingKey
+            );
+            _invalidConsumer.Receive(TimeSpan.FromMilliseconds(1000));
+        }
+
+        return new RequeueTrackingChannelSync(channel);
+    }
+
+    public async Task<IAmAChannelAsync> CreateChannelAsync(
+        RedisSubscription subscription,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var channel = await new ChannelFactory(
+            new RedisMessageConsumerFactory(_configuration, Scheduler)
+        ).CreateAsyncChannelAsync(subscription, cancellationToken);
+
+        // Redis async ReceiveAsync does NOT enforce a 1s minimum timeout like
+        // sync Receive does, so we use 1000ms explicitly to ensure the BLPOP
+        // registration completes reliably.
+        await channel.ReceiveAsync(TimeSpan.FromMilliseconds(1000), cancellationToken);
+
+        if (subscription.DeadLetterRoutingKey != null)
+        {
+            var dlqQueueName = new ChannelName($"dlq-{Guid.NewGuid().ToString("N")[..8]}");
+            _dlqConsumer = new RedisMessageConsumer(
+                _configuration,
+                dlqQueueName,
+                subscription.DeadLetterRoutingKey
+            );
+            _dlqConsumer.Receive(TimeSpan.FromMilliseconds(1000));
+        }
+
+        if (subscription.InvalidMessageRoutingKey != null)
+        {
+            var invalidQueueName = new ChannelName($"invalid-{Guid.NewGuid().ToString("N")[..8]}");
+            _invalidConsumer = new RedisMessageConsumer(
+                _configuration,
+                invalidQueueName,
+                subscription.InvalidMessageRoutingKey
+            );
+            _invalidConsumer.Receive(TimeSpan.FromMilliseconds(1000));
+        }
+
+        return new RequeueTrackingChannelAsync(channel);
+    }
+
+    public IAmAMessageProducerSync CreateProducer(RedisMessagePublication publication)
+    {
+        return new RedisMessageProducer(_configuration, publication) { Scheduler = Scheduler };
+    }
+
+    public async Task<IAmAMessageProducerAsync> CreateProducerAsync(
+        RedisMessagePublication publication,
+        CancellationToken cancellationToken = default
+    )
+    {
+        await Task.CompletedTask;
+        return new RedisMessageProducer(_configuration, publication) { Scheduler = Scheduler };
+    }
+
+    public RedisMessagePublication CreatePublication(
+        RoutingKey routingKey,
+        OnMissingChannel makeChannels = OnMissingChannel.Create
+    )
+    {
+        return new RedisMessagePublication
+        {
+            Topic = routingKey,
+            MakeChannels = makeChannels,
+        };
+    }
+
+    public RedisSubscription CreateSubscription(
+        RoutingKey routingKey,
+        ChannelName channelName,
+        OnMissingChannel makeChannel,
+        RoutingKey? deadLetterRoutingKey = null,
+        RoutingKey? invalidMessageRoutingKey = null
+    )
+    {
+        if (deadLetterRoutingKey != null)
+        {
+            return new RedisSubscription<MyCommand>(
+                subscriptionName: new SubscriptionName(Guid.NewGuid().ToString()),
+                channelName: channelName,
+                routingKey: routingKey,
+                messagePumpType: MessagePumpType.Proactor,
+                makeChannels: makeChannel,
+                deadLetterRoutingKey: deadLetterRoutingKey,
+                invalidMessageRoutingKey: invalidMessageRoutingKey,
+                requeueCount: 3
+            );
+        }
+
+        return new RedisSubscription<MyCommand>(
+            subscriptionName: new SubscriptionName(Guid.NewGuid().ToString()),
+            channelName: channelName,
+            routingKey: routingKey,
+            messagePumpType: MessagePumpType.Proactor,
+            makeChannels: makeChannel,
+            invalidMessageRoutingKey: invalidMessageRoutingKey
+        );
+    }
+
+    public ChannelName GetOrCreateChannelName([CallerMemberName] string? testName = null)
+    {
+        return new ChannelName($"Queue{Guid.NewGuid().ToString("N")[..8]}");
+    }
+
+    public RoutingKey GetOrCreateRoutingKey([CallerMemberName] string? testName = null)
+    {
+        return new RoutingKey($"gen.redis.{Guid.NewGuid().ToString("N")[..8]}");
+    }
+
+    public async Task<Message> GetMessageFromDeadLetterQueueAsync(
+        RedisSubscription subscription,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (_dlqConsumer == null)
+            throw new InvalidOperationException("DLQ consumer was not pre-created. Ensure CreateChannelAsync was called with a DLQ-configured subscription.");
+
+        await Task.CompletedTask;
+
+        return ReceiveOne(_dlqConsumer);
+    }
+
+    public Message GetMessageFromDeadLetterQueue(RedisSubscription subscription)
+    {
+        if (_dlqConsumer == null)
+            throw new InvalidOperationException("DLQ consumer was not pre-created. Ensure CreateChannel was called with a DLQ-configured subscription.");
+
+        return ReceiveOne(_dlqConsumer);
+    }
+
+    public Message GetMessageFromInvalidChannel(RedisSubscription subscription)
+    {
+        if (_invalidConsumer == null)
+            throw new InvalidOperationException("Invalid-message consumer was not pre-created. Ensure CreateChannel was called with an invalid-message-configured subscription.");
+
+        return ReceiveOne(_invalidConsumer);
+    }
+
+    public async Task<Message> GetMessageFromInvalidChannelAsync(
+        RedisSubscription subscription,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (_invalidConsumer == null)
+            throw new InvalidOperationException("Invalid-message consumer was not pre-created. Ensure CreateChannelAsync was called with an invalid-message-configured subscription.");
+
+        await Task.CompletedTask;
+
+        return ReceiveOne(_invalidConsumer);
+    }
+
+    /// <summary>
+    /// One bounded receive from a rejection destination, acknowledged and restored to its original
+    /// topic if anything was there.
+    /// </summary>
+    /// <remarks>
+    /// <para>The retry belongs to the caller's bounded poll loop, so this attempts exactly one receive and
+    /// reports what it found. An empty batch and a batch holding an MT_NONE sentinel both mean the
+    /// same thing - nothing has arrived yet - and both are reported as MT_NONE.</para>
+    /// <para>Redis is alone in needing the topic restored: <c>Reject</c> rewrites the header topic
+    /// to the rejection routing key on the way out, so the original is read back from the bag.</para>
+    /// </remarks>
+    private static Message ReceiveOne(RedisMessageConsumer consumer)
+    {
+        var messages = consumer.Receive(TimeSpan.FromSeconds(5));
+        if (!messages.Any())
+        {
+            return new Message();
+        }
+
+        var message = messages.First();
+        if (message.Header.MessageType != MessageType.MT_NONE)
+        {
+            consumer.Acknowledge(message);
+
+            // Restore original topic — Reject changes it to the rejection routing key
+            if (message.Header.Bag.TryGetValue("originalTopic", out var originalTopic))
+                message.Header.Topic = new RoutingKey(originalTopic.ToString()!);
+        }
+
+        return message;
+    }
+
+    public RejectionMetadataKeys RejectionMetadataKeys =>
+        new RejectionMetadataKeys(
+            "originalTopic",
+            "originalMessageType",
+            "rejectionReason",
+            "rejectionMessage",
+            "rejectionTimestamp"
+        );
+
+    /// <summary>
+    /// Channel decorator that tracks requeue count per original message ID and
+    /// rejects (sending to DLQ) after the max requeue count is reached.
+    /// </summary>
+    private class RequeueTrackingChannelAsync : IAmAChannelAsync
+    {
+        private readonly IAmAChannelAsync _inner;
+        private readonly Dictionary<string, int> _requeueCounts = new();
+
+        public RequeueTrackingChannelAsync(IAmAChannelAsync inner)
+        {
+            _inner = inner;
+        }
+
+        public ChannelName Name => _inner.Name;
+        public RoutingKey RoutingKey => _inner.RoutingKey;
+        public void Enqueue(params Message[] messages) => _inner.Enqueue(messages);
+        public void Stop(RoutingKey topic) => _inner.Stop(topic);
+        public void Dispose() => _inner.Dispose();
+        public ValueTask DisposeAsync() => _inner.DisposeAsync();
+
+        public Task AcknowledgeAsync(Message message, CancellationToken cancellationToken = default)
+            => _inner.AcknowledgeAsync(message, cancellationToken);
+
+        public Task PurgeAsync(CancellationToken cancellationToken = default)
+            => _inner.PurgeAsync(cancellationToken);
+
+        public async Task<Message> ReceiveAsync(TimeSpan? timeout, CancellationToken cancellationToken = default)
+        {
+            // Redis BLPOP needs at least 1s to work reliably in async mode,
+            // matching the sync consumer's enforcement in RedisMessageConsumer.Receive
+            if (timeout != null && timeout.Value.TotalSeconds < 1)
+                timeout = TimeSpan.FromSeconds(1);
+            return await _inner.ReceiveAsync(timeout, cancellationToken);
+        }
+
+        public Task<bool> RejectAsync(Message message, MessageRejectionReason? reason = null, CancellationToken cancellationToken = default)
+            => _inner.RejectAsync(message, reason, cancellationToken);
+
+        public Task NackAsync(Message message, CancellationToken cancellationToken = default)
+            => _inner.NackAsync(message, cancellationToken);
+
+        public async Task<bool> RequeueAsync(Message message, TimeSpan? timeOut = null, CancellationToken cancellationToken = default)
+        {
+            var originalId = GetOriginalMessageId(message);
+
+            if (!message.Header.Bag.ContainsKey(Message.OriginalMessageIdHeaderName))
+                message.Header.Bag[Message.OriginalMessageIdHeaderName] = message.Header.MessageId.ToString();
+
+            _requeueCounts.TryGetValue(originalId, out var count);
+            count++;
+            _requeueCounts[originalId] = count;
+
+            // The delivery budget is NOT enforced here. Reactor and Proactor own it: they call
+            // UpdateHandledCount, test HandledCountReached(RequeueCount), and reject with
+            // DeliveryError when it is spent. This wrapper used to do the same thing at channel
+            // level, which meant the budget-exhaustion behaviour could pass on the harness's copy
+            // of the rule while the product's copy was untested - and would have kept passing had
+            // the two diverged. Tracking the original message id is harness bookkeeping, so it
+            // stays; deciding when a message dies is production behaviour, so it does not.
+
+            return await _inner.RequeueAsync(message, timeOut, cancellationToken);
+        }
+
+        private static string GetOriginalMessageId(Message message)
+        {
+            return message.Header.Bag.TryGetValue(Message.OriginalMessageIdHeaderName, out var id)
+                ? id?.ToString() ?? message.Header.MessageId.ToString()
+                : message.Header.MessageId.ToString();
+        }
+    }
+
+    /// <summary>
+    /// Channel decorator that tracks requeue count per original message ID and
+    /// rejects (sending to DLQ) after the max requeue count is reached.
+    /// </summary>
+    private class RequeueTrackingChannelSync : IAmAChannelSync
+    {
+        private readonly IAmAChannelSync _inner;
+        private readonly Dictionary<string, int> _requeueCounts = new();
+
+        public RequeueTrackingChannelSync(IAmAChannelSync inner)
+        {
+            _inner = inner;
+        }
+
+        public ChannelName Name => _inner.Name;
+        public RoutingKey RoutingKey => _inner.RoutingKey;
+        public void Enqueue(params Message[] messages) => _inner.Enqueue(messages);
+        public void Stop(RoutingKey topic) => _inner.Stop(topic);
+        public void Dispose() => _inner.Dispose();
+
+        public void Acknowledge(Message message) => _inner.Acknowledge(message);
+        public void Purge() => _inner.Purge();
+        public Message Receive(TimeSpan? timeout) => _inner.Receive(timeout);
+
+        public bool Reject(Message message, MessageRejectionReason? reason = null)
+            => _inner.Reject(message, reason);
+
+        public void Nack(Message message) => _inner.Nack(message);
+
+        public bool Requeue(Message message, TimeSpan? timeOut = null)
+        {
+            var originalId = GetOriginalMessageId(message);
+
+            if (!message.Header.Bag.ContainsKey(Message.OriginalMessageIdHeaderName))
+                message.Header.Bag[Message.OriginalMessageIdHeaderName] = message.Header.MessageId.ToString();
+
+            _requeueCounts.TryGetValue(originalId, out var count);
+            count++;
+            _requeueCounts[originalId] = count;
+
+            // The delivery budget is NOT enforced here. Reactor and Proactor own it: they call
+            // UpdateHandledCount, test HandledCountReached(RequeueCount), and reject with
+            // DeliveryError when it is spent. This wrapper used to do the same thing at channel
+            // level, which meant the budget-exhaustion behaviour could pass on the harness's copy
+            // of the rule while the product's copy was untested - and would have kept passing had
+            // the two diverged. Tracking the original message id is harness bookkeeping, so it
+            // stays; deciding when a message dies is production behaviour, so it does not.
+
+            return _inner.Requeue(message, timeOut);
+        }
+
+        private static string GetOriginalMessageId(Message message)
+        {
+            return message.Header.Bag.TryGetValue(Message.OriginalMessageIdHeaderName, out var id)
+                ? id?.ToString() ?? message.Header.MessageId.ToString()
+                : message.Header.MessageId.ToString();
+        }
+    }
+}

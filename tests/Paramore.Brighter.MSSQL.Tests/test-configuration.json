@@ -1,0 +1,30 @@
+{
+  "Namespace": "Paramore.Brighter.MSSQL.Tests",
+  "Outboxes": {
+    "Text": {
+      "Transaction": "System.Data.Common.DbTransaction",
+      "OutboxProvider": "MSSQLTextOutboxProvider",
+      "Category": "MSSQL",
+      "CollectionName": "MSSQLTextOutbox"
+    },
+    "Binary": {
+      "Transaction": "System.Data.Common.DbTransaction",
+      "OutboxProvider": "MSSQLBinaryOutboxProvider",
+      "Category": "MSSQL",
+      "CollectionName": "MSSQLBinaryOutbox"
+    }
+  },
+  "MessagingGateway": {
+    "MessageGatewayProvider": "Paramore.Brighter.MSSQL.Tests.MessagingGateway.MsSqlMessageGatewayProvider",
+    "Publication": "Paramore.Brighter.Publication",
+    "Subscription": "Paramore.Brighter.MessagingGateway.MsSql.MsSqlSubscription",
+    "Category": "MSSQL",
+    "CollectionName": "MSSQLMessagingGateway",
+    "LedgerKey": "MSSQL / MSSQLMessagingGateway",
+    "HasSupportToPublishConfirmation": false,
+    "HasSupportToValidateBrokerExistence": false
+  },
+  "GatewayConformance": {
+    "SubscriptionType": "Paramore.Brighter.MessagingGateway.MsSql.MsSqlSubscription"
+  }
+}

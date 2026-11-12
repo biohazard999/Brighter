@@ -1,0 +1,105 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using Microsoft.Extensions.Time.Testing;
+using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
+using Paramore.Brighter.Extensions;
+using Paramore.Brighter.JsonConverters;
+using Paramore.Brighter.Observability;
+using Polly;
+using Polly.Registry;
+using Xunit;
+
+namespace Paramore.Brighter.Core.Tests.CommandProcessors.Deposit
+{
+    public class CommandProcessorDepositPostWithTransactionTests
+    {
+        private readonly RoutingKey _routingKey = new("MyCommand");
+
+        private readonly CommandProcessor _commandProcessor;
+        private readonly MyCommand _myCommand = new MyCommand();
+        private readonly Message _message;
+        private readonly SpyOutbox _spyOutbox;
+        private readonly SpyTransactionProvider _transactionProvider = new();
+        private readonly InternalBus _internalBus = new();
+
+        public CommandProcessorDepositPostWithTransactionTests()
+        {
+            _myCommand.Value = "Hello World";
+
+            var timeProvider = new FakeTimeProvider();
+            InMemoryMessageProducer messageProducer = new(_internalBus, new Publication { Topic = _routingKey, RequestType = typeof(MyCommand) });
+
+            _message = new Message(
+                new MessageHeader(_myCommand.Id, _routingKey, MessageType.MT_COMMAND),
+                new MessageBody(JsonSerializer.Serialize(_myCommand, JsonSerialisationOptions.Options))
+                );
+
+            var messageMapperRegistry = new MessageMapperRegistry(
+                new SimpleMessageMapperFactory((_) => new MyCommandMessageMapper()),
+                null);
+            messageMapperRegistry.Register<MyCommand, MyCommandMessageMapper>();
+
+            var producerRegistry =
+                new ProducerRegistry(new Dictionary<RoutingKey, IAmAMessageProducer>
+                {
+                    { _routingKey, messageProducer },
+                });
+            
+            var resiliencePipelineRegistry = new ResiliencePipelineRegistry<string>()
+                .AddBrighterDefault();
+
+            var tracer = new BrighterTracer();
+            _spyOutbox = new SpyOutbox {Tracer = tracer};
+            
+            IAmAnOutboxProducerMediator bus = new OutboxProducerMediator<Message, SpyTransaction>(
+                producerRegistry, 
+                resiliencePipelineRegistry,
+                messageMapperRegistry,
+                new EmptyMessageTransformerFactory(),
+                new EmptyMessageTransformerFactoryAsync(),
+                tracer,
+                new FindPublicationByPublicationTopicOrRequestType(),
+                _spyOutbox
+            );
+        
+            var scheduler = new InMemorySchedulerFactory();
+            _commandProcessor = new CommandProcessor(
+                new InMemoryRequestContextFactory(), 
+                new DefaultPolicy(),
+                resiliencePipelineRegistry,
+                bus,
+                scheduler,
+                typeof(SpyTransaction)
+            );
+        }
+
+
+        [Fact]
+        public void When_depositing_a_message_in_the_outbox_with_a_transaction()
+        {
+            //act
+            var postedMessageId = _commandProcessor.DepositPost(_myCommand, _transactionProvider);
+
+            //assert
+
+            //message should not be in the outbox
+            Assert.DoesNotContain(_spyOutbox.Messages, m => m.Message.Id == postedMessageId);
+
+            //message should be in the current transaction
+            var transaction = _transactionProvider.GetTransaction();
+            var message = transaction.Get(postedMessageId);
+            Assert.NotNull(message);
+
+            //message should not be posted
+            Assert.False(_internalBus.Stream(new RoutingKey(_routingKey)).Any());
+
+            //message should correspond to the command
+            Assert.Equal(_message.Id, message.Id);
+            Assert.Equal(_message.Body.Value, message.Body.Value);
+            Assert.Equal(_message.Header.Topic, message.Header.Topic);
+            Assert.Equal(_message.Header.MessageType, message.Header.MessageType);
+        }
+    }
+}

@@ -24,9 +24,6 @@ THE SOFTWARE. */
 
 using System;
 using System.Threading.Tasks;
-using FluentAssertions;
-using FluentAssertions.Extensions;
-using Newtonsoft.Json;
 using Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles;
 using Paramore.Brighter.Core.Tests.Monitoring.TestDoubles;
 using Xunit;
@@ -36,11 +33,13 @@ using Paramore.Brighter.Monitoring.Handlers;
 using Polly.Registry;
 using Microsoft.Extensions.DependencyInjection;
 using Paramore.Brighter.Extensions.DependencyInjection;
+using System.Text.Json;
+using Paramore.Brighter.JsonConverters;
 
 namespace Paramore.Brighter.Core.Tests.Monitoring
 {
     [Trait("Category", "Monitoring")]
-    public class MonitorHandlerPipelineAsyncTests 
+    public class MonitorHandlerPipelineAsyncTests
     {
         private readonly MyCommand _command;
         private readonly IAmACommandProcessor _commandProcessor;
@@ -61,14 +60,16 @@ namespace Paramore.Brighter.Core.Tests.Monitoring
             container.AddTransient<MonitorHandlerAsync<MyCommand>>();
             container.AddSingleton<IAmAControlBusSenderAsync>(_controlBusSender);
             container.AddSingleton(new MonitorConfiguration { IsMonitoringEnabled = true, InstanceName = "UnitTests" });
-
+            container.AddSingleton<IBrighterOptions>(new BrighterOptions {HandlerLifetime = ServiceLifetime.Transient});
+        
             var handlerFactory = new ServiceProviderHandlerFactory(container.BuildServiceProvider());
 
-            _commandProcessor = new CommandProcessor(registry, (IAmAHandlerFactoryAsync)handlerFactory, new InMemoryRequestContextFactory(), new PolicyRegistry());
+            _commandProcessor = new CommandProcessor(registry, handlerFactory, new InMemoryRequestContextFactory(), 
+                new PolicyRegistry(), new ResiliencePipelineRegistry<string>(), new InMemorySchedulerFactory());
 
             _command = new MyCommand();
 
-            _originalRequestAsJson = JsonConvert.SerializeObject(_command);
+            _originalRequestAsJson = JsonSerializer.Serialize(_command, JsonSerialisationOptions.Options);
 
             _at = DateTime.UtcNow.AddMilliseconds(-500);
         }
@@ -81,29 +82,29 @@ namespace Paramore.Brighter.Core.Tests.Monitoring
             _afterEvent = _controlBusSender.Observe<MonitorEvent>();
 
             //_should_have_an_instance_name_before
-            _beforeEvent.InstanceName.Should().Be("UnitTests");
+            Assert.Equal("UnitTests", _beforeEvent.InstanceName);
             //_should_post_the_event_type_to_the_control_bus_before
-            _beforeEvent.EventType.Should().Be(MonitorEventType.EnterHandler);
+            Assert.Equal(MonitorEventType.EnterHandler, _beforeEvent.EventType);
             //_should_post_the_handler_fullname_to_the_control_bus_before
-            _beforeEvent.HandlerFullAssemblyName.Should().Be(typeof(MyMonitoredHandlerAsync).AssemblyQualifiedName);
+            Assert.Equal(typeof(MyMonitoredHandlerAsync).AssemblyQualifiedName, _beforeEvent.HandlerFullAssemblyName);
             //_should_post_the_handler_name_to_the_control_bus_before
-            _beforeEvent.HandlerName.Should().Be(typeof(MyMonitoredHandlerAsync).FullName);
+            Assert.Equal(typeof(MyMonitoredHandlerAsync).FullName, _beforeEvent.HandlerName);
             //_should_include_the_underlying_request_details_before
-            _beforeEvent.RequestBody.Should().Be(_originalRequestAsJson);
+            Assert.Equal(_originalRequestAsJson, _beforeEvent.RequestBody);
             //should_post_the_time_of_the_request_before
-            _beforeEvent.EventTime.AsUtc().Should().BeCloseTo(_at.AsUtc(), 1000);
+            Assert.True((_beforeEvent.EventTime.ToUniversalTime()) >= ((_at.ToUniversalTime()) - (TimeSpan.FromSeconds(1))) && (_beforeEvent.EventTime.ToUniversalTime()) <= ((_at.ToUniversalTime()) + (TimeSpan.FromSeconds(1))));
             //_should_have_an_instance_name_after
-            _afterEvent.InstanceName.Should().Be("UnitTests");
+            Assert.Equal("UnitTests", _afterEvent.InstanceName);
             //_should_post_the_event_type_to_the_control_bus_after
-            _afterEvent.EventType.Should().Be(MonitorEventType.ExitHandler);
+            Assert.Equal(MonitorEventType.ExitHandler, _afterEvent.EventType);
             //_should_post_the_handler_fullname_to_the_control_bus_after
-            _afterEvent.HandlerFullAssemblyName.Should().Be(typeof(MyMonitoredHandlerAsync).AssemblyQualifiedName);
+            Assert.Equal(typeof(MyMonitoredHandlerAsync).AssemblyQualifiedName, _afterEvent.HandlerFullAssemblyName);
             //_should_post_the_handler_name_to_the_control_bus_after
-            _afterEvent.HandlerName.Should().Be(typeof(MyMonitoredHandlerAsync).FullName);
+            Assert.Equal(typeof(MyMonitoredHandlerAsync).FullName, _afterEvent.HandlerName);
             //_should_include_the_underlying_request_details_after
-            _afterEvent.RequestBody.Should().Be(_originalRequestAsJson);
+            Assert.Equal(_originalRequestAsJson, _afterEvent.RequestBody);
             //should_post_the_time_of_the_request_after
-            _afterEvent.EventTime.AsUtc().Should().BeAfter(_at.AsUtc());
+            Assert.True((_afterEvent.EventTime.ToUniversalTime()) > (_at.ToUniversalTime()));
         }
-   }
+    }
 }

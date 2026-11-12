@@ -3,12 +3,12 @@ using Paramore.Brighter.Logging.Attributes;
 
 namespace Paramore.Brighter.Core.Tests.Logging.TestDoubles
 {
-    class MyLoggedHandler : RequestHandler<MyCommand>
+    sealed class MyLoggedHandler : RequestHandler<MyCommand>
     {
         [RequestLogging(0, HandlerTiming.Before)]
-        public override MyCommand Handle(MyCommand command)
+        public override MyCommand Handle(MyCommand myCommand)
         {
-            return base.Handle(command);
+            return base.Handle(myCommand);
         }
     }
 }

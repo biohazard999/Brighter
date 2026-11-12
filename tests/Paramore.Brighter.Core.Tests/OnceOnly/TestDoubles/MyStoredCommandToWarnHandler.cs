@@ -28,16 +28,16 @@ using Paramore.Brighter.Inbox.Attributes;
 
 namespace Paramore.Brighter.Core.Tests.OnceOnly.TestDoubles
 {
-    internal class MyStoredCommandToWarnHandler : RequestHandler<MyCommand>
+    internal sealed class MyStoredCommandToWarnHandler : RequestHandler<MyCommand>
     {
         public static int ReceivedCount { get; private set; }
         
         [UseInbox(1, onceOnly: true, onceOnlyAction: OnceOnlyAction.Warn, contextKey: typeof(MyStoredCommandToWarnHandler))]
-        public override MyCommand Handle(MyCommand command)
+        public override MyCommand Handle(MyCommand myCommand)
         {
             ReceivedCount++;
 
-            return base.Handle(command);
+            return base.Handle(myCommand);
         }
     }
 }

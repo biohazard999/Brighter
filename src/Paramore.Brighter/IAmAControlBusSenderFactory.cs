@@ -23,6 +23,9 @@ THE SOFTWARE. */
 
 #endregion
 
+using System.Collections.Generic;
+using Paramore.Brighter.Observability;
+
 namespace Paramore.Brighter
 {
     /// <summary>
@@ -34,10 +37,19 @@ namespace Paramore.Brighter
         /// <summary>
         /// Creates the specified configuration.
         /// </summary>
-        /// <param name="gateway">The gateway to the control bus</param>
-        /// <param name="logger">The logger to use</param>
         /// <param name="outbox">The outbox to record outbound messages on the control bus</param>
+        /// <param name="producerRegistry">The list of producers to send with</param>
+        /// <param name="tracer">The tracer lets us create open telemetry information</param>
+        /// <param name="requestSchedulerFactory">The request scheduler factory.</param>
+        /// <param name="publicationFinder">The publication finder.</param>
         /// <returns>IAmAControlBusSender.</returns>
-        IAmAControlBusSender Create(IAmAnOutbox<Message> outbox, IAmAMessageProducer gateway);
+        IAmAControlBusSender Create<T, TTransaction>(
+            IAmAnOutbox outbox, 
+            IAmAProducerRegistry producerRegistry, 
+            BrighterTracer tracer,
+            IAmARequestSchedulerFactory? requestSchedulerFactory = null,
+            IAmAPublicationFinder? publicationFinder = null
+        )
+            where T: Message;
     }
 }

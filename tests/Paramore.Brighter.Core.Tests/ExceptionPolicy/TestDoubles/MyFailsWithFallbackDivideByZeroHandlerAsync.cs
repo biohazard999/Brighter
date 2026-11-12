@@ -31,7 +31,7 @@ using Paramore.Brighter.Policies.Handlers;
 
 namespace Paramore.Brighter.Core.Tests.ExceptionPolicy.TestDoubles
 {
-    internal class MyFailsWithFallbackDivideByZeroHandlerAsync : RequestHandlerAsync<MyCommand>
+    internal sealed class MyFailsWithFallbackDivideByZeroHandlerAsync : RequestHandlerAsync<MyCommand>
     {
         public  bool FallbackCalled { get; set; }
         public  bool ReceivedCommand { get; set; }
@@ -39,7 +39,7 @@ namespace Paramore.Brighter.Core.Tests.ExceptionPolicy.TestDoubles
 
         [FallbackPolicyAsync(true, false, 1)]
         [UsePolicyAsync("MyDivideByZeroPolicy", 2)]
-        public override async Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default(CancellationToken))
+        public override async Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
             {
@@ -51,7 +51,7 @@ namespace Paramore.Brighter.Core.Tests.ExceptionPolicy.TestDoubles
             throw new DivideByZeroException();
         }
 
-        public override async Task<MyCommand> FallbackAsync(MyCommand command, CancellationToken cancellationToken = default(CancellationToken))
+        public override async Task<MyCommand> FallbackAsync(MyCommand command, CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
             {

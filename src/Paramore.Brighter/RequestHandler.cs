@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -25,7 +25,9 @@ THE SOFTWARE. */
 using System;
 using System.Linq;
 using System.Reflection;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Logging;
+using Paramore.Brighter.Observability;
 using Paramore.Brighter.Policies.Attributes;
 using Paramore.Brighter.Policies.Handlers;
 using Polly.CircuitBreaker;
@@ -46,17 +48,18 @@ namespace Paramore.Brighter
     /// within your derived class handler to forward the call to the next handler in the chain.
     /// </summary>
     /// <typeparam name="TRequest">The type of the t request.</typeparam>
-    public abstract class RequestHandler<TRequest> : IHandleRequests<TRequest> where TRequest : class, IRequest
+    /// <param name="instrumentationOptions">The <see cref="InstrumentationOptions"/> for how deep should the instrumentation go?</param>
+    public abstract partial class RequestHandler<TRequest>(InstrumentationOptions instrumentationOptions = InstrumentationOptions.All) : IHandleRequests<TRequest> where TRequest : class, IRequest
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<RequestHandler<TRequest>>);
+        private static readonly ILogger s_logger= ApplicationLogging.CreateLogger<RequestHandler<TRequest>>();
 
-        private IHandleRequests<TRequest> _successor;
+        private IHandleRequests<TRequest>? _successor;
 
         /// <summary>
         /// Gets or sets the context.
         /// </summary>
         /// <value>The context.</value>
-        public IRequestContext Context { get; set; }
+        public IRequestContext? Context { get; set; }
 
         /// <summary>
         /// Gets the name.
@@ -96,17 +99,22 @@ namespace Paramore.Brighter
         /// <summary>
         /// Handles the specified command.
         /// </summary>
-        /// <param name="command">The command.</param>
+        /// <param name="request">The command.</param>
         /// <returns>TRequest.</returns>
-        public virtual TRequest Handle(TRequest command)
+        public virtual TRequest Handle(TRequest request)
         {
+            if (Context?.Span != null)
+            {
+                BrighterTracer.WriteHandlerEvent(Context.Span, this.GetType().Name, isAsync:false, instrumentationOptions, isSink:_successor == null);
+            }   
+            
             if (_successor != null)
             {
-                _logger.Value.DebugFormat("Passing request from {0} to {1}", Name, _successor.Name);
-                return _successor.Handle(command);
+                Log.PassingRequestFromTo(s_logger, Name, _successor.Name);
+                return _successor.Handle(request);
             }
 
-            return command;
+            return request;
         }
 
         /// <summary>
@@ -119,7 +127,7 @@ namespace Paramore.Brighter
         /// Steps that don't know how to handle should pass through.
         /// Useful alternatives for Fallback are to try via the cache.
         /// Note that a Fallback handler implementation should not catch exceptions in the <see cref="Fallback"/> chain to avoid an infinite loop.
-        /// Call <see cref="Successor"/>.<see cref="Handle"/> if having provided a Fallback you want the chain to return to the 'happy' path. Excerise caution here though
+        /// Call <see cref="Successor"/>.<see cref="Handle"/> if having provided a Fallback you want the chain to return to the 'happy' path. Exercise caution here though
         /// as you do not know who generated the exception that caused the fallback chain.
         /// For this reason, the <see cref="FallbackPolicyHandler{TRequest}"/> puts the exception in the request context.
         /// When the <see cref="FallbackPolicyAttribute"/> is set on the <see cref="Handle"/> method of a derived class
@@ -130,9 +138,14 @@ namespace Paramore.Brighter
         /// <returns>TRequest.</returns>
         public virtual TRequest Fallback(TRequest command)
         {
+            if (Context?.Span != null)
+            {
+                BrighterTracer.WriteHandlerEvent(Context.Span, $"{this.GetType().Name} Fallback", isAsync:false, instrumentationOptions, isSink:_successor == null);
+            }   
+            
             if (_successor != null)
             {
-                _logger.Value.DebugFormat("Falling back from {0} to {1}", Name, _successor.Name);
+                Log.FallingBackFromTo(s_logger, Name, _successor.Name);
                 return _successor.Fallback(command);
             }
 
@@ -144,15 +157,20 @@ namespace Paramore.Brighter
         /// Initializes from attribute parameters.
         /// </summary>
         /// <param name="initializerList">The initializer list.</param>
-        public virtual void InitializeFromAttributeParams(params object[] initializerList) { }
+        public virtual void InitializeFromAttributeParams(params object?[] initializerList) { }
 
 
         internal MethodInfo FindHandlerMethod()
+            => HandlerMethodDiscovery.FindHandlerMethod(GetType(), typeof(TRequest));
+
+        private static partial class Log
         {
-            var methods = GetType().GetTypeInfo().GetMethods();
-            return methods
-                .Where(method => method.Name == nameof(Handle))
-                .SingleOrDefault(method => method.GetParameters().Length == 1 && method.GetParameters().Single().ParameterType == typeof(TRequest));
+            [LoggerMessage(LogLevel.Debug, "Passing request from {HandlerName} to {NextHandler}")]
+            public static partial void PassingRequestFromTo(ILogger logger, HandlerName handlerName, HandlerName nextHandler);
+
+            [LoggerMessage(LogLevel.Debug, "Falling back from {HandlerName} to {NextHandler}")]
+            public static partial void FallingBackFromTo(ILogger logger, HandlerName handlerName, HandlerName nextHandler);
         }
     }
 }
+

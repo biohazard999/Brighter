@@ -1,19 +1,35 @@
-using Newtonsoft.Json;
+﻿using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Paramore.Brighter.Extensions;
+using Paramore.Brighter.JsonConverters;
 using Paramore.Brighter.Monitoring.Events;
 
 namespace Paramore.Brighter.Monitoring.Mappers
 {
-    public class MonitorEventMessageMapper : IAmAMessageMapper<MonitorEvent>
+    public class MonitorEventMessageMapper : IAmAMessageMapper<MonitorEvent>, IAmAMessageMapperAsync<MonitorEvent>
     {
+        public IRequestContext? Context { get; set; }
+
+        /// <inheritdoc />
+        public Task<Message> MapToMessageAsync(MonitorEvent request, Publication publication,
+            CancellationToken cancellationToken = default)
+            => Task.FromResult(MapToMessage(request, publication));
+
+        /// <inheritdoc />
+        public Task<MonitorEvent> MapToRequestAsync(Message message, CancellationToken cancellationToken = default)
+            => Task.FromResult(MapToRequest(message));
+
         /// <summary>
         /// Maps to message.
         /// </summary>
         /// <param name="request">The request.</param>
+        /// <param name="publication">The publication with metadata</param>
         /// <returns>Message.</returns>
-        public Message MapToMessage(MonitorEvent request)
+        public Message MapToMessage(MonitorEvent request, Publication publication)
         {
-            var header = new MessageHeader(messageId: request.Id, topic: "paramore.monitoring.event", messageType: MessageType.MT_COMMAND);
-            var body = new MessageBody(JsonConvert.SerializeObject(request));
+            var header = new MessageHeader(messageId: request.Id, topic: publication.Topic ?? RoutingKey.Empty, messageType: request.RequestToMessageType());
+            var body = new MessageBody(JsonSerializer.Serialize(request, JsonSerialisationOptions.Options));
             var message = new Message(header, body);
             return message;
         }
@@ -25,7 +41,7 @@ namespace Paramore.Brighter.Monitoring.Mappers
         /// <returns>TRequest.</returns>
         public MonitorEvent MapToRequest(Message message)
         {
-            return JsonConvert.DeserializeObject<MonitorEvent>(message.Body.Value);
+            return JsonSerializer.Deserialize<MonitorEvent>(message.Body.Value, JsonSerialisationOptions.Options)!;
         }
     }
 }

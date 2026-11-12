@@ -27,24 +27,27 @@ using System;
 namespace Paramore.Brighter
 {
     /// <summary>
-    /// Interface IAmAnAysyncHandlerFactory
+    /// Interface IAmAnAsyncHandlerFactory
     /// We do not know how to create instances of <see cref="IHandleRequestsAsync"/> implemented by your application, but need to create instances to instantiate a pipeline.
     /// To achieve this we require clients of the Paramore.Brighter library need to implement <see cref="IAmAHandlerFactoryAsync"/> to provide 
     /// instances of their <see cref="IHandleRequestsAsync"/> types. You need to provide a Handler Factory to support all <see cref="IHandleRequestsAsync"/> registered 
     /// with <see cref="IAmASubscriberRegistry"/>. Typically you would use an IoC container to implement the Handler Factory.
     /// </summary>
-    public interface IAmAHandlerFactoryAsync
+    public interface IAmAHandlerFactoryAsync : IAmAHandlerFactory
     {
         /// <summary>
         /// Creates the specified async handler type.
         /// </summary>
         /// <param name="handlerType">Type of the handler.</param>
+        /// <param name="lifetime">The brighter Handler lifetime</param>
         /// <returns>IHandleRequestsAsync.</returns>
-        IHandleRequestsAsync Create(Type handlerType);
+        IHandleRequestsAsync? Create(Type handlerType, IAmALifetime lifetime);
+
         /// <summary>
         /// Releases the specified async handler.
         /// </summary>
         /// <param name="handler">The handler.</param>
-        void Release(IHandleRequestsAsync handler);
+        /// <param name="lifetime">The brighter Handler lifetime.</param>
+        void Release(IHandleRequestsAsync? handler, IAmALifetime lifetime);
     }
 }

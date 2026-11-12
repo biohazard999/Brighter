@@ -1,31 +1,38 @@
-using FakeItEasy;
-using FluentAssertions;
+using System;
+using System.Collections.Generic;
+using System.Transactions;
+using Paramore.Brighter.Observability;
 using Xunit;
 
 namespace Paramore.Brighter.Core.Tests.ControlBus
 {
     public class ControlBusSenderFactoryTests
     {
-        private IAmAControlBusSender s_sender;
-        private readonly IAmAControlBusSenderFactory s_senderFactory;
-        private readonly IAmAnOutbox<Message> s_fakeOutbox;
-        private readonly IAmAMessageProducer s_fakeGateway;
+        private IAmAControlBusSender? _sender;
+        private readonly IAmAControlBusSenderFactory _senderFactory;
+        private readonly IAmAnOutboxSync<Message, CommittableTransaction> _outbox;
+        private readonly IAmAMessageProducerSync _gateway;
 
         public ControlBusSenderFactoryTests()
         {
-            s_fakeOutbox = A.Fake<IAmAnOutbox<Message>>();
-            s_fakeGateway = A.Fake<IAmAMessageProducer>();
- 
-            s_senderFactory = new ControlBusSenderFactory();
+            _outbox = new InMemoryOutbox(TimeProvider.System);
+            _gateway = new InMemoryMessageProducer(new InternalBus());
+
+            _senderFactory = new ControlBusSenderFactory();
         }
 
         [Fact]
         public void When_creating_a_control_bus_sender()
         {
-            s_sender = s_senderFactory.Create(s_fakeOutbox, s_fakeGateway);
+            _sender = _senderFactory.Create<Message, CommittableTransaction>(
+                _outbox,
+                new ProducerRegistry(new Dictionary<RoutingKey, IAmAMessageProducer>
+                {
+                    {new RoutingKey("MyTopic"), _gateway},
+                }),
+                tracer: new BrighterTracer());
 
-            //_should_create_a_control_bus_sender
-            s_sender.Should().NotBeNull();
+            Assert.NotNull(_sender);
         }
     }
 }

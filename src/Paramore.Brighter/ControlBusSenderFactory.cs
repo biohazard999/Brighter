@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 
 /* The MIT License (MIT)
 Copyright © 2015 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
@@ -23,34 +23,62 @@ THE SOFTWARE. */
 
 #endregion
 
+using System.Transactions;
+using Paramore.Brighter.CircuitBreaker;
+using Paramore.Brighter.Extensions;
 using Paramore.Brighter.Monitoring.Events;
 using Paramore.Brighter.Monitoring.Mappers;
+using Paramore.Brighter.Observability;
+using Polly.Registry;
 
 namespace Paramore.Brighter
 {
     /// <summary>
-    /// Class ControlBusSenderFactory. Helper for creating instances of a control bus (which requires messaging, but not subcribers).
+    /// Class ControlBusSenderFactory. Helper for creating instances of a control bus (which requires messaging, but not subscribers).
     /// </summary>
     public class ControlBusSenderFactory : IAmAControlBusSenderFactory
     {
         /// <summary>
         /// Creates the specified configuration.
         /// </summary>
-        /// <param name="gateway">The gateway to the control bus to send messages</param>
-        /// <param name="logger">The logger to use</param>
         /// <param name="outbox">The outbox for outgoing messages to the control bus</param>
+        /// <param name="producerRegistry"></param>
+        /// <param name="tracer"></param>
+        /// <param name="requestSchedulerFactory"></param>
         /// <returns>IAmAControlBusSender.</returns>
-        public IAmAControlBusSender Create(IAmAnOutbox<Message> outbox, IAmAMessageProducer gateway)
+        public IAmAControlBusSender Create<T, TTransaction>(IAmAnOutbox outbox, 
+            IAmAProducerRegistry producerRegistry,
+            BrighterTracer tracer,
+            IAmARequestSchedulerFactory? requestSchedulerFactory = null,
+            IAmAPublicationFinder? publicationFinder = null)
+            where T : Message
         {
-            var mapper = new MessageMapperRegistry(new SimpleMessageMapperFactory((_) => new MonitorEventMessageMapper()));
+            var mapper = new MessageMapperRegistry(
+                new SimpleMessageMapperFactory((_) => new MonitorEventMessageMapper()),
+                new SimpleMessageMapperFactoryAsync((_) => new MonitorEventMessageMapper()));
             mapper.Register<MonitorEvent, MonitorEventMessageMapper>();
+            mapper.RegisterAsync<MonitorEvent, MonitorEventMessageMapper>();
 
-            return new ControlBusSender(CommandProcessorBuilder.With()
-                    .Handlers(new HandlerConfiguration())
-                    .DefaultPolicy()
-                    .TaskQueues(new MessagingConfiguration(outbox, gateway, mapper))
-                    .RequestContextFactory(new InMemoryRequestContextFactory())
-                    .Build()
+            var mediator = new OutboxProducerMediator<Message, CommittableTransaction>(
+                producerRegistry: producerRegistry,
+                resiliencePipelineRegistry: new ResiliencePipelineRegistry<string>().AddBrighterDefault(),
+                mapperRegistry: mapper,
+                messageTransformerFactory: new EmptyMessageTransformerFactory(),
+                messageTransformerFactoryAsync: new EmptyMessageTransformerFactoryAsync(), tracer: tracer,
+                outbox: outbox,
+                outboxCircuitBreaker: new InMemoryOutboxCircuitBreaker(),
+                publicationFinder: publicationFinder ?? new FindPublicationByPublicationTopicOrRequestType()
+                ); 
+            
+            return new ControlBusSender(
+                CommandProcessorBuilder.StartNew()
+                .Handlers(new HandlerConfiguration())
+                .DefaultResilience()
+                .ExternalBus(ExternalBusType.FireAndForget, mediator)   
+                .ConfigureInstrumentation(null, InstrumentationOptions.None)
+                .RequestContextFactory(new InMemoryRequestContextFactory())
+                .RequestSchedulerFactory(requestSchedulerFactory ?? new InMemorySchedulerFactory())
+                .Build()
                 );
         }
     }

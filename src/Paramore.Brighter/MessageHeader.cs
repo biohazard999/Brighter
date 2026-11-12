@@ -1,4 +1,5 @@
-#region Licence
+﻿#region Licence
+
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -24,12 +25,18 @@ THE SOFTWARE. */
 
 using System;
 using System.Collections.Generic;
+using System.Net.Mime;
+using System.Threading;
+using System.Text.Json.Serialization;
+using Paramore.Brighter.JsonConverters;
+using Paramore.Brighter.NJsonConverters;
+using Paramore.Brighter.Observability;
 
 namespace Paramore.Brighter
 {
     /// <summary>
     /// Enum MessageType
-    /// The type of a message, used on the receiving side of a Task Queue to handle the message appropriately
+    /// The legacy transport classification and control signal for a message.
     /// </summary>
     public enum MessageType
     {
@@ -37,32 +44,33 @@ namespace Paramore.Brighter
         /// The message could not be read
         /// </summary>
         MT_UNACCEPTABLE = -1,
+
         /// <summary>
         /// The message type has not been configured
         /// </summary>
         MT_NONE = 0,
+
         /// <summary>
         /// The message was sent as a command, and the producer intended it to be handled by a consumer
         /// </summary>
         MT_COMMAND = 1,
+
         /// <summary>
         /// The message was raised as an event and the producer does not care if anyone listens to it
         /// It only contains a simple notification, not the data of what changed
         /// </summary>
         MT_EVENT = 2,
+
         /// <summary>
         /// The message was raised as an event and the producer does not care if anyone listens to it
         /// It contains a notification of what changed
         /// </summary>
         MT_DOCUMENT = 3,
+
         /// <summary>
         /// A quit message, used to end a dispatcher's message pump
         /// </summary>
-        MT_QUIT = 4,
-        /// <summary>
-        /// We are a message used to provide a callback for an uncompleted task that has finished and should be scheduled
-        /// </summary>
-        MT_CALLBACK = 5,
+        MT_QUIT = 4
     }
 
     /// <summary>
@@ -71,116 +79,398 @@ namespace Paramore.Brighter
     /// </summary>
     public class MessageHeader : IEquatable<MessageHeader>
     {
-        public DateTime TimeStamp { get; set; }
         /// <summary>
-        /// Gets the identifier.
+        /// The default Brighter SpecVersion
         /// </summary>
-        /// <value>The identifier.</value>
-        public Guid Id { get; set; }
-        /// <summary>
-        /// Gets the topic.
-        /// </summary>
-        /// <value>The topic.</value>
-        public string Topic { get; set; }
-        /// <summary>
-        /// Gets the type of the message. Used for routing the message to a handler
-        /// </summary>
-        /// <value>The type of the message.</value>
-        public MessageType MessageType { get; set; }
+        public const string DefaultSpecVersion = "1.0";
 
         /// <summary>
-        /// Gets the bag.
+        /// The default Brighter source
+        /// </summary>
+        public const string DefaultSource = "http://goparamore.io";
+
+        /// <summary>
+        /// Bag keys that are internal to Brighter — set by the framework so a downstream
+        /// component (e.g. the outbox dispatcher) can read them, but not intended to travel
+        /// over the wire. Transports that copy <see cref="Bag"/> into their wire format must
+        /// skip keys for which <see cref="IsLocalHeader"/> returns true: either filter inline
+        /// (see ASB / RMQ / Kafka publishers) or call <see cref="BagWithoutLocalHeaders"/>
+        /// when serialising the bag in one go (see SNS / SQS / Redis publishers).
+        /// </summary>
+        /// <remarks>
+        /// Pre-populated with <see cref="Message.ProducerTopicHeaderName"/>. Use
+        /// <see cref="RegisterLocalHeader"/> from extension code to add additional keys.
+        /// The backing <see cref="HashSet{T}"/> is treated as a copy-on-write snapshot —
+        /// never mutated in place after publication — so reads are lock-free on the
+        /// message hot path; registrations are expected at startup and use a CAS loop
+        /// that allocates a new snapshot.
+        /// </remarks>
+        private static HashSet<string> s_localHeaderNames = new(StringComparer.Ordinal)
+        {
+            Message.ProducerTopicHeaderName
+        };
+
+        /// <summary>
+        /// Returns true when <paramref name="name"/> is a local-only bag key that must
+        /// not travel over the wire.
+        /// </summary>
+        public static bool IsLocalHeader(string name)
+            => Volatile.Read(ref s_localHeaderNames).Contains(name);
+
+        /// <summary>
+        /// Adds <paramref name="name"/> to the set of local bag keys. Idempotent.
+        /// Call once at startup from extension code that introduces a local-only bag key.
+        /// </summary>
+        public static void RegisterLocalHeader(string name)
+        {
+            while (true)
+            {
+                var snapshot = Volatile.Read(ref s_localHeaderNames);
+                if (snapshot.Contains(name))
+                    return;
+                var updated = new HashSet<string>(snapshot, StringComparer.Ordinal) { name };
+                if (ReferenceEquals(Interlocked.CompareExchange(ref s_localHeaderNames, updated, snapshot), snapshot))
+                    return;
+            }
+        }
+
+        /// <summary>
+        /// Returns a new dictionary containing every <see cref="Bag"/> entry whose key
+        /// is not a local header (see <see cref="IsLocalHeader"/>). For transports that
+        /// serialise the whole bag in one go (e.g. SNS/SQS/Redis emit it as a single JSON
+        /// property), pass this to the serialiser instead of <see cref="Bag"/> directly.
+        /// </summary>
+        public Dictionary<string, object> BagWithoutLocalHeaders()
+        {
+            var locals = Volatile.Read(ref s_localHeaderNames);
+            var copy = new Dictionary<string, object>(Bag.Count);
+            foreach (var kv in Bag)
+            {
+                if (!locals.Contains(kv.Key))
+                    copy[kv.Key] = kv.Value;
+            }
+            return copy;
+        }
+
+        /// <summary>
+        /// A property bag that can be used for extended header attributes.
+        /// Key names round-trip verbatim through Brighter's serialization, so you can read a key back
+        /// using the exact name you wrote (for example "SessionId"); Brighter no longer applies a naming
+        /// policy to bag keys.
         /// </summary>
         /// <value>The bag.</value>
-        public Dictionary<string, object> Bag { get; } = new Dictionary<string, object>();
+        public Dictionary<string, object> Bag { get; set; } = new();
+        
         /// <summary>
-        /// Gets the number of times this message has been seen 
+        /// The Baggage header is a W3C standard and is used to convey user-defined request or workflow information across systems.
+        /// It is not intended for telemetry data, but rather for user-defined metadata about a trace.
+        /// Each entry consists of a key-value pair where the key identifies the vendor and the value contains user-defined request or workflow data.
+        /// Whereas the <see cref="Bag"/> property is used for extended header attributes, the Baggage property is specifically for W3C Baggage.
         /// </summary>
-        public int HandledCount { get; set; }
+        /// <value>The baggage.</value>
+        public Baggage Baggage { get; set; } = new();
+        
         /// <summary>
-        /// Gets the number of milliseconds the message was instructed to be delayed for
+        /// OPTIONAL [Cloud Events] REQUIRED [Brighter]
+        /// Content type of data value. This attribute enables data to carry any type of content, whereby format and
+        /// encoding might differ from that of the chosen event format.
+        /// MUST adhere to the format specified in <see href="https://datatracker.ietf.org/doc/html/rfc2046">RFC 2046</see>
+        /// Because of the complexity of serializing if you do not know the type, we regard this as required even
+        /// though Cloud Events does not.
+        /// Default value is "appliacation/json; charset=utf-8"
         /// </summary>
-        public int DelayedMilliseconds { get; set; }
+        /// <value>The content type.</value>
+        [Newtonsoft.Json.JsonConverter(typeof(NContentTypePropertyConverter))]
+        public ContentType ContentType { get; set; }
 
         /// <summary>
         /// Gets or sets the correlation identifier. Used when doing Request-Reply instead of Publish-Subscribe,
         /// allows the originator to match responses to requests
         /// </summary>
         /// <value>The correlation identifier.</value>
-        public Guid CorrelationId { get; set; }
+        [JsonConverter(typeof(IdConverter))]
+        [Newtonsoft.Json.JsonConverter(typeof(NIdConverter))]
+        public Id CorrelationId { get; set; } = new("");
 
         /// <summary>
-        /// Gets or sets the ContentType used to describe how the message payload
-        /// has been serialized.  Default value is text/plain
+        /// OPTIONAL
+        /// From <see href="https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md#context-attributes">Cloud Events Spec</see>
+        /// Identifies the schema that data adheres to. Incompatible changes to the schema SHOULD be reflected by a different URI. 
         /// </summary>
-        public string ContentType { get; set; }
+        /// <value>The data schema.</value>
+        public Uri? DataSchema { get; set; }
+        
+        /// <summary>
+        /// OPTIONAL
+        /// From <see href="https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/extensions/dataref.md">Cloud Events Spec</see>
+        /// A reference to a location where the event payload is stored. The location MAY not be accessible without further information (e.g. a pre-shared secret).
+         ///Known as the "Claim Check Pattern", this attribute MAY be used for a variety of purposes:
+        ///  - If the Data is too large to be included in the message, the data is not present, and the consumer can retrieve it using this attribute.
+        ///  - If the consumer wants to verify that the Data has not been tampered with, it can retrieve it from a trusted source using this attribute.
+        ///  - If the Data MUST only be viewed by trusted consumers (e.g. personally identifiable information), only a trusted consumer can retrieve it using this attribute and a pre-shared secret.
+        /// </summary>
+        /// <value>The data reference.</value>
+        public string? DataRef { get; set; }
+        
+        /// <summary>
+        /// OPTIONAL
+        /// Internal usage. Gets or sets the requested delivery delay.
+        /// RabbitMQ clears this instruction on receipt; its elapsed native delay remains in Bag["x-delay"].
+        /// </summary>
+        /// <value>The delay.</value>
+        public TimeSpan Delayed { get; set; }
+        
+        /// <summary>
+        /// OPTIONAL
+        /// Internal usage. Gets the number of times this message has been seen 
+        /// </summary>
+        /// <value>The number of times this message has been handled.</value>
+        public int HandledCount { get; set; }
+        
+        /// <summary>
+        /// The identifier for an instance of a workflow. This is used to correlate messages that are part of a workflow.
+        /// </summary>
+        /// <remarks> Reserved for future use, currently not used in Brighter</remarks>
+        /// <value>The job identifier.</value>
+        [JsonConverter(typeof(IdConverter))]
+        [Newtonsoft.Json.JsonConverter(typeof(NIdConverter))]
+        public Id? JobId { get; }
 
         /// <summary>
+        /// REQUIRED
+        /// From <see href="https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md#context-attributes">Cloud Events Spec</see>
+        /// Identifies the event. Producers MUST ensure that source + id is unique for each distinct event.
+        /// If a duplicate event is re-sent (e.g. due to a network error) it MAY have the same id.
+        /// Consumers MAY assume that Events with identical source and id are duplicates.
+        /// </summary>
+        /// <value>The identifier.</value>
+        [JsonConverter(typeof(IdConverter))]
+        [Newtonsoft.Json.JsonConverter(typeof(NIdConverter))]
+        public Id MessageId { get; init; } = new("");
+
+        /// <summary>
+        /// Gets or sets the legacy transport classification and pump control signal.
+        /// </summary>
+        /// <value>The transport message type.</value>
+        /// <remarks>
+        /// The command/event distinction in this header is obsolete for application routing. The message pump
+        /// routes the mapped request using <see cref="ICommand"/> or <see cref="IEvent"/> instead.
+        /// This property is retained for wire compatibility and the <see cref="MessageType.MT_NONE"/>,
+        /// <see cref="MessageType.MT_UNACCEPTABLE"/> and <see cref="MessageType.MT_QUIT"/> control signals.
+        /// </remarks>
+        [Obsolete("Message type headers no longer determine request routing. Use ICommand or IEvent on the mapped request. Retained for wire compatibility and pump control signals.")]
+        public MessageType MessageType { get; set; }
+
+        /// <summary>
+        /// OPTIONAL
+        /// From <see href="https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/extensions/partitioning.md">Cloud Events Spec</see>       
+        /// If we are working with consistent hashing to distribute writes across multiple channels according to the
+        /// hash value of a partition key then we need to be able to set that key, so that we can distribute writes effectively.
+        /// </summary>
+        /// <value>The partition key.</value>
+        public PartitionKey PartitionKey { get; set; } = PartitionKey.Empty;
+        
+        /// <summary>
+        /// OPTIONAL
         /// Gets or sets the reply to topic. Used when doing Request-Reply instead of Publish-Subscribe to identify
         /// the queue that the sender is listening on. Usually a sender listens on a private queue, so that they
         /// do not have to filter replies intended for other listeners.
         /// </summary>
         /// <value>The reply to.</value>
-        public string ReplyTo { get; set; }
+        [JsonConverter(typeof(RoutingKeyConvertor))]
+        [Newtonsoft.Json.JsonConverter(typeof(NRoutingKeyConverter))]
+        public RoutingKey? ReplyTo { get; set; }
+        
+        /// <summary>
+        /// OPTIONAL
+        /// From <see href="https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md#context-attributes">Cloud Events Spec</see>
+        /// This describes the subject of the event in the context of the event producer (identified by source).
+        /// In publish-subscribe scenarios, a subscriber will typically subscribe to events emitted by a source,
+        /// but the source identifier alone might not be sufficient as a qualifier for any specific event if the
+        /// source context has internal sub-structure.
+        /// </summary>
+        public string? Subject { get; set; }
 
         /// <summary>
-        /// Intended for serialization, prefer a parameterized constructor in application code as a better 'pit of success'
+        /// REQUIRED
+        /// The version of the CloudEvents specification which the event uses. This enables the interpretation of the context.
+        /// Defaults tp 1.0
         /// </summary>
-        public MessageHeader() {}
+        /// <value>The spec version.</value>
+        public string SpecVersion { get; set; } = DefaultSpecVersion;
+        
+        /// <summary>
+        /// REQUIRED
+        /// From <see href="https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md#context-attributes">Cloud Events Spec</see>
+        /// Identifies the context in which an event happened. Often this will include information such as the type of
+        /// the event source, the organization publishing the event or the process that produced the event.
+        /// The exact syntax and semantics behind the data encoded in the URI is defined by the event producer.
+        /// Producers MUST ensure that source + id is unique for each distinct event.
+        /// Default: "http://goparamore.io" for backward compatibility as required
+        /// </summary>
+        public Uri Source { get; set; } = new Uri(DefaultSource);
+
+        /// <summary>
+        /// REQUIRED for sending. OPTIONAL for receiving
+        /// Gets the name of the channel that the message is on. Whilst this can be inferred from the message type, it is
+        /// used internally when we send the message to its destination
+        /// </summary>
+        /// <value>The topic.</value>
+        [JsonConverter(typeof(RoutingKeyConvertor))]
+        [Newtonsoft.Json.JsonConverter(typeof(NRoutingKeyConverter))]
+        public RoutingKey Topic { get; set; } = RoutingKey.Empty;
+
+        /// <summary>
+        /// REQUIRED
+        /// Internal usage. The date the message was created.
+        /// Defaults to now in UTC
+        /// </summary>
+        /// <value>The time stamp.</value>
+        public DateTimeOffset TimeStamp { get; init; }
+        
+        /// <summary>
+        /// REQUIRED (for OTel support, OPTIONAL in Cloud Events)
+        /// From <see href="https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/extensions/distributed-tracing.md">Cloud Events Spec</see>
+        /// See also <see href = "https://w3c.github.io/trace-context/#traceparent-header">W3C Trace Context</see>
+        ///  The traceparent HTTP header field identifies the incoming request in a tracing system. It has four fields:
+        ///     - version
+        ///     - trace-id
+        ///     - parent-id
+        ///     - trace-flags
+        /// In .NET it is set from Activity.Current.Id
+        /// </summary>
+        /// <value>The traceparent.</value>
+        [JsonConverter(typeof(TraceParentConverter))]
+        [Newtonsoft.Json.JsonConverter(typeof(NTraceParentConverter))]
+        public TraceParent? TraceParent { get; set; }
+
+        /// <summary>
+        /// OPTIONAL
+        /// From <see href="https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/extensions/distributed-tracing.md">Cloud Events Spec</see>
+        /// See also <see href = "https://w3c.github.io/trace-context/#tracestate-header">W3C Trace Context</see>
+        /// Provides additional vendor-specific trace identification information across different distributed tracing systems
+        /// and is a companion header for the traceparent field. It also conveys information about the request’s position
+        /// in multiple distributed tracing graphs.
+        /// The tracestate HTTP header MUST NOT be used for any properties that are not defined by a tracing system. 
+        /// </summary>
+        /// <value>The tracestate.</value>
+        [JsonConverter(typeof(TraceStateConverter))]
+        [Newtonsoft.Json.JsonConverter(typeof(NTraceStateConverter))]
+        public TraceState? TraceState { get; set; }
+
+        /// <summary>
+        /// REQUIRED
+        /// From <see href="https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md#context-attributes">Clode Events Spec</see>
+        /// This attribute contains a value describing the type of event related to the originating occurrence.
+        /// Often this attribute is used for routing, observability, policy enforcement, etc.
+        /// SHOULD be prefixed with a reverse-DNS name. The prefixed domain dictates the organization which defines the semantics of this event type.
+        /// Default to empty string
+        /// </summary>
+        /// <value>The type of event as a <see cref="CloudEventsType"/>.</value>
+        public CloudEventsType Type { get; set; } = CloudEventsType.Empty;
+        
+        /// <summary>
+        /// The identity of the workflow this message was sent as part of. This is used to correlate messages that are part of a workflow.
+        /// </summary>
+        /// <value>The workflow identifier.</value>
+        /// <remarks> Reserved for future use, currently not used in Brighter</remarks>
+        [JsonConverter(typeof(IdConverter))]
+        [Newtonsoft.Json.JsonConverter(typeof(NIdConverter))]
+        public Id? WorkflowId { get; }
+
+        /// <summary>
+        /// Intended for serialization, prefer the parameterized constructor in application code as a better 'pit of success'
+        /// </summary>
+        public MessageHeader()
+        {
+            ContentType = new ContentType("application/json; charset=utf-8");
+        }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="MessageHeader"/> class.
         /// </summary>
-        /// <param name="messageId">The message identifier.</param>
-        /// <param name="topic">The topic.</param>
-        /// <param name="messageType">Type of the message.</param>
+        /// <param name="messageId">Identifies the event. Producers MUST ensure that source + id is unique for each distinct event.</param>
+        /// <param name="topic">The name of the channel that the message is on</param>
+        /// <param name="messageType">Type of message: command; event.</param>
+        /// <param name="source">Identifies the context in which an event happened; often a URI identifying the producer</param>
+        /// <param name="type">The type of event; SHOULD be prefixed with a reverse-DNS name </param>
+        /// <param name="timeStamp">The time of message creation, will be rounded to seconds</param>
         /// <param name="correlationId">Used in request-reply to allow the sender to match response to their request</param>
         /// <param name="replyTo">Used for a request-reply message to indicate the private channel to reply to</param>
-        /// <param name="contentType">The type of the payload of the message, defaults to tex/plain</param>
-        public MessageHeader(Guid messageId, string topic, MessageType messageType, Guid? correlationId = null, string replyTo = "", string contentType = "text/plain")
+        /// <param name="contentType">The type of the payload of the message, defaults to application/json and utf8</param>
+        /// <param name="partitionKey">How should we group messages that must be processed together i.e. consistent hashing</param>
+        /// <param name="dataSchema">A Uri that identifies the schema that data adheres to</param>
+        /// <param name="subject">Describes the subject of the event in the context of the event producer</param>
+        /// <param name="workflowId">The identity of the workflow this message was sent as part of</param>
+        /// <param name="jobId">The identifier for an instance of that workflow</param>
+        /// <param name="handledCount">The number of attempts to handle this message</param>
+        /// <param name="delayed">The delay in milliseconds to this message (usually to retry)</param>
+        /// <param name="traceParent">The traceparent for this message; follows the W3C standard</param>
+        /// <param name="traceState">The tracestate for this message; follows the W3C standard</param>
+        /// <param name="baggage">The baggage for this message; follows the W3C standard</param>
+        public MessageHeader(
+            Id messageId,
+            RoutingKey topic,
+            MessageType messageType,
+            Uri? source = null,
+            CloudEventsType? type = null,
+            DateTimeOffset? timeStamp = null,
+            Id? correlationId = null,
+            RoutingKey? replyTo = null,
+            ContentType? contentType = null,
+            PartitionKey? partitionKey = null,
+            Uri? dataSchema = null,
+            string? subject = null,
+            int handledCount = 0,
+            Id? workflowId = null,
+            Id? jobId = null,
+            TimeSpan? delayed = null,
+            TraceParent? traceParent = null,
+            TraceState? traceState = null,
+            Baggage? baggage = null)
         {
-            Id = messageId;
+            MessageId = messageId;
             Topic = topic;
+#pragma warning disable CS0618 // Preserve the legacy message type for transport compatibility.
             MessageType = messageType;
-            TimeStamp = RoundToSeconds(DateTime.UtcNow);
-            HandledCount = 0;
-            DelayedMilliseconds = 0;
-            CorrelationId = correlationId ?? Guid.Empty ;
-            ReplyTo = replyTo ?? string.Empty;
-            ContentType = contentType ?? "text/plain";
-        }
-
-        public MessageHeader(Guid messageId, string topic, MessageType messageType, DateTime timeStamp, Guid? correlationId = null, string replyTo = null, string contentType = "text/plain")
-            : this(messageId, topic, messageType, correlationId, replyTo, contentType)
-        {
-            TimeStamp = RoundToSeconds(timeStamp);
-        }
-
-        public MessageHeader(Guid messageId, string topic, MessageType messageType, DateTime timeStamp, int handledCount, int delayedMilliseconds, Guid? correlationId = null, string replyTo = null, string contentType = "text/plain")
-            : this(messageId, topic, messageType, timeStamp, correlationId, replyTo, contentType)
-        {
+#pragma warning restore CS0618
+            if (source != null) Source = source;
+            Type = type ?? CloudEventsType.Empty;
+            TimeStamp = timeStamp ?? DateTimeOffset.UtcNow;
             HandledCount = handledCount;
-            DelayedMilliseconds = delayedMilliseconds;
+            WorkflowId = workflowId;
+            JobId = jobId;
+            Delayed = delayed ?? TimeSpan.Zero;
+            CorrelationId = correlationId ?? new Id(string.Empty);
+            ReplyTo = replyTo ?? RoutingKey.Empty;
+            ContentType = contentType ?? new ContentType("application/json; charset=utf-8");
+            PartitionKey = partitionKey ?? PartitionKey.Empty;
+            DataSchema = dataSchema;
+            Subject = subject;
+            TraceParent = traceParent;
+            TraceState = traceState;
+            Baggage = baggage ?? new Baggage();
         }
-        
+
         /// <summary>
         /// Create a copy of the header that allows manipulation of bag contents.
         /// </summary>
         /// <returns></returns>
         public MessageHeader Copy()
         {
-            var newHeader = new MessageHeader
-            {
-                Id = Id,
-                Topic = $"{Topic}",
-                MessageType = MessageType,
-                TimeStamp = TimeStamp,
-                HandledCount = 0,
-                DelayedMilliseconds = 0,
-                CorrelationId = CorrelationId,
-                ReplyTo = $"{ReplyTo}",
-                ContentType = $"{ContentType}"
-            };
+            var newHeader = new MessageHeader(MessageId,
+                new RoutingKey($"{Topic}"),
+#pragma warning disable CS0618 // Preserve the legacy message type for transport compatibility.
+                MessageType,
+#pragma warning restore CS0618
+                timeStamp : TimeStamp,
+                handledCount : 0,
+                delayed : TimeSpan.Zero,
+                correlationId: CorrelationId,
+                replyTo : new RoutingKey($"{ReplyTo}"),
+                contentType : ContentType,
+                partitionKey : PartitionKey
+            );
 
             foreach (var item in Bag)
             {
@@ -190,15 +480,30 @@ namespace Paramore.Brighter
             return newHeader;
         }
 
-
-        //AMQP spec says:
-        // 4.2.5.4 Timestamps
-        // Time stamps are held in the 64-bit POSIX time_t format with an
-        // accuracy of one second. By using 64 bits we avoid future wraparound
-        // issues associated with 31-bit and 32-bit time_t values.
-        private DateTime RoundToSeconds(DateTime dateTime)
+        internal MessageHeader CopyForDelivery()
         {
-            return new DateTime(dateTime.Ticks - (dateTime.Ticks % TimeSpan.TicksPerSecond), dateTime.Kind);
+            var copy = (MessageHeader)MemberwiseClone();
+            copy.Bag = new Dictionary<string, object>(Bag, Bag.Comparer);
+            copy.ContentType = new ContentType(ContentType.ToString());
+            copy.Baggage = new Baggage();
+            foreach (var entry in Baggage)
+                copy.Baggage.Add(entry.Key, entry.Value!);
+            return copy;
+        }
+        
+        /// <summary>
+        /// We return an MT_UNACCEPTABLE message because we cannot process. Really this should go on to an
+        /// Invalid Message Queue provided by the Control Bus
+        /// </summary>
+        /// <param name="topic"></param>
+        /// <param name="messageId"></param>
+        /// <returns></returns>
+        public static MessageHeader FailureMessageHeader(RoutingKey? topic, Id? messageId)
+        {
+            return new MessageHeader(
+                messageId ?? Id.Empty,
+                topic ?? RoutingKey.Empty,
+                MessageType.MT_UNACCEPTABLE);
         }
 
         /// <summary>
@@ -206,9 +511,34 @@ namespace Paramore.Brighter
         /// </summary>
         /// <param name="other">An object to compare with this object.</param>
         /// <returns>true if the current object is equal to the <paramref name="other" /> parameter; otherwise, false.</returns>
-        public bool Equals(MessageHeader other)
+        public bool Equals(MessageHeader? other)
         {
-            return Id == other.Id && Topic == other.Topic && MessageType == other.MessageType;
+            if (ReferenceEquals(null, other)) return false;
+
+            //We choose to break these into individual comparisons to make it easier to debug
+            bool messageIdEquals = MessageId == other.MessageId;
+            bool topicEquals = Topic == other.Topic;
+#pragma warning disable CS0618 // Preserve the legacy message type for transport compatibility.
+            bool messageTypeEquals = MessageType == other.MessageType;
+#pragma warning restore CS0618
+            bool sourceEquals = Source == other.Source;
+            bool typeEquals = Type == other.Type;
+            bool correlationIdEquals = CorrelationId == other.CorrelationId;
+            bool replyToEquals = ReplyTo == other.ReplyTo;
+            bool contentTypeEquals = ContentType.Equals(other.ContentType);
+            bool partitionKeyEquals = PartitionKey.Equals(other.PartitionKey);
+            bool dataSchemaEquals = DataSchema == other.DataSchema;
+            bool subjectEquals = Subject == other.Subject;
+            bool specVersionEquals = SpecVersion == other.SpecVersion;
+            bool workflowIdEquals = WorkflowId == other.WorkflowId;
+            bool jobIdEquals = JobId == other.JobId;
+            bool handledCountEquals = HandledCount == other.HandledCount;
+            bool delayedEquals = Delayed.Equals(other.Delayed);
+
+            return messageIdEquals && topicEquals && messageTypeEquals && sourceEquals &&
+                   typeEquals && correlationIdEquals && replyToEquals && contentTypeEquals &&
+                   partitionKeyEquals && dataSchemaEquals && subjectEquals && specVersionEquals &&
+                   workflowIdEquals && jobIdEquals && handledCountEquals && delayedEquals;
         }
 
         /// <summary>
@@ -216,7 +546,7 @@ namespace Paramore.Brighter
         /// </summary>
         /// <param name="obj">The object to compare with the current object.</param>
         /// <returns><c>true</c> if the specified <see cref="System.Object" /> is equal to this instance; otherwise, <c>false</c>.</returns>
-        public override bool Equals(object obj)
+        public override bool Equals(object? obj)
         {
             if (ReferenceEquals(null, obj)) return false;
             if (ReferenceEquals(this, obj)) return true;
@@ -232,12 +562,11 @@ namespace Paramore.Brighter
         {
             unchecked
             {
-                var hashCode = Id.GetHashCode();
-                hashCode = (hashCode * 397) ^ (Topic != null ? Topic.GetHashCode() : 0);
+                var hashCode = MessageId.GetHashCode();
+                hashCode = (hashCode * 397) ^ Topic.GetHashCode();
+#pragma warning disable CS0618 // Preserve the legacy message type for transport compatibility.
                 hashCode = (hashCode * 397) ^ (int)MessageType;
-                hashCode = (hashCode * 397) ^ TimeStamp.GetHashCode();
-                hashCode = (hashCode * 397) ^ HandledCount.GetHashCode();
-                hashCode = (hashCode * 397) ^ DelayedMilliseconds.GetHashCode();
+#pragma warning restore CS0618
                 return hashCode;
             }
         }
@@ -265,12 +594,11 @@ namespace Paramore.Brighter
         }
 
         /// <summary>
-        /// Updates the number of times the message has been seen by the dispatcher; used to determine if it is poisioned and should be discarded.
+        /// Updates the number of times the message has been seen by the dispatcher; used to determine if it is poisoned and should be discarded.
         /// </summary>
         public void UpdateHandledCount()
         {
             HandledCount++;
         }
-
-   }
+    }
 }

@@ -22,30 +22,115 @@ THE SOFTWARE. */
 
 #endregion
 
+using Paramore.Brighter.PostgreSql;
+
 namespace Paramore.Brighter.Outbox.PostgreSql
 {
-    public class PostgreSqlOutboxBulder
+    /// <summary>
+    /// Provide SQL statement helpers for creation of an Outbox
+    /// </summary>
+    public class PostgreSqlOutboxBuilder
     {
-        const string OutboxDdl = @"
-       CREATE TABLE {0}
+        private const string TextOutboxDdl =
+            """
+            CREATE TABLE IF NOT EXISTS {0}
             (
-                Id BIGSERIAL PRIMARY KEY,
-                MessageId UUID UNIQUE NOT NULL,
-                Topic VARCHAR(255) NULL,
-                MessageType VARCHAR(32) NULL,
+                Id bigserial PRIMARY KEY,
+                MessageId character varying(255) UNIQUE NOT NULL,
+                Topic character varying(255) NULL,
+                MessageType character varying(32) NULL,
                 Timestamp timestamptz NULL,
-                CorrelationId uuid NULL,
-                ReplyTo VARCHAR(255) NULL,
-                ContentType VARCHAR(128) NULL,  
+                CorrelationId character varying(255) NULL,
+                ReplyTo character varying(255) NULL,
+                ContentType character varying(128) NULL,
+                PartitionKey character varying(128) NULL,  
+                WorkflowId character varying(255) NULL,
+                JobId character varying(255) NULL,
                 Dispatched timestamptz NULL,
-                HeaderBag TEXT NULL,
-                Body TEXT NULL
+                HeaderBag text NULL,
+                Body text NULL,
+                Source character varying (255) NULL,
+                Type character varying (255) NULL,
+                DataSchema character varying (255) NULL,
+                Subject character varying (255) NULL,
+                TraceParent character varying (255) NULL,
+                TraceState character varying (255) NULL,
+                Baggage text NULL,
+                DataRef character varying (255) NULL,
+                CausationId character varying (255) NULL,
+                SpecVersion character varying (255) NULL
             );
-        ";
+            """;
 
-        public static string GetDDL(string OutboxTableName)
+        private const string BinaryOutboxDdl =
+            """
+            CREATE TABLE {0}
+            (
+                Id bigserial PRIMARY KEY,
+                MessageId character varying(255) UNIQUE NOT NULL,
+                Topic character varying(255) NULL,
+                MessageType character varying(32) NULL,
+                Timestamp timestamptz NULL,
+                CorrelationId character varying(255) NULL,
+                ReplyTo character varying(255) NULL,
+                ContentType character varying(128) NULL,
+                PartitionKey character varying(128) NULL,  
+                WorkflowId character varying(255) NULL,
+                JobId character varying(255) NULL,
+                Dispatched timestamptz NULL,
+                HeaderBag text NULL,
+                Body bytea NULL,
+                Source character varying (255) NULL,
+                Type character varying (255) NULL,
+                DataSchema character varying (255) NULL,
+                Subject character varying (255) NULL,
+                TraceParent character varying (255) NULL,
+                TraceState character varying (255) NULL,
+                Baggage text NULL,
+                DataRef character varying (255) NULL,
+                CausationId character varying (255) NULL,
+                SpecVersion character varying (255) NULL
+            );
+            """;
+
+        private const string OutboxExistsSQL = @"SELECT EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_CATALOG = '{0}' AND TABLE_NAME = '{1}')";
+
+        /// <summary>
+        /// Get the DDL required to create the Outbox in Postgres
+        /// </summary>
+        /// <param name="outboxTableName">The name you want to use for the table</param>
+        /// <param name="binaryMessagePayload"></param>
+        /// <param name="schemaName">
+        /// Optional Postgres schema name. When non-null, the emitted DDL schema-qualifies the
+        /// table as <c>"schemaname"."outboxtablename"</c> (lowercase-then-quote via
+        /// <see cref="PgIdentifier"/>) so reserved-keyword names parse cleanly while still
+        /// resolving to the same physical table that PG's natural case-fold of unquoted
+        /// identifiers would have produced. Otherwise the table is emitted unqualified and
+        /// lands in the connection's search_path default (typically <c>public</c>). Identifier
+        /// safety is enforced upstream via <c>Identifiers.AssertSafe</c>.
+        /// </param>
+        /// <returns>The required DDL</returns>
+        public static string GetDDL(string outboxTableName, bool binaryMessagePayload = false, string? schemaName = null)
         {
-            return string.Format(OutboxDdl, OutboxTableName);
+            var qualifiedTable = PgIdentifier.QuoteQualified(schemaName, outboxTableName);
+            var ddl = binaryMessagePayload ? string.Format(BinaryOutboxDdl, qualifiedTable) : string.Format(TextOutboxDdl, qualifiedTable);
+            // Replay index (Spec 0027, #2541) on causationid via Postgres's native CREATE INDEX
+            // IF NOT EXISTS. The index name folds the table identifier to lowercase and is emitted
+            // bare so it matches Postgres's natural case-fold. None of the outbox builders indexed
+            // any column before this.
+            return ddl + "\n" +
+                $"CREATE INDEX IF NOT EXISTS idx_{PgIdentifier.Normalize(outboxTableName)}_causationid ON {qualifiedTable} (causationid);";
+        }
+
+        /// <summary>
+        /// Get the SQL statements required to test for the existence of an Inbox in Postgres
+        /// </summary>
+        /// <param name="tableCatalog">The Postgres table catalog that the table is in</param>
+        /// <param name="outboxTableName">The name that was used for the Inbox table</param>
+        /// <returns>The required SQL</returns>
+        public static string GetExistsQuery(string tableCatalog, string outboxTableName)
+        {
+            return string.Format(OutboxExistsSQL, tableCatalog, PgIdentifier.Normalize(outboxTableName));
         }
     }
 }

@@ -1,0 +1,396 @@
+using System.Net.Mime;
+using Google.Cloud.PubSub.V1;
+using Google.Protobuf;
+using Google.Protobuf.Collections;
+using Paramore.Brighter.Extensions;
+using Paramore.Brighter.Observability;
+
+namespace Paramore.Brighter.MessagingGateway.GcpPubSub;
+
+internal static class Parser
+{
+    private static readonly HashSet<string> s_ignoreHeaders = new(StringComparer.InvariantCultureIgnoreCase)
+    {
+        HeaderNames.MessageType,
+        HeaderNames.CorrelationId,
+        HeaderNames.Topic,
+        HeaderNames.HandledCount,
+        HeaderNames.Id,
+        HeaderNames.ContentType,
+        HeaderNames.Timestamp,
+        HeaderNames.ReplyTo,
+        HeaderNames.Subject,
+        HeaderNames.SpecVersion,
+        HeaderNames.Type,
+        HeaderNames.Source,
+        HeaderNames.DataSchema,
+        HeaderNames.TraceParent,
+        HeaderNames.TraceState,
+        HeaderNames.Baggage,
+        HeaderNames.PartitionKey,
+        "googclient_deliveryattempt"
+    };
+
+
+    public static Message ToBrighterMessage(GcpStreamMessage receivedMessage)
+    {
+        var partitionKey = ReadPartitionKey(receivedMessage.Message);
+        var topic = ReadTopic(receivedMessage.Message.Attributes);
+        var messageId = ReadMessageId(receivedMessage.Message.Attributes);
+        var handleCount = ReadHandleCount(receivedMessage.Message.Attributes);
+        var contentType = ReadContentType(receivedMessage.Message.Attributes);
+        var messageType = ReadMessageType(receivedMessage.Message.Attributes);
+        var timestamp = ReadTimestamp(receivedMessage.Message.Attributes);
+        var replyTo = ReadReplyTo(receivedMessage.Message.Attributes);
+        var correlationId = ReadCorrelationId(receivedMessage.Message.Attributes);
+        var subject = ReadSubject(receivedMessage.Message.Attributes);
+        var type = ReadType(receivedMessage.Message.Attributes);
+        var source = ReadSource(receivedMessage.Message.Attributes);
+        var dataSchema = ReadDataSchema(receivedMessage.Message.Attributes);
+        var traceParent = ReadTraceParent(receivedMessage.Message.Attributes);
+        var traceState = ReadTraceState(receivedMessage.Message.Attributes);
+        var baggage = ReadBaggage(receivedMessage.Message.Attributes);
+
+        var messageHeader = new MessageHeader(
+            messageId: messageId,
+            topic: topic,
+            messageType: messageType,
+            source: source,
+            type: type,
+            timeStamp: timestamp,
+            correlationId: correlationId,
+            replyTo: replyTo,
+            contentType: contentType,
+            handledCount: handleCount,
+            dataSchema: dataSchema,
+            subject: subject,
+            delayed: TimeSpan.Zero,
+            partitionKey: partitionKey,
+            baggage: baggage,
+            traceParent: traceParent,
+            traceState: traceState
+        );
+
+        foreach (var header in receivedMessage.Message.Attributes
+                     .Where(x => !s_ignoreHeaders.Contains(x.Key)))
+        {
+            messageHeader.Bag[header.Key] = header.Value;
+        }
+
+        messageHeader.Bag["ReceiptHandle"] = receivedMessage;
+
+        // R-1/R-2/R-3 (ADR 0077): present the broker's own delivery counter, normalised so a first
+        // delivery reads 0, unless the message is a Brighter-routed rejection copy (R-28), in which
+        // case the stamped header count is kept. Runs after the bag is filled so the rejectionReason
+        // discriminator (if present) is visible to Resolve. No allocation, no RPC (NFR-1, NFR-2):
+        // GetDeliveryAttempt reads the already-received PubsubMessage's own attribute.
+        messageHeader.HandledCount = DeliveryCount.Resolve(
+            handleCount, PubsubExtensions.GetDeliveryAttempt(receivedMessage.Message), messageHeader.Bag);
+
+        var body = new MessageBody(receivedMessage.Message.Data.ToByteArray());
+        return new Message(messageHeader, body);
+    }
+    
+    public static Message ToBrighterMessage(ReceivedMessage receivedMessage)
+    {
+        var receiptHandle = receivedMessage.AckId;
+        var partitionKey = ReadPartitionKey(receivedMessage.Message);
+        var topic = ReadTopic(receivedMessage.Message.Attributes);
+        var messageId = ReadMessageId(receivedMessage.Message.Attributes);
+        var handleCount = ReadHandleCount(receivedMessage.Message.Attributes);
+        var contentType = ReadContentType(receivedMessage.Message.Attributes);
+        var messageType = ReadMessageType(receivedMessage.Message.Attributes);
+        var timestamp = ReadTimestamp(receivedMessage.Message.Attributes);
+        var replyTo = ReadReplyTo(receivedMessage.Message.Attributes);
+        var correlationId = ReadCorrelationId(receivedMessage.Message.Attributes);
+        var subject = ReadSubject(receivedMessage.Message.Attributes);
+        var type = ReadType(receivedMessage.Message.Attributes);
+        var source = ReadSource(receivedMessage.Message.Attributes);
+        var dataSchema = ReadDataSchema(receivedMessage.Message.Attributes);
+        var traceParent = ReadTraceParent(receivedMessage.Message.Attributes);
+        var traceState = ReadTraceState(receivedMessage.Message.Attributes);
+        var baggage = ReadBaggage(receivedMessage.Message.Attributes);
+
+        var messageHeader = new MessageHeader(
+            messageId: messageId,
+            topic: topic,
+            messageType: messageType,
+            source: source,
+            type: type,
+            timeStamp: timestamp,
+            correlationId: correlationId,
+            replyTo: replyTo,
+            contentType: contentType,
+            handledCount: handleCount,
+            dataSchema: dataSchema,
+            subject: subject,
+            delayed: TimeSpan.Zero,
+            partitionKey: partitionKey,
+            traceParent: traceParent,
+            traceState: traceState,
+            baggage: baggage
+        );
+
+        foreach (var header in receivedMessage.Message.Attributes
+                     .Where(x => !s_ignoreHeaders.Contains(x.Key)))
+        {
+            messageHeader.Bag[header.Key] = header.Value;
+        }
+
+        messageHeader.Bag["ReceiptHandle"] = receiptHandle;
+
+        // R-1/R-2/R-3 (ADR 0077): present the broker's own delivery counter, normalised so a first
+        // delivery reads 0, unless the message is a Brighter-routed rejection copy (R-28), in which
+        // case the stamped header count is kept. Runs after the bag is filled so the rejectionReason
+        // discriminator (if present) is visible to Resolve. No allocation, no RPC (NFR-1, NFR-2):
+        // DeliveryAttempt is already on the ReceivedMessage the Pull call returned.
+        messageHeader.HandledCount = DeliveryCount.Resolve(handleCount, receivedMessage.DeliveryAttempt, messageHeader.Bag);
+
+        var body = new MessageBody(receivedMessage.Message.Data.ToByteArray());
+
+        return new Message(messageHeader, body);
+    }
+
+    private static string ReadPartitionKey(PubsubMessage message)
+    {
+        // A message from a producer that predates the partition key attribute carries its key only as the ordering key
+        if (message.Attributes.TryGetValue(HeaderNames.PartitionKey, out var partitionKey))
+        {
+            return partitionKey;
+        }
+
+        return message.OrderingKey;
+    }
+
+    private static RoutingKey ReadTopic(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.Topic, out var topic))
+        {
+            return new RoutingKey(topic);
+        }
+
+        return RoutingKey.Empty;
+    }
+
+    private static string ReadMessageId(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.Id, out var id))
+        {
+            return id;
+        }
+
+        return Guid.NewGuid().ToString();
+    }
+
+    private static ContentType ReadContentType(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.ContentType, out var contentType))
+        {
+            return new ContentType(contentType);
+        }
+
+        return new ContentType("text/plain");
+    }
+
+    private static int ReadHandleCount(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.HandledCount, out var val) && int.TryParse(val, out var handleCount))
+        {
+            return handleCount;
+        }
+
+        return 0;
+    }
+
+    private static MessageType ReadMessageType(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.MessageType, out var val) &&
+            Enum.TryParse<MessageType>(val, out var messageType))
+        {
+            return messageType;
+        }
+
+        return MessageType.MT_EVENT;
+    }
+
+    private static DateTimeOffset ReadTimestamp(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.Timestamp, out var val) &&
+            DateTimeOffset.TryParse(val, out var timestamp))
+        {
+            return timestamp;
+        }
+
+        return DateTimeOffset.UtcNow;
+    }
+
+    private static RoutingKey ReadReplyTo(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.ReplyTo, out var replyTo))
+        {
+            return new RoutingKey(replyTo);
+        }
+
+        return RoutingKey.Empty;
+    }
+
+    private static string ReadCorrelationId(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.CorrelationId, out var correlationId))
+        {
+            return correlationId;
+        }
+
+        return string.Empty;
+    }
+
+    private static string ReadSubject(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.Subject, out var subject))
+        {
+            return subject;
+        }
+
+        return string.Empty;
+    }
+
+    private static CloudEventsType ReadType(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.Type, out var type))
+        {
+            return new CloudEventsType(type);
+        }
+
+        return CloudEventsType.Empty;
+    }
+
+    private static Uri? ReadSource(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.Source, out var val)
+            && Uri.TryCreate(val, UriKind.RelativeOrAbsolute, out var source))
+        {
+            return source;
+        }
+
+        return null;
+    }
+
+    private static Uri? ReadDataSchema(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.DataSchema, out var val)
+            && Uri.TryCreate(val, UriKind.RelativeOrAbsolute, out var dataSchema))
+        {
+            return dataSchema;
+        }
+
+        return null;
+    }
+    
+    private static TraceParent? ReadTraceParent(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.TraceParent, out var traceParent))
+        {
+            return new TraceParent(traceParent);
+        }
+
+        return null;
+    }
+    
+    private static TraceState? ReadTraceState(MapField<string, string> attributes)
+    {
+        if (attributes.TryGetValue(HeaderNames.TraceState, out var traceState))
+        {
+            return new TraceState(traceState);
+        }
+
+        return null;
+    }
+    
+    private static Baggage ReadBaggage(MapField<string, string> attributes)
+    {
+        var baggage = new Baggage();
+        if (attributes.TryGetValue(HeaderNames.Baggage, out var val))
+        {
+            baggage.LoadBaggage(val);
+        }
+
+        return baggage;
+    }
+
+    public static PubsubMessage ToPubSubMessage(Message message, bool enableMessageOrdering)
+    {
+        // The Google client refuses an ordering key unless message ordering is enabled; the partition key attribute
+        // carries the key either way
+        var pubSubMessage = new PubsubMessage
+        {
+            Data = ByteString.CopyFrom(message.Body.Memory.Span),
+            OrderingKey = enableMessageOrdering ? message.Header.PartitionKey : string.Empty
+        };
+
+        AddHeaders(pubSubMessage.Attributes, message);
+        return pubSubMessage;
+    }
+
+    private static void AddHeaders(MapField<string, string> headers, Message message)
+    {
+        headers.Add(HeaderNames.Id, message.Header.MessageId.Value);
+        headers.Add(HeaderNames.Topic, message.Header.Topic.Value);
+        headers.Add(HeaderNames.HandledCount, message.Header.HandledCount.ToString());
+#pragma warning disable CS0618 // Preserve the legacy message type for transport compatibility.
+        headers.Add(HeaderNames.MessageType, message.Header.MessageType.ToString());
+#pragma warning restore CS0618
+        headers.Add(HeaderNames.SpecVersion, message.Header.SpecVersion);
+        headers.Add(HeaderNames.Source, message.Header.Source.ToString());
+        headers.Add(HeaderNames.Timestamp, message.Header.TimeStamp.ToRfc3339());
+        headers.Add(HeaderNames.ContentType, message.Header.ContentType.ToString());
+        headers.Add(HeaderNames.Baggage, message.Header.Baggage.ToString());
+
+        if (message.Header.Type != CloudEventsType.Empty)
+        {
+            headers.Add(HeaderNames.Type, message.Header.Type.Value);
+        }
+
+        if (!string.IsNullOrEmpty(message.Header.CorrelationId))
+        {
+            headers.Add(HeaderNames.CorrelationId, message.Header.CorrelationId.Value);
+        }
+
+        if (!RoutingKey.IsNullOrEmpty(message.Header.ReplyTo))
+        {
+            headers.Add(HeaderNames.ReplyTo, message.Header.ReplyTo!);
+        }
+
+        if (!string.IsNullOrEmpty(message.Header.Subject))
+        {
+            headers.Add(HeaderNames.Subject, message.Header.Subject!);
+        }
+
+        if (message.Header.DataSchema != null)
+        {
+            headers.Add(HeaderNames.DataSchema, message.Header.DataSchema.ToString());
+        }
+
+        if (!TraceParent.IsNullOrEmpty(message.Header.TraceParent))
+        {
+            headers.Add(HeaderNames.TraceParent, message.Header.TraceParent.Value);
+        }
+
+        if (!TraceState.IsNullOrEmpty(message.Header.TraceState))
+        {
+            headers.Add(HeaderNames.TraceState, message.Header.TraceState.Value);
+        }
+
+        if (!PartitionKey.IsNullOrEmpty(message.Header.PartitionKey))
+        {
+            headers.Add(HeaderNames.PartitionKey, message.Header.PartitionKey.Value);
+        }
+
+        message.Header.Bag.Each(header =>
+        {
+            if (!headers.ContainsKey(header.Key) && !MessageHeader.IsLocalHeader(header.Key))
+            {
+                headers.Add(header.Key, header.Value.ToString()!);
+            }
+        });
+    }
+}

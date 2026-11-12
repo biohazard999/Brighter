@@ -64,13 +64,13 @@ namespace Paramore.Brighter.ServiceActivator
         }
 
         /// <summary>
-        /// Performs an implicit conversion from <see cref="ConnectionName" /> to <see cref="System.String" />.
+        /// Performs an implicit conversion from <see cref="SubscriptionName" /> to <see cref="System.String" />.
         /// </summary>
         /// <param name="rhs">The RHS.</param>
         /// <returns>The result of the conversion.</returns>
-        public static implicit operator string(HostName rhs)
+        public static implicit operator string?(HostName rhs)
         {
-            return rhs.ToString();
+            return rhs?.ToString();
         }
 
         /// <summary>
@@ -78,7 +78,7 @@ namespace Paramore.Brighter.ServiceActivator
         /// </summary>
         /// <param name="other">An object to compare with this object.</param>
         /// <returns>true if the current object is equal to the <paramref name="other" /> parameter; otherwise, false.</returns>
-        public bool Equals(HostName other)
+        public bool Equals(HostName? other)
         {
             if (ReferenceEquals(null, other)) return false;
             if (ReferenceEquals(this, other)) return true;
@@ -90,7 +90,7 @@ namespace Paramore.Brighter.ServiceActivator
         /// </summary>
         /// <param name="obj">The object to compare with the current object.</param>
         /// <returns><c>true</c> if the specified <see cref="System.Object" /> is equal to this instance; otherwise, <c>false</c>.</returns>
-        public override bool Equals(object obj)
+        public override bool Equals(object? obj)
         {
             if (ReferenceEquals(null, obj)) return false;
             if (ReferenceEquals(this, obj)) return true;

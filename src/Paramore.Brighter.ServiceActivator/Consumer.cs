@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -46,7 +46,7 @@ namespace Paramore.Brighter.ServiceActivator
 
     /// <summary>
     /// Class Consumer.
-    /// Manages the message pump used to read messages for a channel. Creation establishes the message pump for a given connection and channel. Open runs the
+    /// Manages the message pump used to read messages for a channel. Creation establishes the message pump for a given subscription and channel. Open runs the
     /// message pump, which begins consuming messages from the channel; it returns the TPL Task used to run the message pump thread so that it can be
     /// Waited on by callers. Shut closes the message pump.
     /// 
@@ -59,7 +59,7 @@ namespace Paramore.Brighter.ServiceActivator
         /// <value>The name.</value>
         public ConsumerName Name { get; }
 
-        public ConnectionName ConnectionName { get; set; }
+        public Subscription Subscription { get; set; }
         /// <summary>
         /// Gets the performer.
         /// </summary>
@@ -74,22 +74,27 @@ namespace Paramore.Brighter.ServiceActivator
         /// Gets or sets the job.
         /// </summary>
         /// <value>The job.</value>
-        public Task Job { get; set; }
+        public Task? Job { get; set; }
 
         public int JobId { get; set; }
+
+        // A Shut() arriving before Open() must keep the consumer Shut, otherwise the
+        // late-opened performer leaks with no way to receive a quit message.
+        private readonly object _stateLock = new();
+        private bool _shutRequested;
 
 
         /// <summary>
         /// Initializes a new instance of the <see cref="Consumer"/> class.
         /// </summary>
         /// <param name="name">The name.</param>
-        /// <param name="connectionName">The name of the associated connection.</param>
+        /// <param name="subscription"></param>
         /// <param name="channel">The channel.</param>
         /// <param name="messagePump">The message pump.</param>
-        public Consumer(ConsumerName name, ConnectionName connectionName, IAmAChannel channel, IAmAMessagePump messagePump)
+        public Consumer(ConsumerName name, Subscription subscription, IAmAChannel channel, IAmAMessagePump messagePump)
         {
             Name = name;
-            ConnectionName = connectionName;
+            Subscription = subscription;
             Performer = new Performer(channel, messagePump);
             State = ConsumerState.Shut;
         }
@@ -99,19 +104,28 @@ namespace Paramore.Brighter.ServiceActivator
         /// </summary>
         public void Open()
         {
-            State = ConsumerState.Open;
-            Job = Performer.Run();
-            JobId = Job.Id;
+            lock (_stateLock)
+            {
+                if (_shutRequested)
+                    return;
+                State = ConsumerState.Open;
+                Job = Performer.Run();
+                JobId = Job.Id;
+            }
         }
 
         /// <summary>
         /// Shuts the task, which will not receive messages.
         /// </summary>
-        public void Shut()
+        /// <param name="topic">The topic we post the quit message to, in order to shut the perfomer</param>
+        public void Shut(RoutingKey topic)
         {
-            if (State == ConsumerState.Open)
+            lock (_stateLock)
             {
-                Performer.Stop();
+                _shutRequested = true;
+                if (State != ConsumerState.Open)
+                    return;
+                Performer.Stop(topic);
                 State = ConsumerState.Shut;
             }
         }
@@ -138,7 +152,7 @@ namespace Paramore.Brighter.ServiceActivator
         /// </summary>
         /// <param name="other">An object to compare with this object.</param>
         /// <returns>true if the current object is equal to the <paramref name="other" /> parameter; otherwise, false.</returns>
-        public bool Equals(Consumer other)
+        public bool Equals(Consumer? other)
         {
             if (ReferenceEquals(null, other)) return false;
             if (ReferenceEquals(this, other)) return true;
@@ -150,7 +164,7 @@ namespace Paramore.Brighter.ServiceActivator
         /// </summary>
         /// <param name="obj">The object to compare with the current object.</param>
         /// <returns><c>true</c> if the specified <see cref="System.Object" /> is equal to this instance; otherwise, <c>false</c>.</returns>
-        public override bool Equals(object obj)
+        public override bool Equals(object? obj)
         {
             if (ReferenceEquals(null, obj)) return false;
             if (ReferenceEquals(this, obj)) return true;
@@ -166,7 +180,7 @@ namespace Paramore.Brighter.ServiceActivator
         {
             unchecked
             {
-                return ((Name != null ? Name.GetHashCode() : 0) * 397) ^ (Job != null ? Job.GetHashCode() : 0);
+                return ((Name is not null ? Name.GetHashCode() : 0) * 397) ^ (Job != null ? Job.GetHashCode() : 0);
             }
         }
 

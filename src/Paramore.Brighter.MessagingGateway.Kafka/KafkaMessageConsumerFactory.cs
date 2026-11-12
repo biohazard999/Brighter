@@ -25,37 +25,91 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
 {
     /// <inheritdoc />
     /// <summary>
-    /// Class KafkaMessageConsumerFactory.
+    /// A factory for creating a Kafka message consumer from a <see cref="Subscription{T}"/>> 
     /// </summary>
+    
     public class KafkaMessageConsumerFactory : IAmAMessageConsumerFactory
     {
-        private readonly KafkaMessagingGatewayConfiguration _globalConfiguration;
-        private readonly KafkaMessagingConsumerConfiguration _consumerConfiguration;
+        private readonly KafkaMessagingGatewayConfiguration _configuration;
+        private IAmAMessageScheduler? _scheduler;
 
-        public KafkaMessageConsumerFactory(KafkaMessagingGatewayConfiguration globalConfiguration):
-            this(globalConfiguration, new KafkaMessagingConsumerConfiguration())
+        /// <summary>
+        /// Gets or sets the message scheduler for delayed requeue support.
+        /// Can be set after construction to allow channel factories to forward the scheduler from DI.
+        /// </summary>
+        public IAmAMessageScheduler? Scheduler
         {
-        }
-
-        public KafkaMessageConsumerFactory(KafkaMessagingGatewayConfiguration globalConfiguration,
-            KafkaMessagingConsumerConfiguration consumerConfiguration)
-        {
-            _globalConfiguration = globalConfiguration;
-            _consumerConfiguration = consumerConfiguration;
+            get => _scheduler;
+            set => _scheduler = value;
         }
 
         /// <summary>
-        /// Creates a consumer for the specified queue.
+        /// Initializes a factory with the <see cref="KafkaMessagingGatewayConfiguration"/> used to connect to a Kafka Broker
         /// </summary>
-        /// <param name="connection">The queue to connect to</param>
-        /// <returns>IAmAMessageConsumer</returns>
-         public IAmAMessageConsumer Create(Connection connection)
+        /// <param name="configuration">The <see cref="KafkaMessagingGatewayConfiguration"/> used to connect to the Broker</param>
+        /// <param name="scheduler">The optional message scheduler for delayed requeue support</param>
+        public KafkaMessageConsumerFactory(
+            KafkaMessagingGatewayConfiguration configuration,
+            IAmAMessageScheduler? scheduler = null
+            )
         {
-            return new KafkaMessageConsumer(
-                connection.ChannelName, //groupId,
-                connection.RoutingKey, //topic
-                _globalConfiguration, 
-                _consumerConfiguration);
+            _configuration = configuration;
+            _scheduler = scheduler;
         }
+
+        /// <summary>
+        /// Creates a consumer from the <see cref="Subscription{T}"/>
+        /// </summary>
+        /// <param name="subscription">The <see cref="KafkaSubscription"/> to read</param>
+        /// <returns>A consumer that can be used to read from the stream</returns>
+        public IAmAMessageConsumerSync Create(Subscription subscription)
+        {
+            KafkaSubscription? kafkaSubscription = subscription as KafkaSubscription;  
+            if (kafkaSubscription == null)
+                throw new ConfigurationException("We expect a KafkaSubscription or KafkaSubscription<T> as a parameter");
+            
+            // Extract DLQ and invalid message routing keys if subscription supports them
+            RoutingKey? deadLetterRoutingKey = null;
+            RoutingKey? invalidMessageRoutingKey = null;
+
+            if (kafkaSubscription is IUseBrighterDeadLetterSupport dlqSupport)
+            {
+                deadLetterRoutingKey = dlqSupport.DeadLetterRoutingKey;
+            }
+
+            if (kafkaSubscription is IUseBrighterInvalidMessageSupport invalidSupport)
+            {
+                invalidMessageRoutingKey = invalidSupport.InvalidMessageRoutingKey;
+            }
+
+#pragma warning disable CS0618
+            return new KafkaMessageConsumer(
+                configuration: _configuration,
+                routingKey:kafkaSubscription.RoutingKey, //topic
+                groupId: kafkaSubscription.GroupId,
+                offsetDefault: kafkaSubscription.OffsetDefault,
+                sessionTimeout: kafkaSubscription.SessionTimeout,
+                maxPollInterval: kafkaSubscription.MaxPollInterval,
+                isolationLevel: kafkaSubscription.IsolationLevel,
+                commitBatchSize: kafkaSubscription.CommitBatchSize,
+                sweepUncommittedOffsetsInterval: kafkaSubscription.SweepUncommittedOffsetsInterval,
+                readCommittedOffsetsTimeout: kafkaSubscription.ReadCommittedOffsetsTimeOut,
+                numPartitions: kafkaSubscription.NumPartitions,
+                partitionAssignmentStrategy: kafkaSubscription.PartitionAssignmentStrategy,
+                replicationFactor: kafkaSubscription.ReplicationFactor,
+                topicFindTimeout: kafkaSubscription.TopicFindTimeout,
+                makeChannels: kafkaSubscription.MakeChannels,
+                configHook: kafkaSubscription.ConfigHook,
+                errorLogLevel: kafkaSubscription.ErrorLogLevel,
+                deadLetterRoutingKey: deadLetterRoutingKey,
+                invalidMessageRoutingKey: invalidMessageRoutingKey,
+                timeProvider: kafkaSubscription.TimeProvider,
+                scheduler: _scheduler,
+                groupProtocol: kafkaSubscription.GroupProtocol);
+#pragma warning restore CS0618
+        }
+
+        public IAmAMessageConsumerAsync CreateAsync(Subscription subscription) => (IAmAMessageConsumerAsync)Create(subscription);
+
     }
 }

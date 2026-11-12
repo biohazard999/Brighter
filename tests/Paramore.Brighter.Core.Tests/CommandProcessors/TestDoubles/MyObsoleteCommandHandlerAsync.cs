@@ -4,7 +4,7 @@ using System.Threading.Tasks;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyObsoleteCommandHandlerAsync : RequestHandlerAsync<MyCommand>
+    internal sealed class MyObsoleteCommandHandlerAsync : RequestHandlerAsync<MyCommand>
     {
         private static MyCommand s_command;
 
@@ -17,7 +17,7 @@ namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
         [MyPreValidationHandlerAsync(2, HandlerTiming.Before)]
         [MyPostLoggingHandlerAsync(1, HandlerTiming.After)]
         [Obsolete] // even with attributes non inheriting from MessageHandlerDecoratorAttribute it should not fail
-        public override async Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default(CancellationToken))
+        public override async Task<MyCommand> HandleAsync(MyCommand command, CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
             {

@@ -22,31 +22,30 @@ THE SOFTWARE. */
 
 #endregion
 
-using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace Paramore.Brighter.Core.Tests.CommandProcessors.TestDoubles
 {
-    internal class MyOtherEventHandlerAsync : RequestHandlerAsync<MyEvent>
+    internal sealed class MyOtherEventHandlerAsync : RequestHandlerAsync<MyEvent>
     {
-        private readonly IDictionary<string, Guid> _receivedMessages;
+        private readonly IDictionary<string, string> _receivedMessages;
 
-        public MyOtherEventHandlerAsync(IDictionary<string, Guid> receivedMessages)
+        public MyOtherEventHandlerAsync(IDictionary<string, string> receivedMessages)
         {
             _receivedMessages = receivedMessages;
         }
 
-        public override async Task<MyEvent> HandleAsync(MyEvent command, CancellationToken cancellationToken = default(CancellationToken))
+        public override async Task<MyEvent> HandleAsync(MyEvent @event, CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
-                return command;
+                return @event;
 
-            _receivedMessages.Add(nameof(MyOtherEventHandlerAsync), command.Id);
+            _receivedMessages.Add(nameof(MyOtherEventHandlerAsync), @event.Id);
 
             await Task.Delay(0, cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
-            return command;
+            return await base.HandleAsync(@event, cancellationToken);
         }
     }
 }

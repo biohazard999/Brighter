@@ -1,4 +1,4 @@
-#region Licence
+﻿#region Licence
 /* The MIT License (MIT)
 Copyright © 2014 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
@@ -23,38 +23,73 @@ THE SOFTWARE. */
 #endregion
 
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Paramore.Brighter.ServiceActivator
 {
     /// Abstracts the thread that runs a message pump
-    public class Performer : IAmAPerformer
+    public class Performer : IAmAPerformer, IHaveAChannelFailureCount
     {
         private readonly IAmAChannel _channel;
         private readonly IAmAMessagePump _messagePump;
 
+        /// <inheritdoc />
+        public int ConsecutiveChannelFailures =>
+            (_messagePump as IHaveAChannelFailureCount)?.ConsecutiveChannelFailures ?? 0;
+
+        /// <summary>
+        /// Constructs a performer, a combination of a message pump and a channel that it reads from
+        /// A peformer is a single thread, increase the number of performs to increase the number of threads
+        /// </summary>
+        /// <param name="channel">The channel to read messages from</param>
+        /// <param name="messagePump">The message pump that reads messages</param>
         public Performer(IAmAChannel channel, IAmAMessagePump messagePump)
         {
             _channel = channel;
             _messagePump = messagePump;
         }
 
-        public void Stop()
+        /// <summary>
+        /// Stops a performer, by posting a quit message to the channel
+        /// </summary>
+        /// <param name="routingKey">The topic to post the quit message too</param>
+        public void Stop(RoutingKey routingKey)
         {
-            _channel.Stop();
+            _channel.Stop(routingKey);
         }
 
+        /// <summary>
+        /// Runs this instance.
+        /// </summary>
+        /// <returns>Task.</returns>
         public Task Run()
         {
-            return Task.Factory.StartNew(() => _messagePump.Run().Wait(), TaskCreationOptions.LongRunning); 
+            return Task.Factory.StartNew(
+                () =>
+                {
+                    using (AmbientScopeSuppression.Suppress())
+                    {
+                        _messagePump.Run();
+                    }
+                },
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
         }
 
+        /// <summary>
+        /// Shut this performer and clean up its resources
+        /// </summary>
         public void Dispose()
         {
             Dispose(true);
             GC.SuppressFinalize(this);
         }
 
+        /// <summary>
+        /// Shut this performer and clean up its resources
+        /// </summary>
         ~Performer()
         {
             Dispose(false);

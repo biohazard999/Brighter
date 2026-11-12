@@ -26,87 +26,303 @@ using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Collections.Generic;
+using System.Runtime.ExceptionServices;
+using System.Threading.Tasks;
 using Paramore.Brighter.Extensions;
 using Paramore.Brighter.Logging;
-using System.Reflection;
+using Paramore.Brighter.Validation;
+using Microsoft.Extensions.Logging;
 using Paramore.Brighter.Inbox.Attributes;
 
 namespace Paramore.Brighter
 {
-    public class PipelineBuilder<TRequest> : IAmAPipelineBuilder<TRequest>, IAmAnAsyncPipelineBuilder<TRequest>
+    public partial class PipelineBuilder<TRequest>
+        : IAmAPipelineBuilder<TRequest>, IAmAnAsyncPipelineBuilder<TRequest>, IAsyncDisposable
         where TRequest : class, IRequest
     {
-        private static readonly Lazy<ILog> _logger = new Lazy<ILog>(LogProvider.For<PipelineBuilder<TRequest>>);
+        private static readonly ILogger s_logger= ApplicationLogging.CreateLogger<PipelineBuilder<TRequest>>();
 
-        private readonly IAmAHandlerFactory _handlerFactory;
-        private readonly InboxConfiguration _inboxConfiguration;
-        private readonly Interpreter<TRequest> _interpreter;
-        private readonly IAmALifetime _instanceScope;
-        private readonly IAmAHandlerFactoryAsync _asyncHandlerFactory;
+        private readonly IAmASubscriberRegistry? _subscriberRegistry;
+        private readonly IAmASubscriberRegistryInspector? _subscriberRegistryInspector;
+        private readonly IAmAHandlerFactorySync? _syncHandlerFactory;
+        private readonly InboxConfiguration? _inboxConfiguration;
+        private readonly IAmAHandlerFactoryAsync? _asyncHandlerFactory;
+        private readonly bool _isolateSubscribers;
+        private readonly List<IAmALifetime> _instanceScopes = new List<IAmALifetime>();
         //GLOBAL! cache of handler attributes - won't change post-startup so avoid re-calculation. Method to clear cache below (if a broken test brought you here)
-        private static readonly ConcurrentDictionary<string, IOrderedEnumerable<RequestHandlerAttribute>> _preAttributesMemento = new ConcurrentDictionary<string, IOrderedEnumerable<RequestHandlerAttribute>>();
-        private static readonly ConcurrentDictionary<string, IOrderedEnumerable<RequestHandlerAttribute>> _postAttributesMemento = new ConcurrentDictionary<string, IOrderedEnumerable<RequestHandlerAttribute>>();
+        private static readonly ConcurrentDictionary<Type, IOrderedEnumerable<RequestHandlerAttribute>> s_preAttributesMemento = new ConcurrentDictionary<Type, IOrderedEnumerable<RequestHandlerAttribute>>();
+        private static readonly ConcurrentDictionary<Type, IOrderedEnumerable<RequestHandlerAttribute>> s_postAttributesMemento = new ConcurrentDictionary<Type, IOrderedEnumerable<RequestHandlerAttribute>>();
 
         /// <summary>
         /// Used to build a pipeline of handlers from the target handler and the attributes on that
         /// target handler which represent other filter steps in the pipeline
         /// </summary>
-        /// <param name="registry">What handler services this request</param>
-        /// <param name="handlerFactory">Callback to the user code to create instances of handlers</param>
+        /// <param name="subscriberRegistry">A <see cref="IAmASubscriberRegistry"/> subscriber registry</param>
+        /// <param name="syncHandlerFactory">An <see cref="IAmAHandlerFactoryAsync"/>providing a callback to the user code to create instances of handlers</param>
         /// <param name="inboxConfiguration">Do we have a global attribute to add an inbox</param>
+        /// <param name="isolateSubscribers">Does this build isolate each subscriber's pipeline from the others (a Publish dispatch) rather than a single dispatch (a Send)</param>
         public PipelineBuilder(
-            IAmASubscriberRegistry registry, 
-            IAmAHandlerFactory handlerFactory,
-            InboxConfiguration inboxConfiguration = null) 
+            IAmASubscriberRegistry subscriberRegistry,
+            IAmAHandlerFactorySync syncHandlerFactory,
+            InboxConfiguration? inboxConfiguration = null,
+            bool isolateSubscribers = false)
         {
-            _handlerFactory = handlerFactory;
+            _subscriberRegistry = subscriberRegistry;
+            _syncHandlerFactory = syncHandlerFactory;
             _inboxConfiguration = inboxConfiguration;
-            _instanceScope = new LifetimeScope(handlerFactory);
-            _interpreter = new Interpreter<TRequest>(registry, handlerFactory);
-        }
-
-        public PipelineBuilder(
-            IAmASubscriberRegistry registry, 
-            IAmAHandlerFactoryAsync asyncHandlerFactory,
-            InboxConfiguration inboxConfiguration = null)
-        {
-            _asyncHandlerFactory = asyncHandlerFactory;
-            _inboxConfiguration = inboxConfiguration;
-            _instanceScope = new LifetimeScope(asyncHandlerFactory);
-            _interpreter = new Interpreter<TRequest>(registry, asyncHandlerFactory);
-        }
-
-        public Pipelines<TRequest> Build(IRequestContext requestContext)
-        {
-            var handlers = _interpreter.GetHandlers();
-
-            var pipelines = new Pipelines<TRequest>();
-
-            handlers.Each(handler => pipelines.Add(BuildPipeline(handler, requestContext)));
-
-            pipelines.Each(handler => handler.AddToLifetime(_instanceScope));
-
-            return pipelines;
+            _isolateSubscribers = isolateSubscribers;
         }
 
         /// <summary>
-        /// Clears any cached pipeline definitions. Mainly intended as a helper for testing where the
-        /// use of a static creates a shared fixture across tests (although in a production environment, shared
-        /// is what we are after). If your pipeline tests don't respond as expected to manipulation, this may be your
-        /// ally.
+        /// Used to build a pipeline of handlers from the target handler and the attributes on that
+        /// target handler which represent other filter steps in the pipeline
         /// </summary>
+        /// <param name="subscriberRegistry">A <see cref="IAmASubscriberRegistry"/> subscriber registry</param>
+        /// <param name="asyncHandlerFactory">An <see cref="IAmAHandlerFactoryAsync"/>providing a callback to the user code to create instances of handlers</param>
+        /// <param name="inboxConfiguration">Do we have a global attribute to add an inbox</param>
+        /// <param name="isolateSubscribers">Does this build isolate each subscriber's pipeline from the others (a Publish dispatch) rather than a single dispatch (a Send)</param>
+        public PipelineBuilder(
+            IAmASubscriberRegistry subscriberRegistry,
+            IAmAHandlerFactoryAsync asyncHandlerFactory,
+            InboxConfiguration? inboxConfiguration = null,
+            bool isolateSubscribers = false)
+        {
+            _subscriberRegistry = subscriberRegistry;
+            _asyncHandlerFactory = asyncHandlerFactory;
+            _inboxConfiguration = inboxConfiguration;
+            _isolateSubscribers = isolateSubscribers;
+        }
+
+        /// <summary>
+        /// Describe-only constructor for startup validation and diagnostics.
+        /// Does not require a handler factory — only uses reflection to describe pipelines.
+        /// </summary>
+        /// <param name="subscriberRegistryInspector">An <see cref="IAmASubscriberRegistryInspector"/> for introspecting registered handlers.</param>
+        /// <param name="inboxConfiguration">Optional inbox configuration for global inbox attribute detection.</param>
+        public PipelineBuilder(
+            IAmASubscriberRegistryInspector subscriberRegistryInspector,
+            InboxConfiguration? inboxConfiguration = null)
+        {
+            _subscriberRegistryInspector = subscriberRegistryInspector;
+            _inboxConfiguration = inboxConfiguration;
+        }
+
+        /// <summary>
+        /// Describes the handler pipeline(s) for a given request type without instantiating handlers.
+        /// Uses the same reflection path as <see cref="Build"/> to prevent drift.
+        /// </summary>
+        /// <param name="requestType">The request type to describe pipelines for.</param>
+        /// <returns>One <see cref="HandlerPipelineDescription"/> per handler type registered for the request type.</returns>
+        public IEnumerable<HandlerPipelineDescription> Describe(Type requestType)
+        {
+            var inspector = _subscriberRegistryInspector ?? _subscriberRegistry as IAmASubscriberRegistryInspector
+                ?? throw new ConfigurationException(
+                    "SubscriberRegistry must implement IAmASubscriberRegistryInspector for pipeline description");
+
+            var handlerTypes = inspector.GetHandlerTypes(requestType);
+
+            foreach (var handlerType in handlerTypes)
+            {
+                var handlerMethod = HandlerMethodDiscovery.FindHandlerMethod(handlerType, requestType);
+                var isAsync = HandlerMethodDiscovery.IsAsyncHandler(handlerType);
+
+                var otherHandlers = handlerMethod.GetOtherHandlersInPipeline().ToList();
+
+                var beforeAttributes = otherHandlers
+                    .Where(a => a.Timing == HandlerTiming.Before)
+                    .ToList();
+
+                var globalInbox = TryCreateGlobalInboxAttribute(requestType, handlerMethod, handlerType, isAsync);
+                if (globalInbox is not null)
+                    beforeAttributes.Add(globalInbox);
+
+                var beforeSteps = beforeAttributes
+                    .OrderByDescending(a => a.Step)
+                    .Select(a => new PipelineStepDescription(a.GetType(), a.GetHandlerType(), a.Step, a.Timing) { Attribute = a })
+                    .ToList()
+                    .AsReadOnly();
+
+                var afterSteps = otherHandlers
+                    .Where(a => a.Timing == HandlerTiming.After)
+                    .OrderByDescending(a => a.Step)
+                    .Select(a => new PipelineStepDescription(a.GetType(), a.GetHandlerType(), a.Step, a.Timing) { Attribute = a })
+                    .ToList()
+                    .AsReadOnly();
+
+                yield return new HandlerPipelineDescription(requestType, handlerType, isAsync, beforeSteps, afterSteps);
+            }
+        }
+
+        /// <summary>
+        /// Describes all registered handler pipelines without instantiating handlers.
+        /// Iterates all request types from the subscriber registry.
+        /// </summary>
+        /// <returns>One <see cref="HandlerPipelineDescription"/> per handler type per request type.</returns>
+        public IEnumerable<HandlerPipelineDescription> Describe()
+        {
+            var inspector = _subscriberRegistryInspector ?? _subscriberRegistry as IAmASubscriberRegistryInspector
+                ?? throw new ConfigurationException(
+                    "SubscriberRegistry must implement IAmASubscriberRegistryInspector for pipeline description");
+
+            foreach (var requestType in inspector.GetRegisteredRequestTypes())
+            {
+                foreach (var description in Describe(requestType))
+                    yield return description;
+            }
+        }
+
+        /// <summary>
+        /// Builds a pipeline of synchronous handlers for the given <paramref name="requestContext"/>.
+        /// </summary>
+        /// <param name="request">The <see cref="IRequest"/> that we are building the request for; used for routing at this point, not execution</param>
+        /// <param name="requestContext">The <see cref="IRequestContext"/> for the pipeline. If multiple handlers are registered, a copy is made for each pipeline.</param>
+        /// <returns>
+        /// A <see cref="Pipelines{TRequest}"/> containing the constructed handler pipelines for the request type.
+        /// </returns>
+        /// <exception cref="NullReferenceException">Thrown if the synchronous handler factory is null.</exception>
+        /// <exception cref="ConfigurationException">Thrown if there is an error building the pipeline.</exception>
+        public Pipelines<TRequest> Build(TRequest request, IRequestContext requestContext)
+            => Build(request, requestContext, excludeResilienceContext: false);
+
+        internal Pipelines<TRequest> Build(TRequest request, IRequestContext requestContext, bool excludeResilienceContext)
+        {
+            if(_syncHandlerFactory is null)
+                throw new NullReferenceException("HandlerFactorySync is null");
+            
+            try
+            {
+                var observers = _subscriberRegistry!.Get<TRequest>(request, requestContext);
+                
+                var pipelines = new Pipelines<TRequest>();
+
+                var observerTypes = observers as Type[] ?? observers.ToArray();
+                
+                observerTypes.Each(observer =>
+                {
+                    var context = observerTypes.Length == 1 ? requestContext : requestContext.CreateCopy();
+
+                    if (excludeResilienceContext && context.ResilienceContext is not null)
+                        context = new PublishRequestContext(context);
+
+                    using var suppression = _isolateSubscribers ? AmbientScopeSuppression.Suppress() : null;
+
+                    var instanceScope = GetSyncInstanceScope();
+                    var handler = (RequestHandler<TRequest>?)_syncHandlerFactory.Create(observer, instanceScope);
+                    if (handler is null)
+                        throw new ConfigurationException($"Handler Factory could not construct handler of type {observer}");
+                    var pipeline = BuildPipeline(handler, context, instanceScope);
+                    pipeline.AddToLifetime(instanceScope);
+
+                    pipelines.Add(pipeline);
+                });
+
+                return pipelines;
+            }
+            catch (AmbientScopeSourceException ambientEx)
+            {
+                ExceptionDispatchInfo.Capture(ambientEx.InnerException!).Throw();
+                throw; // unreachable - satisfies the compiler
+            }
+            catch (Exception e) when (e is not ConfigurationException and not AmbientScopeSourceException)
+            {
+                throw new ConfigurationException("Error when building pipeline, see inner Exception for details", e);
+            }
+        }
+
+        /// <summary>
+        /// Builds a pipeline of asynchronous handlers for the given <paramref name="requestContext"/>.
+        /// </summary>
+        /// <param name="request">The <see cref="IRequest"/> that we are building the request for; used for routing at this point, not execution</param>
+        /// <param name="requestContext">The <see cref="IRequestContext"/> for the pipeline. If multiple handlers are registered, a copy is made for each pipeline.</param>
+        /// <param name="continueOnCapturedContext">Indicates whether to continue on the captured synchronization context for async handlers.</param>
+        /// <returns>
+        /// An <see cref="AsyncPipelines{TRequest}"/> containing the constructed async handler pipelines for the request type.
+        /// </returns>
+        /// <exception cref="NullReferenceException">Thrown if the async handler factory is null.</exception>
+        /// <exception cref="ConfigurationException">Thrown if there is an error building the pipeline.</exception>
+        public AsyncPipelines<TRequest> BuildAsync(TRequest request, IRequestContext requestContext, bool continueOnCapturedContext)
+            => BuildAsync(request, requestContext, continueOnCapturedContext, excludeResilienceContext: false);
+
+        internal AsyncPipelines<TRequest> BuildAsync(TRequest request, IRequestContext requestContext,
+            bool continueOnCapturedContext, bool excludeResilienceContext)
+        {
+            if(_asyncHandlerFactory is null)
+                throw new NullReferenceException("AsyncHandlerFactory is null");
+            
+            try
+            {
+                var observers = _subscriberRegistry!.Get<TRequest>(request, requestContext);
+
+                var pipelines = new AsyncPipelines<TRequest>();
+
+                var observerTypes = observers as Type[] ?? observers.ToArray();
+                
+                observerTypes.Each(observer =>
+                {
+                    var context = observerTypes.Length == 1 ? requestContext : requestContext.CreateCopy();
+
+                    if (excludeResilienceContext && context.ResilienceContext is not null)
+                        context = new PublishRequestContext(context);
+
+                    using var suppression = _isolateSubscribers ? AmbientScopeSuppression.Suppress() : null;
+
+                    var instanceScope = GetAsyncInstanceScope();
+                    var handler = (RequestHandlerAsync<TRequest>?)_asyncHandlerFactory.Create(observer, instanceScope);
+                    if (handler is null)
+                        throw new ConfigurationException($"Handler Factory could not construct handler of type {observer}");
+                    var pipeline = BuildAsyncPipeline(handler, context, instanceScope,
+                        continueOnCapturedContext);
+                    pipeline.AddToLifetime(instanceScope);
+
+                    pipelines.Add(pipeline);
+                });
+
+                return pipelines;
+            }
+            catch (AmbientScopeSourceException ambientEx)
+            {
+                ExceptionDispatchInfo.Capture(ambientEx.InnerException!).Throw();
+                throw; // unreachable - satisfies the compiler
+            }
+            catch (Exception e) when (e is not ConfigurationException and not AmbientScopeSourceException)
+            {
+                throw new ConfigurationException("Error when building pipeline, see inner Exception for details", e);
+            }
+        }
+
+        /// <summary>
+        /// Clears any cached pipeline definitions.
+        /// </summary>
+        /// <remarks>
+        /// Intended primarily for testing scenarios where static caches may cause shared state between tests.
+        /// </remarks>
         public static void ClearPipelineCache()
         {
-            _preAttributesMemento.Clear();
-            _postAttributesMemento.Clear();
+            s_preAttributesMemento.Clear();
+            s_postAttributesMemento.Clear();
         }
 
+        /// <summary>
+        /// Disposes all instance scopes created by this builder.
+        /// </summary>
         public void Dispose()
+            => _instanceScopes.Each(s => s.Dispose());
+
+        /// <summary>
+        /// Disposes all instance scopes created by this builder, asynchronously. Prefer this from an
+        /// async caller (<c>await using</c>): each <see cref="IAmALifetime"/>'s own scope handle is
+        /// awaited rather than blocked on.
+        /// </summary>
+        public async ValueTask DisposeAsync()
         {
-            _instanceScope.Dispose();
+            foreach (var scope in _instanceScopes)
+            {
+                await scope.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
-        private IHandleRequests<TRequest> BuildPipeline(RequestHandler<TRequest> implicitHandler, IRequestContext requestContext)
+        private IHandleRequests<TRequest> BuildPipeline(RequestHandler<TRequest> implicitHandler,
+            IRequestContext requestContext, IAmALifetime instanceScope)
         {
             if (implicitHandler is null)
             {
@@ -115,7 +331,8 @@ namespace Paramore.Brighter
 
             implicitHandler.Context = requestContext;
 
-            if (!_preAttributesMemento.TryGetValue(implicitHandler.Name.ToString(), out IOrderedEnumerable<RequestHandlerAttribute> preAttributes))
+            if (!s_preAttributesMemento.TryGetValue(implicitHandler.GetType(),
+                    out IOrderedEnumerable<RequestHandlerAttribute>? preAttributes))
             {
                 preAttributes =
                     implicitHandler.FindHandlerMethod()
@@ -123,43 +340,32 @@ namespace Paramore.Brighter
                         .Where(attribute => attribute.Timing == HandlerTiming.Before)
                         .OrderByDescending(attribute => attribute.Step);
 
-                AddGlobalInboxAttributes(ref preAttributes, implicitHandler);
-
-                _preAttributesMemento.TryAdd(implicitHandler.Name.ToString(), preAttributes);
-
+                s_preAttributesMemento.TryAdd(implicitHandler.GetType(), preAttributes);
             }
 
-            var firstInPipeline = PushOntoPipeline(preAttributes, implicitHandler, requestContext);
+            AddGlobalInboxAttributes(ref preAttributes, implicitHandler);
+
+            var firstInPipeline = PushOntoPipeline(preAttributes, implicitHandler, requestContext, instanceScope);
 
 
-            if (!_postAttributesMemento.TryGetValue(implicitHandler.Name.ToString(), out IOrderedEnumerable<RequestHandlerAttribute> postAttributes))
+            if (!s_postAttributesMemento.TryGetValue(implicitHandler.GetType(),
+                    out IOrderedEnumerable<RequestHandlerAttribute>? postAttributes))
             {
                 postAttributes =
                     implicitHandler.FindHandlerMethod()
                         .GetOtherHandlersInPipeline()
                         .Where(attribute => attribute.Timing == HandlerTiming.After)
                         .OrderByDescending(attribute => attribute.Step);
+
+                s_postAttributesMemento.TryAdd(implicitHandler.GetType(), postAttributes);
             }
 
-            AppendToPipeline(postAttributes, implicitHandler, requestContext);
-            _logger.Value.DebugFormat("New handler pipeline created: {0}", TracePipeline(firstInPipeline));
+            AppendToPipeline(postAttributes, implicitHandler, requestContext, instanceScope);
+            Log.NewHandlerPipelineCreated(s_logger, TracePipeline(firstInPipeline).ToString());
             return firstInPipeline;
         }
 
-
-        public AsyncPipelines<TRequest> BuildAsync(IRequestContext requestContext, bool continueOnCapturedContext)
-        {
-            var handlers = _interpreter.GetAsyncHandlers();
-
-            var pipelines = new AsyncPipelines<TRequest>();
-            handlers.Each(handler => pipelines.Add(BuildAsyncPipeline(handler, requestContext, continueOnCapturedContext)));
-
-            pipelines.Each(handler => handler.AddToLifetime(_instanceScope));
-
-            return pipelines;
-        }
-
-        private IHandleRequestsAsync<TRequest> BuildAsyncPipeline(RequestHandlerAsync<TRequest> implicitHandler, IRequestContext requestContext, bool continueOnCapturedContext)
+        private IHandleRequestsAsync<TRequest> BuildAsyncPipeline(RequestHandlerAsync<TRequest> implicitHandler, IRequestContext requestContext, IAmALifetime instanceScope, bool continueOnCapturedContext)
         {
             if (implicitHandler is null)
             {
@@ -169,7 +375,7 @@ namespace Paramore.Brighter
             implicitHandler.Context = requestContext;
             implicitHandler.ContinueOnCapturedContext = continueOnCapturedContext;
 
-            if (!_preAttributesMemento.TryGetValue(implicitHandler.Name.ToString(), out IOrderedEnumerable<RequestHandlerAttribute> preAttributes))
+            if (!s_preAttributesMemento.TryGetValue(implicitHandler.GetType(), out IOrderedEnumerable<RequestHandlerAttribute>? preAttributes))
             {
                 preAttributes =
                     implicitHandler.FindHandlerMethod()
@@ -177,60 +383,96 @@ namespace Paramore.Brighter
                         .Where(attribute => attribute.Timing == HandlerTiming.Before)
                         .OrderByDescending(attribute => attribute.Step);
 
-                AddGlobalInboxAttributesAsync(ref preAttributes, implicitHandler);
-
-                _preAttributesMemento.TryAdd(implicitHandler.Name.ToString(), preAttributes);
-
+                s_preAttributesMemento.TryAdd(implicitHandler.GetType(), preAttributes);
             }
 
-
             AddGlobalInboxAttributesAsync(ref preAttributes, implicitHandler);
-            
-            var firstInPipeline = PushOntoAsyncPipeline(preAttributes, implicitHandler, requestContext, continueOnCapturedContext);
 
-            if (!_postAttributesMemento.TryGetValue(implicitHandler.Name.ToString(), out IOrderedEnumerable<RequestHandlerAttribute> postAttributes))
+            var firstInPipeline = PushOntoAsyncPipeline(preAttributes, implicitHandler, requestContext, instanceScope, continueOnCapturedContext);
+
+            if (!s_postAttributesMemento.TryGetValue(implicitHandler.GetType(), out IOrderedEnumerable<RequestHandlerAttribute>? postAttributes))
             {
                 postAttributes =
                     implicitHandler.FindHandlerMethod()
                         .GetOtherHandlersInPipeline()
                         .Where(attribute => attribute.Timing == HandlerTiming.After)
                         .OrderByDescending(attribute => attribute.Step);
+
+                s_postAttributesMemento.TryAdd(implicitHandler.GetType(), postAttributes);
             }
 
-            AppendToAsyncPipeline(postAttributes, implicitHandler, requestContext);
-            _logger.Value.DebugFormat("New async handler pipeline created: {0}", TracePipeline(firstInPipeline));
+            AppendToAsyncPipeline(postAttributes, implicitHandler, requestContext, instanceScope);
+            Log.NewAsyncHandlerPipelineCreated(s_logger, TracePipeline(firstInPipeline).ToString());
             return firstInPipeline;
+        }
+
+        /// <summary>
+        /// Reflection-only counterpart to <see cref="AddGlobalInboxAttributes"/> used by <see cref="Describe(Type)"/>.
+        /// Returns the global inbox attribute that <see cref="Build"/> would inject for this handler, or null
+        /// when no global inbox applies. Uses the same guards as the build path so the description does not drift.
+        /// </summary>
+        private RequestHandlerAttribute? TryCreateGlobalInboxAttribute(Type requestType,
+            System.Reflection.MethodInfo handlerMethod, Type handlerType, bool isAsync)
+        {
+            if (_inboxConfiguration == null
+                || !IsInInboxScope(_inboxConfiguration.Scope, requestType)
+                || handlerMethod.HasNoInboxAttributesInPipeline()
+                || handlerMethod.HasExistingUseInboxAttributesInPipeline())
+                return null;
+
+            if (_inboxConfiguration.Context is null)
+                throw new ArgumentException("Inbox Configuration must be set");
+
+            var contextKey = _inboxConfiguration.Context(handlerType);
+
+            return isAsync
+                ? new UseInboxAsyncAttribute(
+                    step: 0,
+                    contextKey: contextKey,
+                    onceOnly: _inboxConfiguration.OnceOnly,
+                    timing: HandlerTiming.Before,
+                    onceOnlyAction: _inboxConfiguration.ActionOnExists)
+                : new UseInboxAttribute(
+                    step: 0,
+                    contextKey: contextKey,
+                    onceOnly: _inboxConfiguration.OnceOnly,
+                    timing: HandlerTiming.Before,
+                    onceOnlyAction: _inboxConfiguration.ActionOnExists);
         }
 
         private void AddGlobalInboxAttributes(ref IOrderedEnumerable<RequestHandlerAttribute> preAttributes, RequestHandler<TRequest> implicitHandler)
         {
             if (
-                _inboxConfiguration == null 
+                _inboxConfiguration == null
+                || !IsInInboxScope(_inboxConfiguration.Scope, typeof(TRequest))
                 || implicitHandler.FindHandlerMethod().HasNoInboxAttributesInPipeline()
                 || implicitHandler.FindHandlerMethod().HasExistingUseInboxAttributesInPipeline()
             )
                 return;
 
+            if (_inboxConfiguration.Context is null)
+                throw new ArgumentException("Inbox Configuration must be set");
             var useInboxAttribute = new UseInboxAttribute(
                 step: 0,
                 contextKey: _inboxConfiguration.Context(implicitHandler.GetType()),
                 onceOnly: _inboxConfiguration.OnceOnly,
                 timing: HandlerTiming.Before,
                 onceOnlyAction: _inboxConfiguration.ActionOnExists);
-            
+
              PushOntoAttributeList(ref preAttributes, useInboxAttribute);
         }
 
-
         private void AddGlobalInboxAttributesAsync(ref IOrderedEnumerable<RequestHandlerAttribute> preAttributes, RequestHandlerAsync<TRequest> implicitHandler)
         {
-            if (_inboxConfiguration == null 
+            if (_inboxConfiguration == null
+                || !IsInInboxScope(_inboxConfiguration.Scope, typeof(TRequest))
                 || implicitHandler.FindHandlerMethod().HasNoInboxAttributesInPipeline()
                 || implicitHandler.FindHandlerMethod().HasExistingUseInboxAttributesInPipeline()
-     
             )
                 return;
 
+            if (_inboxConfiguration.Context is null)
+                throw new ArgumentException("Inbox Configuration must be set");
             var useInboxAttribute = new UseInboxAsyncAttribute(
                 step: 0,
                 contextKey: _inboxConfiguration.Context(implicitHandler.GetType()),
@@ -241,16 +483,27 @@ namespace Paramore.Brighter
              PushOntoAttributeList(ref preAttributes, useInboxAttribute);
         }
 
-        private void AppendToPipeline(IEnumerable<RequestHandlerAttribute> attributes, IHandleRequests<TRequest> implicitHandler, IRequestContext requestContext)
+        private static bool IsInInboxScope(InboxScope scope, Type requestType)
+        {
+            if (typeof(ICommand).IsAssignableFrom(requestType))
+                return (scope & InboxScope.Commands) != 0;
+
+            if (typeof(IEvent).IsAssignableFrom(requestType))
+                return (scope & InboxScope.Events) != 0;
+
+            return true;
+        }
+
+        private void AppendToPipeline(IEnumerable<RequestHandlerAttribute> attributes, IHandleRequests<TRequest> implicitHandler, IRequestContext requestContext, IAmALifetime instanceScope)
         {
             IHandleRequests<TRequest> lastInPipeline = implicitHandler;
             attributes.Each(attribute =>
             {
                 var handlerType = attribute.GetHandlerType();
-                if (handlerType.GetTypeInfo().GetInterfaces().Contains(typeof(IHandleRequests)))
+                if (handlerType.GetInterfaces().Contains(typeof(IHandleRequests)))
                 {
                     var decorator =
-                        new HandlerFactory<TRequest>(attribute, _handlerFactory, requestContext).CreateRequestHandler();
+                        new HandlerFactory<TRequest>(attribute, _syncHandlerFactory!, requestContext).CreateRequestHandler(instanceScope);
                     lastInPipeline.SetSuccessor(decorator);
                     lastInPipeline = decorator;
                 }
@@ -262,77 +515,102 @@ namespace Paramore.Brighter
             });
         }
 
-        private void AppendToAsyncPipeline(IEnumerable<RequestHandlerAttribute> attributes, IHandleRequestsAsync<TRequest> implicitHandler, IRequestContext requestContext)
+        private void AppendToAsyncPipeline(IEnumerable<RequestHandlerAttribute> attributes,
+            IHandleRequestsAsync<TRequest> implicitHandler, IRequestContext requestContext, IAmALifetime instanceScope)
         {
             IHandleRequestsAsync<TRequest> lastInPipeline = implicitHandler;
             attributes.Each(attribute =>
             {
                 var handlerType = attribute.GetHandlerType();
-                if (handlerType.GetTypeInfo().GetInterfaces().Contains(typeof(IHandleRequestsAsync)))
+                if (handlerType.GetInterfaces().Contains(typeof(IHandleRequestsAsync)))
                 {
-                    var decorator = _asyncHandlerFactory.CreateAsyncRequestHandler<TRequest>(attribute, requestContext);
+                    var decorator =
+                        _asyncHandlerFactory!.CreateAsyncRequestHandler<TRequest>(attribute, requestContext,
+                            instanceScope);
                     lastInPipeline.SetSuccessor(decorator);
                     lastInPipeline = decorator;
                 }
                 else
                 {
-                    var message = string.Format("All handlers in an async pipeline must derive from IHandleRequestsAsync. You cannot have a mixed pipeline by including handler {0}", handlerType.Name);
+                    var message =
+                        string.Format(
+                            "All handlers in an async pipeline must derive from IHandleRequestsAsync. You cannot have a mixed pipeline by including handler {0}",
+                            handlerType.Name);
                     throw new ConfigurationException(message);
                 }
             });
         }
-        
+
         private static void PushOntoAttributeList(ref IOrderedEnumerable<RequestHandlerAttribute> preAttributes, RequestHandlerAttribute requestHandlerAttribute)
         {
             var attributeList = new List<RequestHandlerAttribute>();
-
-            attributeList.Add(requestHandlerAttribute);
+            var minStep = int.MaxValue;
 
             preAttributes.Each(handler =>
             {
-                handler.Step++;
+                if (handler.Step < minStep)
+                    minStep = handler.Step;
                 attributeList.Add(handler);
             });
 
+            // Ensure the new attribute has a lower step than all existing attributes
+            // so it is processed last in the descending iteration (outermost in the pipeline).
+            // Note: requestHandlerAttribute must be a freshly created instance on every call —
+            // callers must not cache or reuse it, as we mutate its Step here.
+            requestHandlerAttribute.Step = minStep == int.MaxValue ? 0 : minStep - 1;
+            attributeList.Add(requestHandlerAttribute);
+
             preAttributes = attributeList.OrderByDescending(handler => handler.Step);
         }
-     
-        private IHandleRequests<TRequest> PushOntoPipeline(IEnumerable<RequestHandlerAttribute> attributes, IHandleRequests<TRequest> lastInPipeline, IRequestContext requestContext)
+
+        private IHandleRequests<TRequest> PushOntoPipeline(IEnumerable<RequestHandlerAttribute> attributes,
+            IHandleRequests<TRequest> lastInPipeline, IRequestContext requestContext, IAmALifetime instanceScope)
         {
             attributes.Each(attribute =>
             {
                 var handlerType = attribute.GetHandlerType();
-                if (handlerType.GetTypeInfo().GetInterfaces().Contains(typeof(IHandleRequests)))
+                if (handlerType.GetInterfaces().Contains(typeof(IHandleRequests)))
                 {
                     var decorator =
-                        new HandlerFactory<TRequest>(attribute, _handlerFactory, requestContext).CreateRequestHandler();
+                        new HandlerFactory<TRequest>(attribute, _syncHandlerFactory!, requestContext)
+                            .CreateRequestHandler(instanceScope);
                     decorator.SetSuccessor(lastInPipeline);
                     lastInPipeline = decorator;
                 }
                 else
                 {
-                    var message = string.Format("All handlers in a pipeline must derive from IHandleRequests. You cannot have a mixed pipeline by including handler {0}", handlerType.Name);
+                    var message =
+                        string.Format(
+                            "All handlers in a pipeline must derive from IHandleRequests. You cannot have a mixed pipeline by including handler {0}",
+                            handlerType.Name);
                     throw new ConfigurationException(message);
                 }
             });
             return lastInPipeline;
         }
 
-        private IHandleRequestsAsync<TRequest> PushOntoAsyncPipeline(IEnumerable<RequestHandlerAttribute> attributes, IHandleRequestsAsync<TRequest> lastInPipeline, IRequestContext requestContext, bool continueOnCapturedContext)
+        private IHandleRequestsAsync<TRequest> PushOntoAsyncPipeline(IEnumerable<RequestHandlerAttribute> attributes,
+            IHandleRequestsAsync<TRequest> lastInPipeline, IRequestContext requestContext, IAmALifetime instanceScope,
+            bool continueOnCapturedContext)
         {
             attributes.Each(attribute =>
             {
                 var handlerType = attribute.GetHandlerType();
-                if (handlerType.GetTypeInfo().GetInterfaces().Contains(typeof(IHandleRequestsAsync)))
+                if (handlerType.GetInterfaces().Contains(typeof(IHandleRequestsAsync)))
                 {
-                    var decorator = _asyncHandlerFactory.CreateAsyncRequestHandler<TRequest>(attribute, requestContext);
+                    var decorator =
+                        _asyncHandlerFactory!.CreateAsyncRequestHandler<TRequest>(attribute, requestContext,
+                            instanceScope);
                     decorator.ContinueOnCapturedContext = continueOnCapturedContext;
                     decorator.SetSuccessor(lastInPipeline);
                     lastInPipeline = decorator;
                 }
                 else
                 {
-                    var message = string.Format("All handlers in an async pipeline must derive from IHandleRequestsAsync. You cannot have a mixed pipeline by including handler {0}", handlerType.Name);
+                    var message =
+                        string.Format(
+                            "All handlers in an async pipeline must derive from IHandleRequestsAsync. You cannot have a mixed pipeline by including handler {0}",
+                            handlerType.Name);
                     throw new ConfigurationException(message);
                 }
             });
@@ -351,6 +629,37 @@ namespace Paramore.Brighter
             var pipelineTracer = new PipelineTracer();
             firstInPipeline.DescribePath(pipelineTracer);
             return pipelineTracer;
+        }
+
+        private IAmALifetime GetSyncInstanceScope()
+        {
+            if(_syncHandlerFactory is null)
+                throw new NullReferenceException("HandlerFactorySync is null");
+
+            var scope = new HandlerLifetimeScope(_syncHandlerFactory, _syncHandlerFactory.CreatePipelineScope());
+            _instanceScopes.Add(scope);
+
+            return scope;
+        }
+
+        private IAmALifetime GetAsyncInstanceScope()
+        {
+            if(_asyncHandlerFactory is null)
+                throw new NullReferenceException("AsyncHandlerFactory is null");
+
+            var scope = new HandlerLifetimeScope(_asyncHandlerFactory, _asyncHandlerFactory.CreatePipelineScope());
+            _instanceScopes.Add(scope);
+
+            return scope;
+        }
+
+        private static partial class Log
+        {
+            [LoggerMessage(LogLevel.Debug, "New handler pipeline created: {HandlerName}")]
+            public static partial void NewHandlerPipelineCreated(ILogger logger, string handlerName);
+
+            [LoggerMessage(LogLevel.Debug, "New async handler pipeline created: {HandlerName}")]
+            public static partial void NewAsyncHandlerPipelineCreated(ILogger logger, string handlerName);
         }
     }
 }
